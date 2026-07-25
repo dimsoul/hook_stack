@@ -40,6 +40,7 @@ BPF_CFLAGS += -std=gnu11 -target bpf -D__TARGET_ARCH_$(BPF_ARCH)
 
 BINARY := hook_stack
 TEST_BINARY := test/trace_test
+ASYNC_TEST_BINARY := test/trace_async_test
 BPF_OBJECT := hook/hook_stack.bpf.o
 VMLINUX_HEADER := hook/vmlinux.h
 SKELETON_HEADER := hook/hook_stack.skel.h
@@ -47,7 +48,7 @@ SKELETON_HEADER := hook/hook_stack.skel.h
 .DELETE_ON_ERROR:
 .PHONY: all clean test-program
 
-all: $(BINARY) $(TEST_BINARY)
+all: $(BINARY) $(TEST_BINARY) $(ASYNC_TEST_BINARY)
 
 $(VMLINUX_HEADER):
 	@test -r /sys/kernel/btf/vmlinux || \
@@ -66,10 +67,15 @@ $(BINARY): hook/hook_stack.c $(SKELETON_HEADER)
 
 $(TEST_BINARY): test/test.c
 	$(CC) -std=gnu11 -O0 -g -Wall -Wextra -fno-omit-frame-pointer -fno-inline \
-		-rdynamic $< -o $@
+		-rdynamic $< -o $@ -pthread
 
-test-program: $(TEST_BINARY)
+$(ASYNC_TEST_BINARY): test/test_async.c
+	$(CC) -std=gnu11 -O0 -g -Wall -Wextra -fno-omit-frame-pointer -fno-inline \
+		-rdynamic $< -o $@ -pthread
+
+test-program: $(TEST_BINARY) $(ASYNC_TEST_BINARY)
 
 clean:
-	rm -f $(BINARY) $(TEST_BINARY) $(BPF_OBJECT) $(VMLINUX_HEADER) \
+	rm -f $(BINARY) $(TEST_BINARY) $(ASYNC_TEST_BINARY) $(BPF_OBJECT) \
+		$(VMLINUX_HEADER) \
 		$(SKELETON_HEADER)

@@ -24,6 +24,9 @@ function?” without rebuilding or modifying the target application.
   source location.
 - Optionally attach a return probe to report the raw return register value and
   function execution time.
+- Attribute latency to on-CPU, blocked, run-queue, and preempted/unknown time.
+- Stitch a producer stack to a target running in another thread by matching a
+  shared task pointer or request ID.
 - Pair nested and recursive calls independently for each thread.
 - Stop cleanly on `SIGINT` or `SIGTERM`.
 
@@ -86,6 +89,84 @@ sudo ./hook_stack --binary ./program --offset 0x11c9 --ret --time
 `--return-value` is an alias for `--ret`, and `--latency` is an alias for
 `--time`. Return tracing is disabled unless at least one of these options is
 present, so the original entry-only mode has no return-probe bookkeeping.
+
+Break function latency down by scheduler state:
+
+```sh
+sudo ./hook_stack -p 1234 --attribution function_name
+```
+
+`--attribution` (alias `--breakdown`) implies `--time`. A return event then
+contains fields similar to:
+
+```text
+RETURN duration=20.112 ms oncpu=83.421 us offcpu=20.029 ms blocked=20.011 ms runq=18.327 us preempt/unknown=0 ns
+```
+
+The fields mean:
+
+- `oncpu`: time during which the traced thread was running, derived as total
+  duration minus off-CPU time;
+- `blocked`: time from a scheduler switch-out until an observed wakeup,
+  including waits caused by sleep, timers, futexes, and I/O;
+- `runq`: time from wakeup until the thread was scheduled to run again;
+- `preempt/unknown`: off-CPU time for which no wakeup was observed, such as
+  preemption, yielding, or an event missed under resource pressure.
+
+This is scheduler-state attribution. It answers whether a slow call spent its
+time executing, blocked, or waiting for CPU. It does not yet name the exact
+syscall, lock, or kernel subsystem responsible for a blocked interval.
+
+Stitch a cross-thread asynchronous call chain:
+
+```sh
+sudo ./hook_stack -p 1234 \
+  --async-source submit_async_task \
+  --async-source-arg 1 \
+  --async-target-arg 1 \
+  process_task
+```
+
+The source and target arguments must contain the same nonzero key. A task
+object pointer is a natural key, but an integer request ID also works. Argument
+positions are 1-based and currently support the first five integer or pointer
+arguments. Both positions default to argument 1.
+
+The source function is assumed to be in the target ELF. If it is in another
+executable or shared library, specify it explicitly:
+
+```sh
+sudo ./hook_stack -p 1234 \
+  --async-source enqueue_work \
+  --async-source-binary /absolute/path/to/libqueue.so \
+  --async-source-arg 2 \
+  --async-target-arg 1 \
+  process_work
+```
+
+Each saved context is consumed by the first matching target call. Unmatched
+contexts expire after 30 seconds by default; change the limit with
+`--async-max-age-ms MS`. This one-shot behavior is intended for task queues.
+Fan-out, where one submitted task deliberately runs in multiple workers,
+requires a separate source probe or future multi-consumer support.
+
+For multiple asynchronous handoffs, repeat `--async-hop`. Its format is
+`SOURCE,SOURCE_ARG,TARGET,TARGET_ARG`, and the target of the last hop must be
+the final positional function:
+
+```sh
+sudo ./hook_stack -p 1234 \
+  --async-hop enqueue_request,2,process_request,1 \
+  --async-hop enqueue_storage_task,2,write_result,1 \
+  write_result
+```
+
+Here `process_request` is both the target of the first hop and the execution
+scope in which the second source, `enqueue_storage_task`, runs. The tool
+inherits the first lineage, appends the second producer stack, and finally
+prints both historical stacks before the current `write_result` stack. Up to
+eight hops are retained. If a longer chain is observed, the oldest hop is
+dropped and the output reports how many hops were truncated.
 
 The original explicit-path form remains available and traces every process
 executing the selected ELF:
@@ -167,11 +248,10 @@ sudo ./hook_stack -p PID function_to_trace
 Each loop iteration should produce a stack similar to:
 
 ```text
-[2026-07-23 12:00:00] PID 1234/TID 1234 (trace_test)
-  #0   0x000055... trace_test               function_to_trace at test/test.c:5
-  #1   0x000055... trace_test               call_trace_target at test/test.c:18
-  #2   0x000055... trace_test               main at test/test.c:23
-  #3   0x00007f... libc.so.6                __libc_start_call_main at ...
+[2026-07-25 12:00:00] PID 1234/TID 1235 (trace_test)
+  #0   0x000055... trace_test               function_to_trace at test/test.c:18
+  #1   0x000055... trace_test               worker_main at test/test.c:65
+  #2   0x00007f... libc.so.6                start_thread at ...
 ```
 
 Enable return values and execution time during the quick test:
@@ -194,6 +274,48 @@ entry and return, including time when the thread is preempted or blocked.
 Functions that do not return normally (for example because of `longjmp`,
 thread exit, or process exit) do not produce a return event.
 
+The test function includes a short sleep so that attribution produces a visible
+blocked interval:
+
+```sh
+sudo ./hook_stack -p PID --attribution function_to_trace
+```
+
+The example also passes a task pointer from the main thread through a small
+queue to a worker thread. Use it to test asynchronous stitching:
+
+```sh
+sudo ./hook_stack -p PID \
+  --async-source submit_async_task \
+  function_to_trace
+```
+
+The output first shows the producer stack with an `async` prefix, followed by
+an `--- async handoff ---` marker and the worker's current stack. The `handoff`
+value is the time from entry into the source function until entry into the
+target function.
+
+For a dedicated asynchronous test, run the second example program:
+
+```sh
+./test/trace_async_test
+```
+
+It prints its PID and the exact tracing command. The request passes through
+three threads and two queues:
+
+```sh
+sudo ./hook_stack -p PID \
+  --async-hop enqueue_request,2,process_request,1 \
+  --async-hop enqueue_storage_task,2,write_result,1 \
+  write_result
+```
+
+The resulting lineage is
+`http_handler -> enqueue_request`, then
+`process_request -> enqueue_storage_task`, followed by the current
+`storage_worker_main -> write_result` stack.
+
 Exact frames vary with the compiler, libc, optimization settings, and kernel
 stack-walking support.
 
@@ -210,6 +332,13 @@ stack-walking support.
   output also reports the kernel-global PID and the translation error.
 - **Permission errors**: run as root or configure the required BPF and perf
   capabilities for your kernel and distribution.
+- **Scheduler tracepoint attachment fails**: verify that the kernel exposes the
+  `sched_switch` and `sched_wakeup` raw tracepoints and that the process has the
+  required BPF/perf privileges. Running as root is the simplest test.
+- **No async origin is printed**: verify that both selected argument positions
+  contain exactly the same nonzero pointer or integer value. Also check that
+  the target runs before `--async-max-age-ms` expires. The context is
+  intentionally consumed only once.
 - **Dropped events under heavy load**: the ring buffer is deliberately bounded.
   This tool is intended for targeted tracing rather than very hot functions.
 
@@ -221,9 +350,17 @@ When the uprobe fires, the BPF program records process metadata and calls
 the entry timestamp in a per-thread nested-call state and attaches
 `hook/trace_function_return` as a uretprobe. The return probe pairs the
 innermost outstanding call, reads the raw return register, and calculates the
-elapsed monotonic time. The loader consumes events, reads the process's memory
-mappings, computes each ELF load bias from its `PT_LOAD` segments, groups
-frames by module, and invokes `addr2line` without using a shell.
+elapsed monotonic time. With `--attribution`, raw scheduler switch and wakeup
+tracepoints accumulate off-CPU, blocked, and run-queue intervals for every
+active nested call. The loader consumes events, derives on-CPU time, reads the
+process's memory mappings, computes each ELF load bias from its `PT_LOAD`
+segments, groups frames by module, and invokes `addr2line` without using a
+shell. Async source probes store stack IDs and metadata in an LRU map keyed by
+process and the selected argument. Intermediate target probes bind a consumed
+lineage to the current thread until the target function returns, allowing a
+later source call to inherit and extend it. The final target emits up to eight
+hop descriptors; userspace retrieves their stacks from a BPF stack-trace map
+and symbolizes each segment.
 
 ## License
 
