@@ -132,6 +132,17 @@ object pointer is a natural key, but an integer request ID also works. Argument
 positions are 1-based and currently support the first five integer or pointer
 arguments. Both positions default to argument 1.
 
+For example, given:
+
+```c
+void enqueue_request(const char *queue, struct request *request);
+void process_request(struct request *request);
+```
+
+the shared `request` pointer is source argument 2 and target argument 1, so use
+`--async-source-arg 2 --async-target-arg 1`. The tool reads the raw argument
+value as a key; it does not need to know the C type or dereference the pointer.
+
 The source function is assumed to be in the target ELF. If it is in another
 executable or shared library, specify it explicitly:
 
@@ -167,6 +178,11 @@ inherits the first lineage, appends the second producer stack, and finally
 prints both historical stacks before the current `write_result` stack. Up to
 eight hops are retained. If a longer chain is observed, the oldest hop is
 dropped and the output reports how many hops were truncated.
+
+The multi-hop form currently assumes that all named source and target
+functions are in the target ELF. Hop numbers are zero-based: three thread
+segments have two handoffs, printed as `async hop 0` and `async hop 1`; the
+final current stack is the receiver of the last handoff, not another hop.
 
 The original explicit-path form remains available and traces every process
 executing the selected ELF:
@@ -293,7 +309,9 @@ sudo ./hook_stack -p PID \
 The output first shows the producer stack with an `async` prefix, followed by
 an `--- async handoff ---` marker and the worker's current stack. The `handoff`
 value is the time from entry into the source function until entry into the
-target function.
+target function. It includes enqueue work, queue waiting, wakeup, and
+scheduling delay; it is not the execution time of the target function itself.
+Use `--time` or `--attribution` for target-function execution time.
 
 For a dedicated asynchronous test, run the second example program:
 
@@ -361,17 +379,3 @@ lineage to the current thread until the target function returns, allowing a
 later source call to inherit and extend it. The final target emits up to eight
 hop descriptors; userspace retrieves their stacks from a BPF stack-trace map
 and symbolizes each segment.
-
-## License
-
-This repository uses mixed licensing:
-
-- The userspace loader, test program, build files, and documentation are
-  licensed under the MIT License. See [LICENSE](LICENSE).
-- The eBPF program in `hook/hook_stack.bpf.c` is licensed under
-  GPL-2.0-only because it uses GPL-only kernel helpers such as
-  `bpf_get_stack`. See
-  [LICENSES/GPL-2.0-only.txt](LICENSES/GPL-2.0-only.txt).
-
-The eBPF program's `SEC("license")` declaration remains `GPL`, matching its
-file-level SPDX identifier.
