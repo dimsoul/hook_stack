@@ -1,27 +1,34 @@
+// SPDX-License-Identifier: MIT
+
 #include <stdio.h>
-#include <unistd.h>
-#include <sys/types.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
-void function_to_trace() {
-    struct stat st;
+__attribute__((noinline)) long function_to_trace(void)
+{
+    struct stat file_status;
 
-    if (stat(".", &st) == 0) {
-        printf("stat syscall succeeded. inode: %lu\n", st.st_ino);
-    } else {
-        perror("stat syscall failed");
+    if (stat(".", &file_status) == 0) {
+        printf("stat succeeded; inode: %llu\n",
+               (unsigned long long)file_status.st_ino);
+        return (long)file_status.st_ino;
     }
 
-    sleep(10);
+    perror("stat failed");
+    return -1;
 }
 
-void loop() {
-    while (1) {
-        function_to_trace();
+__attribute__((noinline)) static void call_trace_target(void)
+{
+    volatile long result = function_to_trace();
+
+    (void)result;
+}
+
+int main(void)
+{
+    for (;;) {
+        call_trace_target();
+        sleep(1);
     }
-}
-
-int main() {
-    loop();
-    return 0;
 }
