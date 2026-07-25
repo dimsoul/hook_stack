@@ -41,14 +41,15 @@ BPF_CFLAGS += -std=gnu11 -target bpf -D__TARGET_ARCH_$(BPF_ARCH)
 BINARY := callweave
 TEST_BINARY := test/trace_test
 ASYNC_TEST_BINARY := test/trace_async_test
+THREAD_POOL_TEST_BINARY := test/trace_thread_pool_test
 BPF_OBJECT := src/callweave.bpf.o
 VMLINUX_HEADER := src/vmlinux.h
 SKELETON_HEADER := src/callweave.skel.h
 
 .DELETE_ON_ERROR:
-.PHONY: all clean test-program
+.PHONY: all clean test-program demo-async
 
-all: $(BINARY) $(TEST_BINARY) $(ASYNC_TEST_BINARY)
+all: $(BINARY) $(TEST_BINARY) $(ASYNC_TEST_BINARY) $(THREAD_POOL_TEST_BINARY)
 
 $(VMLINUX_HEADER):
 	@test -r /sys/kernel/btf/vmlinux || \
@@ -73,9 +74,17 @@ $(ASYNC_TEST_BINARY): test/test_async.c
 	$(CC) -std=gnu11 -O0 -g -Wall -Wextra -fno-omit-frame-pointer -fno-inline \
 		-rdynamic $< -o $@ -pthread
 
-test-program: $(TEST_BINARY) $(ASYNC_TEST_BINARY)
+$(THREAD_POOL_TEST_BINARY): test/test_thread_pool.c
+	$(CC) -std=gnu11 -O0 -g -Wall -Wextra -fno-omit-frame-pointer -fno-inline \
+		-rdynamic $< -o $@ -pthread
+
+test-program: $(TEST_BINARY) $(ASYNC_TEST_BINARY) $(THREAD_POOL_TEST_BINARY)
+
+demo-async: all
+	bash test/run_async_demo.sh
 
 clean:
-	rm -f $(BINARY) $(TEST_BINARY) $(ASYNC_TEST_BINARY) $(BPF_OBJECT) \
+	rm -f $(BINARY) $(TEST_BINARY) $(ASYNC_TEST_BINARY) \
+		$(THREAD_POOL_TEST_BINARY) $(BPF_OBJECT) \
 		$(VMLINUX_HEADER) \
 		$(SKELETON_HEADER)

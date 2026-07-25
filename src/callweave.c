@@ -46,7 +46,11 @@ struct async_hop_event {
     int32_t stack_id;
     uint32_t reserved;
     uint64_t key;
-    uint64_t handoff_ns;
+    uint64_t queue_ns;
+    uint64_t target_ns;
+    uint64_t offcpu_ns;
+    uint64_t blocked_ns;
+    uint64_t runqueue_ns;
 };
 
 struct stack_trace_event {
@@ -70,17 +74,28 @@ struct stack_trace_event {
     uint64_t stack[MAX_STACK_DEPTH];
 };
 
+struct async_hop_config {
+    char *source;
+    uint32_t source_arg;
+    char *target;
+    uint32_t target_arg;
+};
+
 struct output_options {
     bool show_return_value;
     bool show_duration;
     bool show_attribution;
     bool show_async;
     int async_stack_map_fd;
+    const struct async_hop_config *async_hops;
+    size_t async_hop_count;
+    const char *async_source_name;
+    const char *final_target_name;
 };
 
-_Static_assert(offsetof(struct stack_trace_event, stack) == 544,
+_Static_assert(offsetof(struct stack_trace_event, stack) == 800,
                "userspace and BPF event layouts differ");
-_Static_assert(sizeof(struct stack_trace_event) == 1568,
+_Static_assert(sizeof(struct stack_trace_event) == 1824,
                "userspace and BPF event sizes differ");
 
 struct proc_map {
@@ -223,6 +238,8 @@ static void usage(FILE *stream, const char *program)
             "      --async-target-arg N   target key argument, 1-5 (default 1)\n"
             "      --async-max-age-ms MS  discard older contexts (default 30000)\n"
             "      --async-hop S,SA,T,TA  add one async hop (repeat up to 8)\n"
+            "                             async tracing implies --time and\n"
+            "                             --attribution\n"
             "  -h, --help                show this help\n"
             "\n"
             "When -p is used without --binary or --module, /proc/PID/exe is used.\n"
@@ -882,6 +899,62 @@ static void print_interval(const char *label, uint64_t nanoseconds)
                (unsigned long long)nanoseconds);
 }
 
+static void calculate_attribution(uint64_t duration_ns, uint64_t offcpu_ns,
+                                  uint64_t blocked_ns, uint64_t runqueue_ns,
+                                  uint64_t *oncpu_ns, uint64_t *unknown_ns)
+{
+    uint64_t classified_ns;
+
+    if (offcpu_ns > duration_ns)
+        offcpu_ns = duration_ns;
+    classified_ns = blocked_ns + runqueue_ns;
+    *unknown_ns = offcpu_ns > classified_ns ?
+                  offcpu_ns - classified_ns : 0;
+    *oncpu_ns = duration_ns - offcpu_ns;
+}
+
+static const char *dominant_attribution(uint64_t oncpu_ns,
+                                        uint64_t blocked_ns,
+                                        uint64_t runqueue_ns,
+                                        uint64_t unknown_ns)
+{
+    const char *dominant = "on-CPU";
+    uint64_t maximum = oncpu_ns;
+
+    if (blocked_ns > maximum) {
+        dominant = "blocked";
+        maximum = blocked_ns;
+    }
+    if (runqueue_ns > maximum) {
+        dominant = "run-queue";
+        maximum = runqueue_ns;
+    }
+    if (unknown_ns > maximum)
+        dominant = "preempt/unknown";
+    return dominant;
+}
+
+static void print_attribution(uint64_t duration_ns, uint64_t offcpu_ns,
+                              uint64_t blocked_ns, uint64_t runqueue_ns,
+                              bool include_dominant)
+{
+    uint64_t oncpu_ns;
+    uint64_t unknown_ns;
+
+    calculate_attribution(duration_ns, offcpu_ns, blocked_ns, runqueue_ns,
+                          &oncpu_ns, &unknown_ns);
+    print_interval("oncpu", oncpu_ns);
+    print_interval("offcpu", offcpu_ns > duration_ns ?
+                   duration_ns : offcpu_ns);
+    print_interval("blocked", blocked_ns);
+    print_interval("runq", runqueue_ns);
+    print_interval("preempt/unknown", unknown_ns);
+    if (include_dominant)
+        printf(" dominant=%s",
+               dominant_attribution(oncpu_ns, blocked_ns, runqueue_ns,
+                                    unknown_ns));
+}
+
 static void print_stack_frames(const uint64_t *stack, int32_t stack_size,
                                struct map_list *maps, const char *prefix)
 {
@@ -968,24 +1041,9 @@ static int handle_event(void *context, void *data, size_t data_size)
                    (long long)event->return_value);
         if (output->show_duration)
             print_interval("duration", event->duration_ns);
-        if (output->show_attribution) {
-            uint64_t offcpu_ns = event->offcpu_ns;
-            uint64_t classified_ns;
-            uint64_t unknown_ns;
-            uint64_t oncpu_ns;
-
-            if (offcpu_ns > event->duration_ns)
-                offcpu_ns = event->duration_ns;
-            classified_ns = event->blocked_ns + event->runqueue_ns;
-            unknown_ns = offcpu_ns > classified_ns ?
-                         offcpu_ns - classified_ns : 0;
-            oncpu_ns = event->duration_ns - offcpu_ns;
-            print_interval("oncpu", oncpu_ns);
-            print_interval("offcpu", offcpu_ns);
-            print_interval("blocked", event->blocked_ns);
-            print_interval("runq", event->runqueue_ns);
-            print_interval("preempt/unknown", unknown_ns);
-        }
+        if (output->show_attribution)
+            print_attribution(event->duration_ns, event->offcpu_ns,
+                              event->blocked_ns, event->runqueue_ns, false);
         putchar('\n');
     } else {
         if (output->show_return_value || output->show_duration)
@@ -1005,20 +1063,20 @@ static int handle_event(void *context, void *data, size_t data_size)
     }
     fflush(stdout);
 
-    if (event->event_type == EVENT_RETURN) {
-        putchar('\n');
-        return 0;
-    }
     if (event->event_type != EVENT_ENTRY) {
-        fprintf(stderr, "unknown event type: %u\n", event->event_type);
-        return 0;
+        if (event->event_type != EVENT_RETURN) {
+            fprintf(stderr, "unknown event type: %u\n", event->event_type);
+            return 0;
+        }
     }
-    if (data_size < entry_size) {
+    if (event->event_type == EVENT_ENTRY && data_size < entry_size) {
         fprintf(stderr, "short entry event received: %zu bytes (expected %zu)\n",
                 data_size, entry_size);
         return 0;
     }
-    if (read_process_maps(maps_pid, &maps)) {
+    if ((event->event_type == EVENT_ENTRY ||
+         (output->show_async && event->async_hop_count)) &&
+        read_process_maps(maps_pid, &maps)) {
         int maps_error = errno;
 
         if (event->global_pid != maps_pid) {
@@ -1050,11 +1108,31 @@ static int handle_event(void *context, void *data, size_t data_size)
                 &event->async_hops[hop_index];
             uint64_t async_stack[MAX_ASYNC_STACK_DEPTH] = {0};
 
-            printf("  async hop %u PID %u/TID %u (%.*s) "
+            const char *source_name = output->async_source_name;
+            const char *target_name = output->final_target_name;
+
+            if (hop_index < output->async_hop_count) {
+                source_name = output->async_hops[hop_index].source;
+                target_name = output->async_hops[hop_index].target;
+            }
+            printf("  async hop %u %s -> %s PID %u/TID %u (%.*s) "
                    "key=0x%016llx\n",
-                   hop_index, hop->pid, hop->tid,
+                   hop_index,
+                   source_name ? source_name : "source",
+                   target_name ? target_name : "target",
+                   hop->pid, hop->tid,
                    (int)sizeof(hop->comm), hop->comm,
                    (unsigned long long)hop->key);
+            printf("    ");
+            print_interval("queue", hop->queue_ns);
+            if (hop->target_ns) {
+                print_interval("work", hop->target_ns);
+                print_attribution(hop->target_ns, hop->offcpu_ns,
+                                  hop->blocked_ns, hop->runqueue_ns, true);
+            } else {
+                printf(" work=unavailable");
+            }
+            putchar('\n');
             if (hop->pid != hop->global_pid ||
                 hop->tid != hop->global_tid)
                 printf("  async global PID %u/TID %u\n",
@@ -1073,10 +1151,12 @@ static int handle_event(void *context, void *data, size_t data_size)
                 print_stack_frames(async_stack, sizeof(async_stack),
                                    &maps, "async ");
             }
-            printf("  --- async handoff %u", hop_index);
-            print_interval("delay", hop->handoff_ns);
-            printf(" ---\n");
         }
+    }
+    if (event->event_type == EVENT_RETURN) {
+        putchar('\n');
+        map_list_free(&maps);
+        return 0;
     }
     print_stack_frames(event->stack, event->stack_size, &maps, "");
     putchar('\n');
@@ -1092,13 +1172,6 @@ enum long_option_id {
     OPT_ASYNC_TARGET_ARG,
     OPT_ASYNC_MAX_AGE_MS,
     OPT_ASYNC_HOP,
-};
-
-struct async_hop_config {
-    char *source;
-    uint32_t source_arg;
-    char *target;
-    uint32_t target_arg;
 };
 
 static void free_async_hops(struct async_hop_config *hops, size_t count)
@@ -1298,6 +1371,10 @@ int main(int argc, char **argv)
     }
 
     remaining_arguments = argc - optind;
+    if (output.show_async) {
+        output.show_duration = true;
+        output.show_attribution = true;
+    }
     if (module_name && target_pid <= 0) {
         fprintf(stderr, "--module requires --pid\n");
         return 2;
@@ -1408,6 +1485,10 @@ int main(int argc, char **argv)
         fprintf(stderr, "function name must not be empty\n");
         return 2;
     }
+    output.async_hops = async_hops;
+    output.async_hop_count = async_hop_count;
+    output.async_source_name = async_source_name;
+    output.final_target_name = function_name;
 
     if (module_name) {
         error = resolve_loaded_module(target_pid, module_name,
