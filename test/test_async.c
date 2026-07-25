@@ -164,7 +164,7 @@ int main(void)
     }
 
     printf("trace_async_test PID=%ld\n", (long)getpid());
-    printf("trace with: sudo ./hook_stack -p %ld "
+    printf("trace with: sudo ./callweave -p %ld "
            "--async-hop enqueue_request,2,process_request,1 "
            "--async-hop enqueue_storage_task,2,write_result,1 "
            "write_result\n",

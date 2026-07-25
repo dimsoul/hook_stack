@@ -26,7 +26,7 @@
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 
-#include "hook_stack.skel.h"
+#include "callweave.skel.h"
 
 #define MAX_STACK_DEPTH 128
 #define MAX_ASYNC_STACK_DEPTH 127
@@ -137,7 +137,7 @@ static int install_signal_handlers(void)
     return 0;
 }
 
-static int configure_pid_namespace(struct hook_stack_bpf *skeleton)
+static int configure_pid_namespace(struct callweave_bpf *skeleton)
 {
     struct stat namespace_status;
     int saved_error;
@@ -1183,7 +1183,7 @@ int main(int argc, char **argv)
     struct output_options output = {
         .async_stack_map_fd = -1,
     };
-    struct hook_stack_bpf *skeleton = NULL;
+    struct callweave_bpf *skeleton = NULL;
     struct ring_buffer *ring_buffer = NULL;
     struct async_hop_config async_hops[MAX_ASYNC_HOPS] = {0};
     struct bpf_link *async_links[MAX_ASYNC_HOPS * 3] = {0};
@@ -1468,7 +1468,7 @@ int main(int argc, char **argv)
     if (install_signal_handlers())
         return 1;
 
-    skeleton = hook_stack_bpf__open();
+    skeleton = callweave_bpf__open();
     if (!skeleton) {
         fprintf(stderr, "failed to open BPF skeleton\n");
         return 1;
@@ -1523,7 +1523,7 @@ int main(int argc, char **argv)
         }
     }
 
-    error = hook_stack_bpf__load(skeleton);
+    error = callweave_bpf__load(skeleton);
     if (error) {
         fprintf(stderr, "failed to load BPF program: %s\n", strerror(-error));
         goto cleanup;
@@ -1675,7 +1675,7 @@ cleanup:
     if (ring_buffer)
         ring_buffer__free(ring_buffer);
     if (skeleton)
-        hook_stack_bpf__destroy(skeleton);
+        callweave_bpf__destroy(skeleton);
     free_async_hops(async_hops, async_hop_count);
     return error ? 1 : 0;
 }

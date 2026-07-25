@@ -38,12 +38,12 @@ CFLAGS += -std=gnu11 -Wall -Wextra -Wpedantic -Wno-overlength-strings
 BPF_CFLAGS ?= -O2 -g
 BPF_CFLAGS += -std=gnu11 -target bpf -D__TARGET_ARCH_$(BPF_ARCH)
 
-BINARY := hook_stack
+BINARY := callweave
 TEST_BINARY := test/trace_test
 ASYNC_TEST_BINARY := test/trace_async_test
-BPF_OBJECT := hook/hook_stack.bpf.o
-VMLINUX_HEADER := hook/vmlinux.h
-SKELETON_HEADER := hook/hook_stack.skel.h
+BPF_OBJECT := src/callweave.bpf.o
+VMLINUX_HEADER := src/vmlinux.h
+SKELETON_HEADER := src/callweave.skel.h
 
 .DELETE_ON_ERROR:
 .PHONY: all clean test-program
@@ -55,14 +55,14 @@ $(VMLINUX_HEADER):
 		{ echo "error: /sys/kernel/btf/vmlinux is unavailable" >&2; exit 1; }
 	$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c > $@
 
-$(BPF_OBJECT): hook/hook_stack.bpf.c $(VMLINUX_HEADER)
-	$(CLANG) $(BPF_CFLAGS) -Ihook -c $< -o $@
+$(BPF_OBJECT): src/callweave.bpf.c $(VMLINUX_HEADER)
+	$(CLANG) $(BPF_CFLAGS) -Isrc -c $< -o $@
 
 $(SKELETON_HEADER): $(BPF_OBJECT)
 	$(BPFTOOL) gen skeleton $< > $@
 
-$(BINARY): hook/hook_stack.c $(SKELETON_HEADER)
-	$(CC) $(CFLAGS) $(LIBBPF_CFLAGS) $(LIBELF_CFLAGS) -Ihook $< -o $@ \
+$(BINARY): src/callweave.c $(SKELETON_HEADER)
+	$(CC) $(CFLAGS) $(LIBBPF_CFLAGS) $(LIBELF_CFLAGS) -Isrc $< -o $@ \
 		$(LIBBPF_LIBS) $(LIBELF_LIBS) $(ZLIB_LIBS)
 
 $(TEST_BINARY): test/test.c

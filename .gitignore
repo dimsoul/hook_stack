@@ -1,5 +1,5 @@
-/hook_stack
-/hook/hook_stack.bpf.o
-/hook/hook_stack.skel.h
-/hook/vmlinux.h
+/callweave
+/src/callweave.bpf.o
+/src/callweave.skel.h
+/src/vmlinux.h
 /test/trace_test
