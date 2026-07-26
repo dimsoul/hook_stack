@@ -30,8 +30,15 @@ the target application.
 - Attribute latency to on-CPU, blocked, run-queue, and preempted/unknown time.
 - Stitch a producer stack to a target running in another thread by matching a
   shared task pointer or request ID.
+- Discover the thread and user stack that most recently woke a target thread,
+  then suggest a candidate source function for async tracing.
 - Retain up to eight asynchronous handoffs and report queue time, target work
   time, scheduler-state attribution, and the dominant delay class for each hop.
+- Load repeatable multi-hop traces from a small YAML configuration file.
+- Keep only slow chains by total, queue, or work time, and stop after a chosen
+  event count or duration.
+- Export completed chains as JSON Lines or a self-contained HTML report with a
+  causal waterfall, per-hop scheduler breakdown, and aggregate latency cards.
 - Pair nested and recursive calls independently for each thread.
 - Stop cleanly on `SIGINT` or `SIGTERM`.
 
@@ -114,6 +121,9 @@ Usage:
   ./callweave -p PID [--module MODULE] FUNCTION
   ./callweave -p PID [--module MODULE] --find-symbol SYMBOL
   ./callweave --binary BINARY --offset OFFSET
+  ./callweave -p PID --discover-async FUNCTION
+  ./callweave -p PID --config PATH
+  ./callweave --check-config PATH
 ```
 
 Add `--ret` to report the raw return register value and `--time` to report the
@@ -156,6 +166,37 @@ This is scheduler-state attribution. It answers whether a slow call spent its
 time executing, blocked, or waiting for CPU. It does not yet name the exact
 syscall, lock, or kernel subsystem responsible for a blocked interval.
 
+If the asynchronous source is not known yet, inspect the most recent thread
+that woke the final target:
+
+```sh
+sudo ./callweave -p 1234 --discover-async write_result
+```
+
+Discovery prints the waker's user stack, the elapsed time from wakeup to target
+entry, and a suggested `--async-hop` template. The suggestion deliberately
+leaves the source argument as `?`, because eBPF can observe raw arguments but
+cannot infer which one is the shared task pointer or request ID:
+
+```text
+candidate source function: submit_storage_task
+suggested template:
+  --async-hop submit_storage_task,?,write_result,1 write_result
+```
+
+If the target key is not argument 1, add `--async-target-arg N` while
+discovering. Discovery is a heuristic: it reports the latest scheduler waker,
+which is often a queue submitter using a condition variable or futex, but it is
+not proof of application-level causality. To bound overhead, this mode records
+wakers in the selected process; timer expiry, I/O completion, signals, and
+kernel-originated wakeups may therefore have no candidate user stack. Use the
+candidate stack to identify the enqueue/submit function, then confirm the
+shared argument before switching to `--async-hop`.
+
+The first target hit after attachment initializes the kernel-global process
+identity used by discovery, so candidate output normally begins with a
+subsequent wakeup rather than that first event.
+
 Stitch a cross-thread asynchronous call chain:
 
 ```sh
@@ -168,8 +209,10 @@ sudo ./callweave -p 1234 \
 
 The source and target arguments must contain the same nonzero key. A task
 object pointer is a natural key, but an integer request ID also works. Argument
-positions are 1-based and currently support the first five integer or pointer
-arguments. Both positions default to argument 1.
+positions are 1-based and currently support the first eight integer or pointer
+arguments. The source position defaults to argument 1, while an omitted target
+position defaults to scanning arguments 1-8. Pass `--async-target-arg N` when
+the target position is known and should be fixed explicitly.
 
 For example, given:
 
@@ -201,16 +244,24 @@ Fan-out, where one submitted task deliberately runs in multiple workers,
 requires a separate source probe or future multi-consumer support.
 
 For multiple asynchronous handoffs, repeat `--async-hop`. Its format is
-`SOURCE,SOURCE_ARG,TARGET,TARGET_ARG`, and the target of the last hop must be
-the final positional function. Async tracing automatically enables function
-timing and scheduler attribution:
+`SOURCE,SOURCE_ARG,TARGET[,TARGET_ARG]`, and the target of the last hop must be
+the final positional function. `TARGET_ARG` can be omitted or written as
+`auto`. In that case, callweave scans target arguments 1-8 and accepts the
+event only when exactly one argument matches a saved source key. Async tracing
+automatically enables function timing and scheduler attribution:
 
 ```sh
 sudo ./callweave -p 1234 \
-  --async-hop enqueue_request,2,process_request,1 \
-  --async-hop enqueue_storage_task,2,write_result,1 \
+  --async-hop enqueue_request,2,process_request \
+  --async-hop enqueue_storage_task,2,write_result \
   write_result
 ```
+
+An explicit target position remains available, for example
+`enqueue_request,2,process_request,1`. It avoids up to five map lookups at each
+target entry and is preferable for very hot target functions. It is also safer
+when several target arguments can coincidentally equal outstanding scalar
+keys. Auto mode rejects such ambiguous events instead of guessing.
 
 Here `process_request` is both the target of the first hop and the execution
 scope in which the second source, `enqueue_storage_task`, runs. The tool
@@ -242,6 +293,104 @@ async hop 1 submit_storage_task -> write_result ...
 The multi-hop form currently assumes that all named source and target
 functions are in the target ELF. Hop numbers are zero-based: three thread
 segments have two handoffs, printed as `async hop 0` and `async hop 1`.
+
+For a repeatable trace, put the target, hops, and output limits in a
+configuration file. `examples/thread-pool.yaml` contains:
+
+```yaml
+target:
+  function: write_result
+
+hops:
+  - source: submit_compute_task
+    source_arg: 2
+    target: process_request
+    target_arg: 1
+  - source: submit_storage_task
+    source_arg: 2
+    target: write_result
+    target_arg: 1
+
+filters:
+  min_total_ms: 100
+  min_queue_ms: 10
+  min_work_ms: 20
+  max_events: 10
+  duration: 30
+```
+
+Validate it without loading BPF, then run it against a process:
+
+```sh
+./callweave --check-config examples/thread-pool.yaml
+sudo ./callweave -p 1234 --config examples/thread-pool.yaml
+```
+
+The parser intentionally accepts this documented YAML subset rather than every
+YAML feature. Each hop requires `source`, `source_arg`, and `target`.
+`target_arg` is optional and defaults to auto detection; it may also be written
+as `target_arg: auto`. Explicit argument positions are 1-8, and at most eight
+hops are accepted. Command-line filter options override values loaded from the
+file regardless of option order.
+
+The same slow-chain controls can be used with explicit `--async-hop` options:
+
+```sh
+sudo ./callweave -p 1234 \
+  --async-hop enqueue_request,2,process_request,1 \
+  --async-hop enqueue_storage_task,2,write_result,1 \
+  --min-total-ms 100 \
+  --min-queue-ms 10 \
+  --min-work-ms 20 \
+  --max-events 10 \
+  --duration 30 \
+  write_result
+```
+
+Filter conditions are combined: `min-total-ms` compares the sum of queue and
+work time across the retained chain, while `min-queue-ms` and `min-work-ms`
+require at least one hop to reach their thresholds. When a chain filter or
+`--max-events` is active, entry events are suppressed and only completed
+matching chains are printed. `--duration` is also available for non-async
+traces.
+
+Generate an interactive, self-contained HTML report while retaining the normal
+terminal output:
+
+```sh
+sudo ./callweave -p 1234 \
+  --config examples/thread-pool.yaml \
+  --max-events 100 \
+  --report callweave-report.html
+```
+
+The report contains:
+
+- aggregate chain count, average, P95, and maximum latency;
+- a selectable causal waterfall whose rows preserve handoff order;
+- queue, on-CPU, blocked, run-queue, and preempted/unknown composition;
+- a per-hop comparison chart and raw correlation-key table.
+
+No JavaScript libraries, fonts, or network requests are required. Open the
+generated file directly in a browser. Scheduler-state colors within a work
+segment show aggregate composition; they do not claim that those states
+occurred in that exact visual order.
+
+For automation or custom visualization, emit one completed asynchronous chain
+per line as JSON:
+
+```sh
+sudo ./callweave -p 1234 \
+  --config examples/thread-pool.yaml \
+  --format json \
+  --output trace.json \
+  --report callweave-report.html
+```
+
+Without `--output`, JSON Lines are written to standard output and tracer status
+is written to standard error. `--format json` and `--report` currently require
+an async trace because their data model is a completed causal chain. Existing
+slow-chain filters are applied before either export is written.
 
 The original explicit-path form remains available and traces every process
 executing the selected ELF:
@@ -390,6 +539,41 @@ The resulting lineage is
 `process_request -> enqueue_storage_task`, followed by the current
 `storage_worker_main -> write_result` stack.
 
+To test target-argument auto detection with a deeper and less artificial
+pipeline, run:
+
+```sh
+./test/trace_complex_async_test
+```
+
+The program uses four threads and three queues. Each stage performs nested
+synchronous calls, and each handoff deliberately uses a different key. The
+three target functions receive those keys in arguments 2, 3, and 8
+respectively. On x86-64, the last key is stack-passed rather than held in an
+argument register. Trace it with the supplied configuration:
+
+```sh
+sudo ./callweave -p PID \
+  --config examples/complex-multi-hop.yaml \
+  --report /tmp/callweave-complex.html
+```
+
+Or use the equivalent command without any target argument positions:
+
+```sh
+sudo ./callweave -p PID \
+  --async-hop submit_decode_task,2,decode_request \
+  --async-hop submit_enrich_task,1,enrich_request \
+  --async-hop submit_persist_task,2,persist_result \
+  --max-events 5 \
+  persist_result
+```
+
+A completed chain contains `async hop 0`, `async hop 1`, and `async hop 2`,
+with `target-arg=2`, `target-arg=3`, and `target-arg=8`. The target argument is
+reported so an automatically discovered configuration can later be made
+explicit if lower probe overhead is important.
+
 For a more realistic example with two reusable worker pools, bounded queues,
 bursty submissions, and blocking target work, run the complete demo:
 
@@ -412,6 +596,24 @@ growth visible, while sleeps inside `process_request` and `write_result`
 produce a clear `dominant=blocked` classification. Press Ctrl+C to stop both
 the tracer and the example process.
 
+The same example is suitable for discovery and configuration tests:
+
+```sh
+./test/trace_thread_pool_test
+# Use the PID printed by the program:
+sudo ./callweave -p PID --duration 5 --discover-async write_result
+./callweave --check-config examples/thread-pool.yaml
+sudo ./callweave -p PID --config examples/thread-pool.yaml \
+  --max-events 2 --duration 10
+```
+
+Generate a short visual report from the same test:
+
+```sh
+sudo ./callweave -p PID --config examples/thread-pool.yaml \
+  --max-events 20 --report /tmp/callweave-report.html
+```
+
 Exact frames vary with the compiler, libc, optimization settings, and kernel
 stack-walking support.
 
@@ -429,12 +631,17 @@ stack-walking support.
 - **Permission errors**: run as root or configure the required BPF and perf
   capabilities for your kernel and distribution.
 - **Scheduler tracepoint attachment fails**: verify that the kernel exposes the
-  `sched_switch` and `sched_wakeup` raw tracepoints and that the process has the
-  required BPF/perf privileges. Running as root is the simplest test.
+  `sched_switch`, `sched_wakeup`, and `sched_waking` raw tracepoints and that
+  the process has the required BPF/perf privileges. Running as root is the
+  simplest test.
 - **No async origin is printed**: verify that both selected argument positions
   contain exactly the same nonzero pointer or integer value. Also check that
   the target runs before `--async-max-age-ms` expires. The context is
   intentionally consumed only once.
+- **Discovery reports no waker stack**: make sure the target thread blocks and
+  is subsequently woken while discovery is running. Kernel-originated wakeups
+  may not have a useful user stack; stack walking also depends on kernel and
+  architecture support.
 - **Dropped events under heavy load**: the ring buffer is deliberately bounded.
   This tool is intended for targeted tracing rather than very hot functions.
 
@@ -459,4 +666,7 @@ each intermediate target's work before the next handoff. The final target
 keeps the lineage until its return probe completes the last hop, then emits up
 to eight hop descriptors. Userspace retrieves their producer stacks from a BPF
 stack-trace map, symbolizes each segment, and prints a single completed causal
-chain.
+chain. In discovery mode, `sched_waking` records wakeups originating in the
+selected process and keys the latest waker stack by target thread. Target
+entry consumes that record so userspace can present a likely handoff site
+without requiring the async source function in advance.

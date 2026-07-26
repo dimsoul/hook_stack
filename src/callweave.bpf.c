@@ -9,6 +9,8 @@
 #define MAX_ASYNC_STACK_DEPTH 127
 #define MAX_ASYNC_HOPS 8
 #define MAX_NESTED_CALLS 16
+#define ASYNC_HOP_ID_MASK 0xffffU
+#define ASYNC_TARGET_ARG_SHIFT 16
 
 enum event_type {
     EVENT_ENTRY,
@@ -31,6 +33,17 @@ struct async_hop_event {
     u64 runqueue_ns;
 };
 
+struct discovery_wakeup {
+    u32 pid;
+    u32 tid;
+    u32 global_pid;
+    u32 global_tid;
+    char comm[16];
+    s32 stack_id;
+    s32 pidns_error;
+    u64 wake_ns;
+};
+
 struct stack_trace_event {
     u32 pid;
     u32 tid;
@@ -49,6 +62,10 @@ struct stack_trace_event {
     u32 async_hop_count;
     u32 async_truncated;
     struct async_hop_event async_hops[MAX_ASYNC_HOPS];
+    u32 discovery_valid;
+    u32 discovery_reserved;
+    struct discovery_wakeup discovery_waker;
+    u64 discovery_wakeup_ns;
     u64 stack[MAX_STACK_DEPTH];
 };
 
@@ -108,9 +125,9 @@ struct async_target_thread {
     u64 wakeup_ns;
 };
 
-_Static_assert(__builtin_offsetof(struct stack_trace_event, stack) == 800,
+_Static_assert(__builtin_offsetof(struct stack_trace_event, stack) == 864,
                "unexpected BPF event layout");
-_Static_assert(sizeof(struct stack_trace_event) == 1824,
+_Static_assert(sizeof(struct stack_trace_event) == 1888,
                "unexpected BPF event size");
 
 const volatile __u64 pidns_dev;
@@ -119,6 +136,7 @@ const volatile __u32 target_pid;
 const volatile __u32 trace_returns;
 const volatile __u32 trace_attribution;
 const volatile __u32 trace_async;
+const volatile __u32 trace_discovery;
 const volatile __u32 async_source_arg;
 const volatile __u32 async_target_arg;
 const volatile __u64 async_max_age_ns;
@@ -191,6 +209,27 @@ struct {
     __type(value, struct async_chain);
 } final_lineages SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 16384);
+    __type(key, u64);
+    __type(value, struct discovery_wakeup);
+} discovery_wakeups SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, u32);
+} discovery_target_global SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_STACK_TRACE);
+    __uint(max_entries, 8192);
+    __type(key, u32);
+    __type(value, u64[MAX_ASYNC_STACK_DEPTH]);
+} discovery_stacks SEC(".maps");
+
 static __always_inline int get_process_info(u64 *pid_tgid, u32 *global_pid,
                                             u32 *global_tid, u32 *pid,
                                             u32 *tid, s32 *pidns_error)
@@ -233,6 +272,18 @@ static __always_inline u64 task_pid_tgid(struct task_struct *task)
     return (u64)tgid << 32 | pid;
 }
 
+static __always_inline u64 read_uprobe_stack_argument(
+    struct pt_regs *ctx, u32 slot)
+{
+    u64 value = 0;
+    u64 address = PT_REGS_SP_CORE(ctx) + slot * sizeof(value);
+
+    if (bpf_probe_read_user(&value, sizeof(value),
+                            (const void *)address))
+        return 0;
+    return value;
+}
+
 static __always_inline u64 read_uprobe_argument(struct pt_regs *ctx, u32 index)
 {
     switch (index) {
@@ -246,9 +297,82 @@ static __always_inline u64 read_uprobe_argument(struct pt_regs *ctx, u32 index)
         return PT_REGS_PARM4_CORE(ctx);
     case 5:
         return PT_REGS_PARM5_CORE(ctx);
+    case 6:
+#if defined(__TARGET_ARCH_s390)
+        return 0;
+#else
+        return PT_REGS_PARM6_CORE(ctx);
+#endif
+    case 7:
+#if defined(__TARGET_ARCH_x86)
+        return read_uprobe_stack_argument(ctx, 1);
+#elif defined(__TARGET_ARCH_arm64) || defined(__TARGET_ARCH_mips) || \
+      defined(__TARGET_ARCH_powerpc) || defined(__TARGET_ARCH_riscv)
+        return PT_REGS_PARM7_CORE(ctx);
+#else
+        return 0;
+#endif
+    case 8:
+#if defined(__TARGET_ARCH_x86)
+        return read_uprobe_stack_argument(ctx, 2);
+#elif defined(__TARGET_ARCH_arm64) || defined(__TARGET_ARCH_mips) || \
+      defined(__TARGET_ARCH_powerpc) || defined(__TARGET_ARCH_riscv)
+        return PT_REGS_PARM8_CORE(ctx);
+#else
+        return 0;
+#endif
     default:
         return 0;
     }
+}
+
+static __always_inline int try_target_argument(
+    struct pt_regs *ctx, u32 global_pid, u32 argument,
+    u64 *matched_value, u32 *matched_argument)
+{
+    struct async_context_key key = {
+        .global_pid = global_pid,
+    };
+
+    key.value = read_uprobe_argument(ctx, argument);
+    if (!key.value || !bpf_map_lookup_elem(&async_contexts, &key))
+        return 0;
+    if (*matched_argument)
+        return -1;
+    *matched_value = key.value;
+    *matched_argument = argument;
+    return 0;
+}
+
+static __always_inline u64 resolve_target_key(
+    struct pt_regs *ctx, u32 global_pid, u32 configured_argument,
+    u32 *matched_argument)
+{
+    u64 matched_value = 0;
+
+    *matched_argument = 0;
+    if (configured_argument) {
+        *matched_argument = configured_argument;
+        return read_uprobe_argument(ctx, configured_argument);
+    }
+    if (try_target_argument(ctx, global_pid, 1, &matched_value,
+                            matched_argument) ||
+        try_target_argument(ctx, global_pid, 2, &matched_value,
+                            matched_argument) ||
+        try_target_argument(ctx, global_pid, 3, &matched_value,
+                            matched_argument) ||
+        try_target_argument(ctx, global_pid, 4, &matched_value,
+                            matched_argument) ||
+        try_target_argument(ctx, global_pid, 5, &matched_value,
+                            matched_argument) ||
+        try_target_argument(ctx, global_pid, 6, &matched_value,
+                            matched_argument) ||
+        try_target_argument(ctx, global_pid, 7, &matched_value,
+                            matched_argument) ||
+        try_target_argument(ctx, global_pid, 8, &matched_value,
+                            matched_argument))
+        return 0;
+    return matched_value;
 }
 
 static __always_inline void move_async_hop(
@@ -262,7 +386,7 @@ static __always_inline void move_async_hop(
     __builtin_memcpy(destination->comm, source->comm,
                      sizeof(destination->comm));
     destination->stack_id = source->stack_id;
-    destination->reserved = 0;
+    destination->reserved = source->reserved;
     destination->key = source->key;
     destination->source_ns = source->source_ns;
     destination->queue_ns = source->queue_ns;
@@ -366,7 +490,7 @@ int trace_async_source(struct pt_regs *ctx)
     hop->tid = tid;
     hop->global_pid = global_pid;
     hop->global_tid = global_tid;
-    hop->reserved = 0;
+    hop->reserved = (u32)(cookie >> 32);
     hop->key = key.value;
     hop->source_ns = now;
     hop->queue_ns = 0;
@@ -399,6 +523,7 @@ int trace_async_target(struct pt_regs *ctx)
     u32 pid;
     u32 tid;
     u32 argument;
+    u32 matched_argument;
     u32 depth;
     u32 last;
     s32 pidns_error;
@@ -427,7 +552,8 @@ int trace_async_target(struct pt_regs *ctx)
     cookie = bpf_get_attach_cookie(ctx);
     argument = cookie ? (u32)cookie : async_target_arg;
     context_key.global_pid = global_pid;
-    context_key.value = read_uprobe_argument(ctx, argument);
+    context_key.value = resolve_target_key(ctx, global_pid, argument,
+                                           &matched_argument);
     if (!context_key.value)
         return 0;
 
@@ -437,6 +563,9 @@ int trace_async_target(struct pt_regs *ctx)
     last = chain->hop_count - 1;
     if (last >= MAX_ASYNC_HOPS)
         return 0;
+    chain->hops[last].reserved =
+        (chain->hops[last].reserved & ASYNC_HOP_ID_MASK) |
+        (matched_argument << ASYNC_TARGET_ARG_SHIFT);
 
     now = bpf_ktime_get_ns();
     if (async_max_age_ns &&
@@ -491,6 +620,30 @@ static __always_inline void clear_async_event(struct stack_trace_event *event)
     event->async_truncated = 0;
 }
 
+static __always_inline void fill_discovery_event(
+    struct stack_trace_event *event, u64 pid_tgid)
+{
+    struct discovery_wakeup *wakeup;
+    u64 now;
+
+    event->discovery_valid = 0;
+    event->discovery_reserved = 0;
+    event->discovery_wakeup_ns = 0;
+    if (!trace_discovery)
+        return;
+
+    wakeup = bpf_map_lookup_elem(&discovery_wakeups, &pid_tgid);
+    if (!wakeup)
+        return;
+
+    now = bpf_ktime_get_ns();
+    event->discovery_waker = *wakeup;
+    if (now >= wakeup->wake_ns)
+        event->discovery_wakeup_ns = now - wakeup->wake_ns;
+    event->discovery_valid = 1;
+    bpf_map_delete_elem(&discovery_wakeups, &pid_tgid);
+}
+
 static __always_inline void copy_async_hop_to_event(
     struct async_hop_event *destination,
     const struct async_hop_context *source)
@@ -502,7 +655,7 @@ static __always_inline void copy_async_hop_to_event(
     __builtin_memcpy(destination->comm, source->comm,
                      sizeof(destination->comm));
     destination->stack_id = source->stack_id;
-    destination->reserved = 0;
+    destination->reserved = source->reserved;
     destination->key = source->key;
     destination->queue_ns = source->queue_ns;
     destination->target_ns = source->target_ns;
@@ -548,9 +701,11 @@ static __always_inline void consume_async_context(
     struct async_chain *chain;
     u64 now;
     u32 last;
+    u32 matched_argument;
 
     clear_async_event(event);
-    key.value = read_uprobe_argument(ctx, async_target_arg);
+    key.value = resolve_target_key(ctx, global_pid, async_target_arg,
+                                   &matched_argument);
     if (!key.value)
         return;
 
@@ -560,6 +715,9 @@ static __always_inline void consume_async_context(
     last = chain->hop_count - 1;
     if (last >= MAX_ASYNC_HOPS)
         return;
+    chain->hops[last].reserved =
+        (chain->hops[last].reserved & ASYNC_HOP_ID_MASK) |
+        (matched_argument << ASYNC_TARGET_ARG_SHIFT);
     now = bpf_ktime_get_ns();
     if (async_max_age_ns &&
         now - chain->hops[last].source_ns > async_max_age_ns) {
@@ -697,6 +855,12 @@ int trace_function(struct pt_regs *ctx)
     if (!get_process_info(&pid_tgid, &global_pid, &global_tid, &pid, &tid,
                           &pidns_error))
         return 0;
+    if (trace_discovery) {
+        u32 zero = 0;
+
+        bpf_map_update_elem(&discovery_target_global, &zero, &global_pid,
+                            BPF_ANY);
+    }
 
     if (trace_returns) {
         thread = bpf_map_lookup_elem(&thread_states, &pid_tgid);
@@ -736,6 +900,7 @@ int trace_function(struct pt_regs *ctx)
             clear_async_event(event);
         fill_entry_event(ctx, event, global_pid, global_tid, pid, tid,
                          pidns_error);
+        fill_discovery_event(event, pid_tgid);
         bpf_ringbuf_submit(event, 0);
     }
 
@@ -813,6 +978,9 @@ int trace_function_return(struct pt_regs *ctx)
     event->offcpu_ns = offcpu_ns;
     event->blocked_ns = blocked_ns;
     event->runqueue_ns = runqueue_ns;
+    event->discovery_valid = 0;
+    event->discovery_reserved = 0;
+    event->discovery_wakeup_ns = 0;
     lineage = bpf_map_lookup_elem(&final_lineages, &key);
     if (lineage && lineage->hop_count) {
         u32 last = lineage->hop_count - 1;
@@ -872,6 +1040,44 @@ int trace_sched_switch(struct bpf_raw_tracepoint_args *ctx)
     return 0;
 }
 
+static __always_inline int record_discovery_waker(
+    struct bpf_raw_tracepoint_args *ctx, struct task_struct *task)
+{
+    struct discovery_wakeup wakeup = {0};
+    struct bpf_pidns_info pidns = {0};
+    u64 waker_pid_tgid;
+    u64 pid_tgid;
+    u32 zero = 0;
+    u32 *discovery_global_pid;
+
+    if (!trace_discovery)
+        return 0;
+
+    pid_tgid = task_pid_tgid(task);
+    waker_pid_tgid = bpf_get_current_pid_tgid();
+    wakeup.global_pid = waker_pid_tgid >> 32;
+    wakeup.global_tid = (u32)waker_pid_tgid;
+    discovery_global_pid =
+        bpf_map_lookup_elem(&discovery_target_global, &zero);
+    if (!discovery_global_pid || !*discovery_global_pid ||
+        *discovery_global_pid != wakeup.global_pid)
+        return 0;
+    wakeup.pid = wakeup.global_pid;
+    wakeup.tid = wakeup.global_tid;
+    wakeup.pidns_error = bpf_get_ns_current_pid_tgid(
+        pidns_dev, pidns_ino, &pidns, sizeof(pidns));
+    if (!wakeup.pidns_error) {
+        wakeup.pid = pidns.tgid;
+        wakeup.tid = pidns.pid;
+    }
+    bpf_get_current_comm(wakeup.comm, sizeof(wakeup.comm));
+    wakeup.stack_id = bpf_get_stackid(ctx, &discovery_stacks,
+                                      BPF_F_USER_STACK);
+    wakeup.wake_ns = bpf_ktime_get_ns();
+    bpf_map_update_elem(&discovery_wakeups, &pid_tgid, &wakeup, BPF_ANY);
+    return 0;
+}
+
 static __always_inline int record_task_wakeup(struct task_struct *task)
 {
     struct thread_state *thread;
@@ -897,6 +1103,13 @@ SEC("raw_tp/sched_wakeup")
 int trace_sched_wakeup(struct bpf_raw_tracepoint_args *ctx)
 {
     return record_task_wakeup((struct task_struct *)ctx->args[0]);
+}
+
+SEC("raw_tp/sched_waking")
+int trace_sched_waking(struct bpf_raw_tracepoint_args *ctx)
+{
+    return record_discovery_waker(ctx,
+                                  (struct task_struct *)ctx->args[0]);
 }
 
 char LICENSE[] SEC("license") = "GPL";

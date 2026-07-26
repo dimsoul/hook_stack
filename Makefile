@@ -42,6 +42,7 @@ BINARY := callweave
 TEST_BINARY := test/trace_test
 ASYNC_TEST_BINARY := test/trace_async_test
 THREAD_POOL_TEST_BINARY := test/trace_thread_pool_test
+COMPLEX_ASYNC_TEST_BINARY := test/trace_complex_async_test
 BPF_OBJECT := src/callweave.bpf.o
 VMLINUX_HEADER := src/vmlinux.h
 SKELETON_HEADER := src/callweave.skel.h
@@ -49,7 +50,8 @@ SKELETON_HEADER := src/callweave.skel.h
 .DELETE_ON_ERROR:
 .PHONY: all clean test-program demo-async
 
-all: $(BINARY) $(TEST_BINARY) $(ASYNC_TEST_BINARY) $(THREAD_POOL_TEST_BINARY)
+all: $(BINARY) $(TEST_BINARY) $(ASYNC_TEST_BINARY) \
+	$(THREAD_POOL_TEST_BINARY) $(COMPLEX_ASYNC_TEST_BINARY)
 
 $(VMLINUX_HEADER):
 	@test -r /sys/kernel/btf/vmlinux || \
@@ -62,8 +64,9 @@ $(BPF_OBJECT): src/callweave.bpf.c $(VMLINUX_HEADER)
 $(SKELETON_HEADER): $(BPF_OBJECT)
 	$(BPFTOOL) gen skeleton $< > $@
 
-$(BINARY): src/callweave.c $(SKELETON_HEADER)
-	$(CC) $(CFLAGS) $(LIBBPF_CFLAGS) $(LIBELF_CFLAGS) -Isrc $< -o $@ \
+$(BINARY): src/callweave.c src/report.c src/report.h $(SKELETON_HEADER)
+	$(CC) $(CFLAGS) $(LIBBPF_CFLAGS) $(LIBELF_CFLAGS) -Isrc \
+		src/callweave.c src/report.c -o $@ \
 		$(LIBBPF_LIBS) $(LIBELF_LIBS) $(ZLIB_LIBS)
 
 $(TEST_BINARY): test/test.c
@@ -78,13 +81,18 @@ $(THREAD_POOL_TEST_BINARY): test/test_thread_pool.c
 	$(CC) -std=gnu11 -O0 -g -Wall -Wextra -fno-omit-frame-pointer -fno-inline \
 		-rdynamic $< -o $@ -pthread
 
-test-program: $(TEST_BINARY) $(ASYNC_TEST_BINARY) $(THREAD_POOL_TEST_BINARY)
+$(COMPLEX_ASYNC_TEST_BINARY): test/test_complex_async.c
+	$(CC) -std=gnu11 -O0 -g -Wall -Wextra -fno-omit-frame-pointer -fno-inline \
+		-rdynamic $< -o $@ -pthread
+
+test-program: $(TEST_BINARY) $(ASYNC_TEST_BINARY) \
+	$(THREAD_POOL_TEST_BINARY) $(COMPLEX_ASYNC_TEST_BINARY)
 
 demo-async: all
 	bash test/run_async_demo.sh
 
 clean:
 	rm -f $(BINARY) $(TEST_BINARY) $(ASYNC_TEST_BINARY) \
-		$(THREAD_POOL_TEST_BINARY) $(BPF_OBJECT) \
+		$(THREAD_POOL_TEST_BINARY) $(COMPLEX_ASYNC_TEST_BINARY) $(BPF_OBJECT) \
 		$(VMLINUX_HEADER) \
 		$(SKELETON_HEADER)

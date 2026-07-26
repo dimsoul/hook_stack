@@ -5,3 +5,4 @@
 /test/trace_test
 /test/trace_async_test
 /test/trace_thread_pool_test
+/test/trace_complex_async_test

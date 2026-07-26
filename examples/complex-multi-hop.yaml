@@ -1,0 +1,21 @@
+# Complex four-thread pipeline with automatic target-argument discovery.
+
+target:
+  function: persist_result
+
+hops:
+  - source: submit_decode_task
+    source_arg: 2
+    target: decode_request
+
+  - source: submit_enrich_task
+    source_arg: 1
+    target: enrich_request
+
+  - source: submit_persist_task
+    source_arg: 2
+    target: persist_result
+
+filters:
+  max_events: 5
+  duration: 15

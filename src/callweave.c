@@ -27,10 +27,13 @@
 #include <bpf/libbpf.h>
 
 #include "callweave.skel.h"
+#include "report.h"
 
 #define MAX_STACK_DEPTH 128
 #define MAX_ASYNC_STACK_DEPTH 127
 #define MAX_ASYNC_HOPS 8
+#define ASYNC_HOP_ID_MASK 0xffffU
+#define ASYNC_TARGET_ARG_SHIFT 16
 
 enum event_type {
     EVENT_ENTRY,
@@ -53,6 +56,17 @@ struct async_hop_event {
     uint64_t runqueue_ns;
 };
 
+struct discovery_wakeup {
+    uint32_t pid;
+    uint32_t tid;
+    uint32_t global_pid;
+    uint32_t global_tid;
+    char comm[16];
+    int32_t stack_id;
+    int32_t pidns_error;
+    uint64_t wake_ns;
+};
+
 struct stack_trace_event {
     uint32_t pid;
     uint32_t tid;
@@ -71,6 +85,10 @@ struct stack_trace_event {
     uint32_t async_hop_count;
     uint32_t async_truncated;
     struct async_hop_event async_hops[MAX_ASYNC_HOPS];
+    uint32_t discovery_valid;
+    uint32_t discovery_reserved;
+    struct discovery_wakeup discovery_waker;
+    uint64_t discovery_wakeup_ns;
     uint64_t stack[MAX_STACK_DEPTH];
 };
 
@@ -86,16 +104,30 @@ struct output_options {
     bool show_duration;
     bool show_attribution;
     bool show_async;
+    bool show_discovery;
     int async_stack_map_fd;
+    int discovery_stack_map_fd;
     const struct async_hop_config *async_hops;
     size_t async_hop_count;
     const char *async_source_name;
     const char *final_target_name;
+    const char *target_path;
+    uint32_t discovery_target_arg;
+    uint64_t min_total_ns;
+    uint64_t min_queue_ns;
+    uint64_t min_work_ns;
+    uint32_t max_events;
+    uint32_t emitted_events;
+    bool json_output;
+    FILE *json_stream;
+    FILE *report_stream;
+    bool report_first;
+    bool export_failed;
 };
 
-_Static_assert(offsetof(struct stack_trace_event, stack) == 800,
+_Static_assert(offsetof(struct stack_trace_event, stack) == 864,
                "userspace and BPF event layouts differ");
-_Static_assert(sizeof(struct stack_trace_event) == 1824,
+_Static_assert(sizeof(struct stack_trace_event) == 1888,
                "userspace and BPF event sizes differ");
 
 struct proc_map {
@@ -221,6 +253,9 @@ static void usage(FILE *stream, const char *program)
             "  %s -p PID [--module MODULE] FUNCTION\n"
             "  %s -p PID [--module MODULE] --find-symbol SYMBOL\n"
             "  %s --binary BINARY --offset OFFSET\n"
+            "  %s -p PID --discover-async FUNCTION\n"
+            "  %s -p PID --config PATH\n"
+            "  %s --check-config PATH\n"
             "\n"
             "Options:\n"
             "  -p, --pid PID             only emit events from PID\n"
@@ -234,17 +269,33 @@ static void usage(FILE *stream, const char *program)
             "      --async-source FUNC    capture the producer stack at FUNC\n"
             "      --async-source-binary PATH\n"
             "                             ELF containing the producer function\n"
-            "      --async-source-arg N   producer key argument, 1-5 (default 1)\n"
-            "      --async-target-arg N   target key argument, 1-5 (default 1)\n"
+            "      --async-source-arg N   producer key argument, 1-8 (default 1)\n"
+            "      --async-target-arg N   target key argument, 1-8 or auto\n"
+            "                             (default auto)\n"
             "      --async-max-age-ms MS  discard older contexts (default 30000)\n"
-            "      --async-hop S,SA,T,TA  add one async hop (repeat up to 8)\n"
+            "      --async-hop S,SA,T[,TA]\n"
+            "                             add one async hop (repeat up to 8);\n"
+            "                             omitted TA scans target arg1-arg8\n"
             "                             async tracing implies --time and\n"
             "                             --attribution\n"
+            "      --discover-async FUNC  show the latest waker stack and a\n"
+            "                             candidate async-hop for FUNC\n"
+            "      --config PATH          load target, hops, and filters from\n"
+            "                             a callweave YAML config\n"
+            "      --check-config PATH    validate a config and exit\n"
+            "      --min-total-ms MS      only print chains at least MS total\n"
+            "      --min-queue-ms MS      require one hop with MS queue time\n"
+            "      --min-work-ms MS       require one hop with MS work time\n"
+            "      --max-events N         stop after N matching chains\n"
+            "      --duration SEC         stop tracing after SEC seconds\n"
+            "      --format FORMAT        text or json (default text)\n"
+            "      --output PATH          write JSON Lines to PATH\n"
+            "      --report PATH          write a self-contained HTML report\n"
             "  -h, --help                show this help\n"
             "\n"
             "When -p is used without --binary or --module, /proc/PID/exe is used.\n"
             "Without -p, an explicit BINARY is required.\n",
-            program, program, program, program);
+            program, program, program, program, program, program, program);
 }
 
 static int parse_pid(const char *text, pid_t *pid)
@@ -883,6 +934,16 @@ static void print_event_time(void)
         printf("[%s] ", buffer);
 }
 
+static uint64_t monotonic_time_ns(void)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now))
+        return 0;
+    return (uint64_t)now.tv_sec * 1000000000ULL +
+           (uint64_t)now.tv_nsec;
+}
+
 static void print_interval(const char *label, uint64_t nanoseconds)
 {
     if (nanoseconds >= 1000000000ULL)
@@ -956,7 +1017,9 @@ static void print_attribution(uint64_t duration_ns, uint64_t offcpu_ns,
 }
 
 static void print_stack_frames(const uint64_t *stack, int32_t stack_size,
-                               struct map_list *maps, const char *prefix)
+                               struct map_list *maps, const char *prefix,
+                               const char *candidate_path,
+                               char *candidate, size_t candidate_size)
 {
     struct frame_info frames[MAX_STACK_DEPTH] = {0};
     size_t frame_count;
@@ -997,6 +1060,20 @@ static void print_stack_frames(const uint64_t *stack, int32_t stack_size,
 
     resolve_frames(frames, frame_count);
     for (i = 0; i < frame_count; i++) {
+        if (candidate && candidate_size && !candidate[0] &&
+            candidate_path && frames[i].map &&
+            !strcmp(frames[i].map->path, candidate_path) &&
+            frames[i].symbol && strncmp(frames[i].symbol, "??", 2)) {
+            const char *separator = strstr(frames[i].symbol, " at ");
+            size_t length = separator ?
+                            (size_t)(separator - frames[i].symbol) :
+                            strlen(frames[i].symbol);
+
+            if (length >= candidate_size)
+                length = candidate_size - 1;
+            memcpy(candidate, frames[i].symbol, length);
+            candidate[length] = '\0';
+        }
         if (!frames[i].map) {
             printf("  %s#%-3zu 0x%016llx [unmapped]\n", prefix, i,
                    (unsigned long long)frames[i].ip);
@@ -1013,19 +1090,193 @@ static void print_stack_frames(const uint64_t *stack, int32_t stack_size,
     }
 }
 
+static bool has_async_chain_filters(const struct output_options *output)
+{
+    return output->min_total_ns || output->min_queue_ns ||
+           output->min_work_ns || output->max_events;
+}
+
+static bool async_chain_matches(const struct stack_trace_event *event,
+                                const struct output_options *output)
+{
+    uint64_t total_ns = 0;
+    uint64_t maximum_queue_ns = 0;
+    uint64_t maximum_work_ns = 0;
+    uint32_t count = event->async_hop_count;
+    uint32_t index;
+
+    if (!count)
+        return false;
+    if (count > MAX_ASYNC_HOPS)
+        count = MAX_ASYNC_HOPS;
+    for (index = 0; index < count; index++) {
+        const struct async_hop_event *hop = &event->async_hops[index];
+
+        if (UINT64_MAX - total_ns < hop->queue_ns)
+            total_ns = UINT64_MAX;
+        else
+            total_ns += hop->queue_ns;
+        if (UINT64_MAX - total_ns < hop->target_ns)
+            total_ns = UINT64_MAX;
+        else
+            total_ns += hop->target_ns;
+        if (hop->queue_ns > maximum_queue_ns)
+            maximum_queue_ns = hop->queue_ns;
+        if (hop->target_ns > maximum_work_ns)
+            maximum_work_ns = hop->target_ns;
+    }
+
+    return total_ns >= output->min_total_ns &&
+           maximum_queue_ns >= output->min_queue_ns &&
+           maximum_work_ns >= output->min_work_ns;
+}
+
+static uint64_t realtime_milliseconds(void)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_REALTIME, &now))
+        return 0;
+    return (uint64_t)now.tv_sec * 1000ULL +
+           (uint64_t)now.tv_nsec / 1000000ULL;
+}
+
+static void copy_report_comm(char destination[17],
+                             const char source[16])
+{
+    memcpy(destination, source, 16);
+    destination[16] = '\0';
+}
+
+static void build_report_chain(const struct stack_trace_event *event,
+                               const struct output_options *output,
+                               struct cw_report_chain *chain)
+{
+    uint32_t hop_count = event->async_hop_count;
+    uint32_t hop_index;
+
+    memset(chain, 0, sizeof(*chain));
+    chain->timestamp_ms = realtime_milliseconds();
+    chain->pid = event->pid;
+    chain->tid = event->tid;
+    copy_report_comm(chain->comm, event->comm);
+    chain->duration_ns = event->duration_ns;
+    chain->offcpu_ns = event->offcpu_ns;
+    chain->blocked_ns = event->blocked_ns;
+    chain->runqueue_ns = event->runqueue_ns;
+    chain->truncated = event->async_truncated;
+    if (hop_count > CW_REPORT_MAX_HOPS)
+        hop_count = CW_REPORT_MAX_HOPS;
+    chain->hop_count = hop_count;
+
+    for (hop_index = 0; hop_index < hop_count; hop_index++) {
+        const struct async_hop_event *source =
+            &event->async_hops[hop_index];
+        struct cw_report_hop *destination =
+            &chain->hops[hop_index];
+        uint32_t hop_id = source->reserved & ASYNC_HOP_ID_MASK;
+        uint32_t configured_hop =
+            hop_id ? hop_id - 1 : hop_index;
+
+        destination->index = configured_hop;
+        destination->pid = source->pid;
+        destination->tid = source->tid;
+        destination->target_tid =
+            hop_index + 1 < hop_count ?
+                event->async_hops[hop_index + 1].tid : event->tid;
+        destination->target_arg =
+            source->reserved >> ASYNC_TARGET_ARG_SHIFT;
+        copy_report_comm(destination->comm, source->comm);
+        if (configured_hop < output->async_hop_count) {
+            destination->source =
+                output->async_hops[configured_hop].source;
+            destination->target =
+                output->async_hops[configured_hop].target;
+        } else {
+            destination->source =
+                output->async_source_name ?
+                    output->async_source_name : "source";
+            destination->target =
+                output->final_target_name ?
+                    output->final_target_name : "target";
+        }
+        destination->key = source->key;
+        destination->queue_ns = source->queue_ns;
+        destination->work_ns = source->target_ns;
+        destination->offcpu_ns = source->offcpu_ns;
+        destination->blocked_ns = source->blocked_ns;
+        destination->runqueue_ns = source->runqueue_ns;
+    }
+}
+
+static void export_completed_chain(const struct stack_trace_event *event,
+                                   struct output_options *output)
+{
+    struct cw_report_chain chain;
+    bool failed = false;
+
+    if ((!output->json_stream && !output->report_stream) ||
+        output->export_failed)
+        return;
+    build_report_chain(event, output, &chain);
+    if (output->json_stream) {
+        failed = cw_write_chain_json(output->json_stream, &chain) ||
+                 fputc('\n', output->json_stream) == EOF ||
+                 fflush(output->json_stream);
+    }
+    if (!failed && output->report_stream) {
+        failed = cw_html_report_write(output->report_stream, &chain,
+                                      &output->report_first) ||
+                 fflush(output->report_stream);
+    }
+    if (failed) {
+        fprintf(stderr, "failed to write trace export: %s\n",
+                strerror(errno ? errno : EIO));
+        output->export_failed = true;
+        exiting = 1;
+    }
+}
+
+static void count_completed_chain(struct output_options *output)
+{
+    output->emitted_events++;
+    if (output->max_events &&
+        output->emitted_events >= output->max_events)
+        exiting = 1;
+}
+
 static int handle_event(void *context, void *data, size_t data_size)
 {
     const struct stack_trace_event *event = data;
-    const struct output_options *output = context;
+    struct output_options *output = context;
     struct map_list maps = {0};
     size_t header_size = offsetof(struct stack_trace_event, stack);
     size_t entry_size = sizeof(*event);
     uint32_t maps_pid;
 
+    if (output->max_events &&
+        output->emitted_events >= output->max_events)
+        return 0;
     if (data_size < header_size) {
         fprintf(stderr,
                 "short event header received: %zu bytes (expected %zu)\n",
                 data_size, header_size);
+        return 0;
+    }
+    if (output->show_async && has_async_chain_filters(output)) {
+        if (event->event_type == EVENT_ENTRY)
+            return 0;
+        if (event->event_type == EVENT_RETURN &&
+            !async_chain_matches(event, output))
+            return 0;
+    }
+    if (event->event_type == EVENT_RETURN && event->async_hop_count) {
+        export_completed_chain(event, output);
+        if (output->json_output) {
+            count_completed_chain(output);
+            return 0;
+        }
+    } else if (output->json_output) {
         return 0;
     }
     maps_pid = event->pid;
@@ -1107,22 +1358,28 @@ static int handle_event(void *context, void *data, size_t data_size)
             const struct async_hop_event *hop =
                 &event->async_hops[hop_index];
             uint64_t async_stack[MAX_ASYNC_STACK_DEPTH] = {0};
+            uint32_t hop_id = hop->reserved & ASYNC_HOP_ID_MASK;
+            uint32_t configured_hop =
+                hop_id ? hop_id - 1 : hop_index;
+            uint32_t matched_target_arg =
+                hop->reserved >> ASYNC_TARGET_ARG_SHIFT;
 
             const char *source_name = output->async_source_name;
             const char *target_name = output->final_target_name;
 
-            if (hop_index < output->async_hop_count) {
-                source_name = output->async_hops[hop_index].source;
-                target_name = output->async_hops[hop_index].target;
+            if (configured_hop < output->async_hop_count) {
+                source_name = output->async_hops[configured_hop].source;
+                target_name = output->async_hops[configured_hop].target;
             }
             printf("  async hop %u %s -> %s PID %u/TID %u (%.*s) "
-                   "key=0x%016llx\n",
-                   hop_index,
+                   "key=0x%016llx target-arg=%u\n",
+                   configured_hop,
                    source_name ? source_name : "source",
                    target_name ? target_name : "target",
                    hop->pid, hop->tid,
                    (int)sizeof(hop->comm), hop->comm,
-                   (unsigned long long)hop->key);
+                   (unsigned long long)hop->key,
+                   matched_target_arg);
             printf("    ");
             print_interval("queue", hop->queue_ns);
             if (hop->target_ns) {
@@ -1149,16 +1406,88 @@ static int handle_event(void *context, void *data, size_t data_size)
                        hop->stack_id, strerror(errno));
             } else {
                 print_stack_frames(async_stack, sizeof(async_stack),
-                                   &maps, "async ");
+                                   &maps, "async ", NULL, NULL, 0);
             }
         }
     }
+    if (output->show_discovery && event->discovery_valid) {
+        const struct discovery_wakeup *waker = &event->discovery_waker;
+        struct map_list waker_maps = {0};
+        uint64_t waker_stack[MAX_ASYNC_STACK_DEPTH] = {0};
+        char candidate[256] = {0};
+        uint32_t waker_maps_pid = waker->pid;
+
+        printf("  async discovery: latest waker PID %u/TID %u (%.*s)",
+               waker->pid, waker->tid, (int)sizeof(waker->comm),
+               waker->comm);
+        print_interval("wake-to-target", event->discovery_wakeup_ns);
+        putchar('\n');
+        if (waker->pid != waker->global_pid ||
+            waker->tid != waker->global_tid)
+            printf("  waker global PID %u/TID %u\n",
+                   waker->global_pid, waker->global_tid);
+        if (waker->pidns_error)
+            printf("  waker PID namespace translation failed: %s (%d)\n",
+                   strerror(-waker->pidns_error), waker->pidns_error);
+
+        if (read_process_maps(waker_maps_pid, &waker_maps) &&
+            waker->global_pid != waker_maps_pid) {
+            map_list_free(&waker_maps);
+            waker_maps_pid = waker->global_pid;
+            read_process_maps(waker_maps_pid, &waker_maps);
+        }
+
+        if (waker->stack_id < 0) {
+            printf("  unable to collect waker user stack: %s (%d)\n",
+                   strerror(-waker->stack_id), waker->stack_id);
+        } else if (output->discovery_stack_map_fd < 0) {
+            printf("  discovery stack map is unavailable\n");
+        } else if (bpf_map_lookup_elem(output->discovery_stack_map_fd,
+                                       &waker->stack_id, waker_stack)) {
+            printf("  discovery stack id %d is unavailable: %s\n",
+                   waker->stack_id, strerror(errno));
+        } else {
+            print_stack_frames(waker_stack, sizeof(waker_stack),
+                               &waker_maps, "waker ",
+                               output->target_path, candidate,
+                               sizeof(candidate));
+        }
+
+        if (candidate[0]) {
+            printf("  candidate source function: %s\n", candidate);
+            if (output->discovery_target_arg) {
+                printf("  suggested template:\n"
+                       "    --async-hop %s,?,%s,%u %s\n",
+                       candidate,
+                       output->final_target_name ?
+                           output->final_target_name : "TARGET",
+                       output->discovery_target_arg,
+                       output->final_target_name ?
+                           output->final_target_name : "TARGET");
+            } else {
+                printf("  suggested template:\n"
+                       "    --async-hop %s,?,%s %s\n",
+                       candidate,
+                       output->final_target_name ?
+                           output->final_target_name : "TARGET",
+                       output->final_target_name ?
+                           output->final_target_name : "TARGET");
+            }
+        } else {
+            printf("  no source symbol was inferred; inspect the waker "
+                   "stack and choose the enqueue/submit frame\n");
+        }
+        map_list_free(&waker_maps);
+    }
     if (event->event_type == EVENT_RETURN) {
+        if (output->show_async && event->async_hop_count)
+            count_completed_chain(output);
         putchar('\n');
         map_list_free(&maps);
         return 0;
     }
-    print_stack_frames(event->stack, event->stack_size, &maps, "");
+    print_stack_frames(event->stack, event->stack_size, &maps, "",
+                       NULL, NULL, 0);
     putchar('\n');
 
     map_list_free(&maps);
@@ -1172,6 +1501,17 @@ enum long_option_id {
     OPT_ASYNC_TARGET_ARG,
     OPT_ASYNC_MAX_AGE_MS,
     OPT_ASYNC_HOP,
+    OPT_DISCOVER_ASYNC,
+    OPT_CONFIG,
+    OPT_CHECK_CONFIG,
+    OPT_MIN_TOTAL_MS,
+    OPT_MIN_QUEUE_MS,
+    OPT_MIN_WORK_MS,
+    OPT_MAX_EVENTS,
+    OPT_DURATION,
+    OPT_FORMAT,
+    OPT_OUTPUT,
+    OPT_REPORT,
 };
 
 static void free_async_hops(struct async_hop_config *hops, size_t count)
@@ -1199,10 +1539,14 @@ static int parse_async_hop(const char *text, struct async_hop_config *hop)
          part && count < 4;
          part = strtok_r(NULL, ",", &save))
         parts[count++] = part;
-    if (part || count != 4 || !parts[0][0] || !parts[2][0])
+    if (part || count < 3 || count > 4 ||
+        !parts[0][0] || !parts[2][0])
         goto cleanup;
-    if (parse_u32_range(parts[1], 1, 5, &hop->source_arg) ||
-        parse_u32_range(parts[3], 1, 5, &hop->target_arg))
+    if (parse_u32_range(parts[1], 1, 8, &hop->source_arg))
+        goto cleanup;
+    hop->target_arg = 0;
+    if (count == 4 && strcmp(parts[3], "auto") &&
+        parse_u32_range(parts[3], 1, 8, &hop->target_arg))
         goto cleanup;
 
     hop->source = strdup(parts[0]);
@@ -1220,6 +1564,281 @@ cleanup:
     }
     free(copy);
     return error;
+}
+
+static char *trim_config_text(char *text)
+{
+    char *end;
+
+    while (*text == ' ' || *text == '\t')
+        text++;
+    end = text + strlen(text);
+    while (end > text &&
+           (end[-1] == ' ' || end[-1] == '\t' ||
+            end[-1] == '\n' || end[-1] == '\r'))
+        *--end = '\0';
+    return text;
+}
+
+static char *normalize_config_value(char *value)
+{
+    size_t length;
+
+    value = trim_config_text(value);
+    length = strlen(value);
+    if (length >= 2 &&
+        ((value[0] == '"' && value[length - 1] == '"') ||
+         (value[0] == '\'' && value[length - 1] == '\''))) {
+        value[length - 1] = '\0';
+        value++;
+    }
+    return value;
+}
+
+static int parse_config_ms(const char *path, size_t line_number,
+                           const char *name, const char *value,
+                           uint64_t *nanoseconds)
+{
+    uint32_t milliseconds;
+
+    if (parse_u32_range(value, 0, UINT32_MAX, &milliseconds)) {
+        fprintf(stderr, "%s:%zu: invalid %s value '%s'\n",
+                path, line_number, name, value);
+        return -1;
+    }
+    *nanoseconds = (uint64_t)milliseconds * 1000000ULL;
+    return 0;
+}
+
+static int parse_cli_ms(const char *option, const char *value,
+                        uint64_t *nanoseconds)
+{
+    uint32_t milliseconds;
+
+    if (parse_u32_range(value, 0, UINT32_MAX, &milliseconds)) {
+        fprintf(stderr, "invalid %s value: %s\n", option, value);
+        return -1;
+    }
+    *nanoseconds = (uint64_t)milliseconds * 1000000ULL;
+    return 0;
+}
+
+static int parse_trace_config(const char *path,
+                              struct async_hop_config *hops,
+                              size_t *hop_count,
+                              char **configured_function,
+                              struct output_options *output,
+                              uint32_t *duration_seconds)
+{
+    enum config_section {
+        CONFIG_NONE,
+        CONFIG_TARGET,
+        CONFIG_HOPS,
+        CONFIG_FILTERS,
+    } section = CONFIG_NONE;
+    bool source_arg_seen[MAX_ASYNC_HOPS] = {0};
+    bool target_arg_seen[MAX_ASYNC_HOPS] = {0};
+    FILE *file;
+    char *line = NULL;
+    size_t capacity = 0;
+    size_t line_number = 0;
+    int result = -1;
+
+    file = fopen(path, "r");
+    if (!file) {
+        fprintf(stderr, "cannot open config %s: %s\n",
+                path, strerror(errno));
+        return -1;
+    }
+
+    while (getline(&line, &capacity, file) >= 0) {
+        struct async_hop_config *hop = NULL;
+        char *key;
+        char *value;
+        char *separator;
+        bool new_hop = false;
+
+        line_number++;
+        key = trim_config_text(line);
+        if (!key[0] || key[0] == '#')
+            continue;
+        if (!strcmp(key, "target:")) {
+            section = CONFIG_TARGET;
+            continue;
+        }
+        if (!strcmp(key, "hops:")) {
+            section = CONFIG_HOPS;
+            continue;
+        }
+        if (!strcmp(key, "filters:")) {
+            section = CONFIG_FILTERS;
+            continue;
+        }
+
+        if (section == CONFIG_HOPS && key[0] == '-') {
+            key = trim_config_text(key + 1);
+            if (*hop_count >= MAX_ASYNC_HOPS) {
+                fprintf(stderr, "%s:%zu: at most %d hops are supported\n",
+                        path, line_number, MAX_ASYNC_HOPS);
+                goto cleanup;
+            }
+            hop = &hops[*hop_count];
+            (*hop_count)++;
+            new_hop = true;
+        } else if (section == CONFIG_HOPS && *hop_count) {
+            hop = &hops[*hop_count - 1];
+        }
+
+        separator = strchr(key, ':');
+        if (!separator) {
+            fprintf(stderr, "%s:%zu: expected KEY: VALUE\n",
+                    path, line_number);
+            goto cleanup;
+        }
+        *separator = '\0';
+        value = normalize_config_value(separator + 1);
+        key = trim_config_text(key);
+        if (!value[0]) {
+            fprintf(stderr, "%s:%zu: %s must not be empty\n",
+                    path, line_number, key);
+            goto cleanup;
+        }
+
+        if (section == CONFIG_TARGET) {
+            if (strcmp(key, "function")) {
+                fprintf(stderr, "%s:%zu: unknown target key '%s'\n",
+                        path, line_number, key);
+                goto cleanup;
+            }
+            if (*configured_function) {
+                fprintf(stderr, "%s:%zu: duplicate target function\n",
+                        path, line_number);
+                goto cleanup;
+            }
+            *configured_function = strdup(value);
+            if (!*configured_function)
+                goto cleanup;
+        } else if (section == CONFIG_HOPS && hop) {
+            size_t index = *hop_count - 1;
+
+            if (new_hop && strcmp(key, "source")) {
+                fprintf(stderr,
+                        "%s:%zu: each hop must begin with '- source:'\n",
+                        path, line_number);
+                goto cleanup;
+            }
+            if (!strcmp(key, "source")) {
+                if (hop->source) {
+                    fprintf(stderr, "%s:%zu: duplicate hop source\n",
+                            path, line_number);
+                    goto cleanup;
+                }
+                hop->source = strdup(value);
+                if (!hop->source)
+                    goto cleanup;
+            } else if (!strcmp(key, "source_arg")) {
+                if (parse_u32_range(value, 1, 8, &hop->source_arg)) {
+                    fprintf(stderr, "%s:%zu: invalid source_arg '%s'\n",
+                            path, line_number, value);
+                    goto cleanup;
+                }
+                source_arg_seen[index] = true;
+            } else if (!strcmp(key, "target")) {
+                if (hop->target) {
+                    fprintf(stderr, "%s:%zu: duplicate hop target\n",
+                            path, line_number);
+                    goto cleanup;
+                }
+                hop->target = strdup(value);
+                if (!hop->target)
+                    goto cleanup;
+            } else if (!strcmp(key, "target_arg")) {
+                if (target_arg_seen[index]) {
+                    fprintf(stderr, "%s:%zu: duplicate target_arg\n",
+                            path, line_number);
+                    goto cleanup;
+                }
+                if (!strcmp(value, "auto")) {
+                    hop->target_arg = 0;
+                } else if (parse_u32_range(value, 1, 8,
+                                           &hop->target_arg)) {
+                    fprintf(stderr, "%s:%zu: invalid target_arg '%s'\n",
+                            path, line_number, value);
+                    goto cleanup;
+                }
+                target_arg_seen[index] = true;
+            } else {
+                fprintf(stderr, "%s:%zu: unknown hop key '%s'\n",
+                        path, line_number, key);
+                goto cleanup;
+            }
+        } else if (section == CONFIG_FILTERS) {
+            if (!strcmp(key, "min_total_ms")) {
+                if (parse_config_ms(path, line_number, key, value,
+                                    &output->min_total_ns))
+                    goto cleanup;
+            } else if (!strcmp(key, "min_queue_ms")) {
+                if (parse_config_ms(path, line_number, key, value,
+                                    &output->min_queue_ns))
+                    goto cleanup;
+            } else if (!strcmp(key, "min_work_ms")) {
+                if (parse_config_ms(path, line_number, key, value,
+                                    &output->min_work_ns))
+                    goto cleanup;
+            } else if (!strcmp(key, "max_events")) {
+                if (parse_u32_range(value, 1, UINT32_MAX,
+                                    &output->max_events)) {
+                    fprintf(stderr, "%s:%zu: invalid max_events '%s'\n",
+                            path, line_number, value);
+                    goto cleanup;
+                }
+            } else if (!strcmp(key, "duration")) {
+                if (parse_u32_range(value, 1, UINT32_MAX,
+                                    duration_seconds)) {
+                    fprintf(stderr, "%s:%zu: invalid duration '%s'\n",
+                            path, line_number, value);
+                    goto cleanup;
+                }
+            } else {
+                fprintf(stderr, "%s:%zu: unknown filter key '%s'\n",
+                        path, line_number, key);
+                goto cleanup;
+            }
+        } else {
+            fprintf(stderr, "%s:%zu: value appears outside a known section\n",
+                    path, line_number);
+            goto cleanup;
+        }
+    }
+    if (ferror(file)) {
+        fprintf(stderr, "cannot read config %s: %s\n",
+                path, strerror(errno));
+        goto cleanup;
+    }
+    if (!*configured_function) {
+        fprintf(stderr, "%s: target.function is required\n", path);
+        goto cleanup;
+    }
+    if (!*hop_count) {
+        fprintf(stderr, "%s: at least one hop is required\n", path);
+        goto cleanup;
+    }
+    for (size_t index = 0; index < *hop_count; index++) {
+        if (!hops[index].source || !hops[index].target ||
+            !source_arg_seen[index]) {
+            fprintf(stderr,
+                    "%s: hop %zu requires source, source_arg, and target; "
+                    "target_arg is optional\n",
+                    path, index);
+            goto cleanup;
+        }
+    }
+    result = 0;
+
+cleanup:
+    free(line);
+    fclose(file);
+    return result;
 }
 
 int main(int argc, char **argv)
@@ -1244,6 +1863,17 @@ int main(int argc, char **argv)
         {"async-target-arg", required_argument, NULL, OPT_ASYNC_TARGET_ARG},
         {"async-max-age-ms", required_argument, NULL, OPT_ASYNC_MAX_AGE_MS},
         {"async-hop", required_argument, NULL, OPT_ASYNC_HOP},
+        {"discover-async", required_argument, NULL, OPT_DISCOVER_ASYNC},
+        {"config", required_argument, NULL, OPT_CONFIG},
+        {"check-config", required_argument, NULL, OPT_CHECK_CONFIG},
+        {"min-total-ms", required_argument, NULL, OPT_MIN_TOTAL_MS},
+        {"min-queue-ms", required_argument, NULL, OPT_MIN_QUEUE_MS},
+        {"min-work-ms", required_argument, NULL, OPT_MIN_WORK_MS},
+        {"max-events", required_argument, NULL, OPT_MAX_EVENTS},
+        {"duration", required_argument, NULL, OPT_DURATION},
+        {"format", required_argument, NULL, OPT_FORMAT},
+        {"output", required_argument, NULL, OPT_OUTPUT},
+        {"report", required_argument, NULL, OPT_REPORT},
         {0, 0, 0, 0},
     };
     struct bpf_uprobe_opts options = {
@@ -1255,6 +1885,7 @@ int main(int argc, char **argv)
     };
     struct output_options output = {
         .async_stack_map_fd = -1,
+        .discovery_stack_map_fd = -1,
     };
     struct callweave_bpf *skeleton = NULL;
     struct ring_buffer *ring_buffer = NULL;
@@ -1269,17 +1900,74 @@ int main(int argc, char **argv)
     const char *function_name = NULL;
     const char *async_source_name = NULL;
     const char *async_source_binary = NULL;
+    const char *discover_function = NULL;
+    const char *config_path = NULL;
+    const char *output_path = NULL;
+    const char *report_path = NULL;
+    char *configured_function = NULL;
     size_t function_offset = 0;
     uint32_t async_source_arg = 1;
-    uint32_t async_target_arg = 1;
+    uint32_t async_target_arg = 0;
     uint32_t async_max_age_ms = 30000;
+    uint32_t duration_seconds = 0;
+    uint64_t stop_time_ns = 0;
     size_t async_hop_count = 0;
     size_t async_link_count = 0;
     pid_t target_pid = -1;
     bool async_option_seen = false;
+    bool check_config = false;
+    bool json_output = false;
     int remaining_arguments;
     int option;
     int error = 0;
+    int argument_index;
+
+    for (argument_index = 1; argument_index < argc; argument_index++) {
+        const char *argument = argv[argument_index];
+
+        if (!strcmp(argument, "--config")) {
+            if (++argument_index >= argc || config_path) {
+                fprintf(stderr,
+                        "--config requires one path and may appear once\n");
+                return 2;
+            }
+            config_path = argv[argument_index];
+        } else if (!strcmp(argument, "--check-config")) {
+            if (++argument_index >= argc || config_path) {
+                fprintf(stderr,
+                        "--check-config requires one path and cannot be "
+                        "combined with --config\n");
+                return 2;
+            }
+            config_path = argv[argument_index];
+            check_config = true;
+        } else if (!strncmp(argument, "--config=", 9)) {
+            if (config_path || !argument[9]) {
+                fprintf(stderr,
+                        "--config requires one path and may appear once\n");
+                return 2;
+            }
+            config_path = argument + 9;
+        } else if (!strncmp(argument, "--check-config=", 15)) {
+            if (config_path || !argument[15]) {
+                fprintf(stderr,
+                        "--check-config requires one path and cannot be "
+                        "combined with --config\n");
+                return 2;
+            }
+            config_path = argument + 15;
+            check_config = true;
+        }
+    }
+    if (config_path) {
+        if (parse_trace_config(config_path, async_hops, &async_hop_count,
+                               &configured_function, &output,
+                               &duration_seconds)) {
+            error = 2;
+            goto cleanup;
+        }
+        output.show_async = true;
+    }
 
     while ((option = getopt_long(argc, argv, "hp:b:m:s:o:rta",
                                  long_options, NULL)) != -1) {
@@ -1325,7 +2013,7 @@ int main(int argc, char **argv)
             break;
         case OPT_ASYNC_SOURCE_ARG:
             async_option_seen = true;
-            if (parse_u32_range(optarg, 1, 5, &async_source_arg)) {
+            if (parse_u32_range(optarg, 1, 8, &async_source_arg)) {
                 fprintf(stderr, "invalid async source argument: %s\n",
                         optarg);
                 return 2;
@@ -1333,7 +2021,10 @@ int main(int argc, char **argv)
             break;
         case OPT_ASYNC_TARGET_ARG:
             async_option_seen = true;
-            if (parse_u32_range(optarg, 1, 5, &async_target_arg)) {
+            if (!strcmp(optarg, "auto")) {
+                async_target_arg = 0;
+            } else if (parse_u32_range(optarg, 1, 8,
+                                       &async_target_arg)) {
                 fprintf(stderr, "invalid async target argument: %s\n",
                         optarg);
                 return 2;
@@ -1347,6 +2038,12 @@ int main(int argc, char **argv)
             }
             break;
         case OPT_ASYNC_HOP:
+            if (config_path) {
+                fprintf(stderr,
+                        "--async-hop cannot be combined with --config\n");
+                error = 2;
+                goto cleanup;
+            }
             if (async_hop_count >= MAX_ASYNC_HOPS) {
                 fprintf(stderr, "at most %d async hops are supported\n",
                         MAX_ASYNC_HOPS);
@@ -1356,13 +2053,78 @@ int main(int argc, char **argv)
             if (parse_async_hop(optarg, &async_hops[async_hop_count])) {
                 fprintf(stderr,
                         "invalid async hop '%s'; expected "
-                        "SOURCE,SOURCE_ARG,TARGET,TARGET_ARG\n",
+                        "SOURCE,SOURCE_ARG,TARGET[,TARGET_ARG]\n",
                         optarg);
                 error = 2;
                 goto cleanup;
             }
             async_hop_count++;
             output.show_async = true;
+            break;
+        case OPT_DISCOVER_ASYNC:
+            discover_function = optarg;
+            output.show_discovery = true;
+            break;
+        case OPT_CONFIG:
+            break;
+        case OPT_CHECK_CONFIG:
+            break;
+        case OPT_MIN_TOTAL_MS:
+            if (parse_cli_ms("--min-total-ms", optarg,
+                             &output.min_total_ns)) {
+                error = 2;
+                goto cleanup;
+            }
+            break;
+        case OPT_MIN_QUEUE_MS:
+            if (parse_cli_ms("--min-queue-ms", optarg,
+                             &output.min_queue_ns)) {
+                error = 2;
+                goto cleanup;
+            }
+            break;
+        case OPT_MIN_WORK_MS:
+            if (parse_cli_ms("--min-work-ms", optarg,
+                             &output.min_work_ns)) {
+                error = 2;
+                goto cleanup;
+            }
+            break;
+        case OPT_MAX_EVENTS:
+            if (parse_u32_range(optarg, 1, UINT32_MAX,
+                                &output.max_events)) {
+                fprintf(stderr, "invalid maximum event count: %s\n",
+                        optarg);
+                error = 2;
+                goto cleanup;
+            }
+            break;
+        case OPT_DURATION:
+            if (parse_u32_range(optarg, 1, UINT32_MAX,
+                                &duration_seconds)) {
+                fprintf(stderr, "invalid duration: %s\n", optarg);
+                error = 2;
+                goto cleanup;
+            }
+            break;
+        case OPT_FORMAT:
+            if (!strcmp(optarg, "json")) {
+                json_output = true;
+            } else if (!strcmp(optarg, "text")) {
+                json_output = false;
+            } else {
+                fprintf(stderr,
+                        "invalid output format '%s'; expected text or json\n",
+                        optarg);
+                error = 2;
+                goto cleanup;
+            }
+            break;
+        case OPT_OUTPUT:
+            output_path = optarg;
+            break;
+        case OPT_REPORT:
+            report_path = optarg;
             break;
         default:
             usage(stderr, argv[0]);
@@ -1371,10 +2133,41 @@ int main(int argc, char **argv)
     }
 
     remaining_arguments = argc - optind;
+    if (check_config) {
+        if (remaining_arguments) {
+            fprintf(stderr,
+                    "--check-config does not accept positional arguments\n");
+            error = 2;
+            goto cleanup;
+        }
+        printf("%s: valid (%zu async hop%s)\n",
+               config_path, async_hop_count,
+               async_hop_count == 1 ? "" : "s");
+        goto cleanup;
+    }
     if (output.show_async) {
         output.show_duration = true;
         output.show_attribution = true;
     }
+    if (output_path && !json_output) {
+        fprintf(stderr, "--output requires --format json\n");
+        error = 2;
+        goto cleanup;
+    }
+    if ((json_output || report_path) && !output.show_async) {
+        fprintf(stderr,
+                "--format json and --report require async tracing via "
+                "--config, --async-hop, or --async-source\n");
+        error = 2;
+        goto cleanup;
+    }
+    if (output_path && report_path && !strcmp(output_path, report_path)) {
+        fprintf(stderr,
+                "--output and --report must use different paths\n");
+        error = 2;
+        goto cleanup;
+    }
+    output.json_output = json_output;
     if (module_name && target_pid <= 0) {
         fprintf(stderr, "--module requires --pid\n");
         return 2;
@@ -1383,6 +2176,27 @@ int main(int argc, char **argv)
         fprintf(stderr, "--module and --binary are mutually exclusive\n");
         return 2;
     }
+    if (output.show_discovery &&
+        (output.show_async || async_source_name || async_hop_count)) {
+        fprintf(stderr,
+                "--discover-async cannot be combined with async tracing\n");
+        error = 2;
+        goto cleanup;
+    }
+    if ((output.min_total_ns || output.min_queue_ns ||
+         output.min_work_ns || output.max_events) &&
+        !output.show_async) {
+        fprintf(stderr,
+                "chain filters require --config, --async-hop, or "
+                "--async-source\n");
+        error = 2;
+        goto cleanup;
+    }
+    if (output.show_discovery && target_pid <= 0) {
+        fprintf(stderr, "--discover-async requires --pid\n");
+        error = 2;
+        goto cleanup;
+    }
     if (async_hop_count && (async_source_name || async_option_seen)) {
         fprintf(stderr,
                 "--async-hop cannot be combined with the legacy "
@@ -1390,7 +2204,8 @@ int main(int argc, char **argv)
         error = 2;
         goto cleanup;
     }
-    if (!async_hop_count && async_option_seen && !async_source_name) {
+    if (!async_hop_count && async_option_seen && !async_source_name &&
+        !output.show_discovery) {
         fprintf(stderr,
                 "async tuning options require --async-source FUNCTION\n");
         error = 2;
@@ -1410,7 +2225,7 @@ int main(int argc, char **argv)
 
         if (offset_text || remaining_arguments ||
             output.show_return_value || output.show_duration ||
-            output.show_async) {
+            output.show_async || output.show_discovery) {
             fprintf(stderr,
                     "--find-symbol cannot be combined with --offset, "
                     "--ret, --time, --attribution, --async-source, or a "
@@ -1460,7 +2275,25 @@ int main(int argc, char **argv)
                                       find_symbol_name) ? 1 : 0;
     }
 
-    if (offset_text) {
+    if (configured_function) {
+        if (discover_function || offset_text || remaining_arguments) {
+            fprintf(stderr,
+                    "--config supplies target.function and cannot be "
+                    "combined with another target function\n");
+            error = 2;
+            goto cleanup;
+        }
+        function_name = configured_function;
+    } else if (discover_function) {
+        if (offset_text || remaining_arguments || !discover_function[0]) {
+            fprintf(stderr,
+                    "--discover-async accepts its target as the option "
+                    "argument and cannot be combined with --offset or a "
+                    "positional FUNCTION\n");
+            return 2;
+        }
+        function_name = discover_function;
+    } else if (offset_text) {
         if (remaining_arguments || !binary_argument || module_name) {
             fprintf(stderr,
                     "--offset requires --binary and no positional FUNCTION\n");
@@ -1489,6 +2322,7 @@ int main(int argc, char **argv)
     output.async_hop_count = async_hop_count;
     output.async_source_name = async_source_name;
     output.final_target_name = function_name;
+    output.discovery_target_arg = async_target_arg;
 
     if (module_name) {
         error = resolve_loaded_module(target_pid, module_name,
@@ -1511,6 +2345,7 @@ int main(int argc, char **argv)
                 "BINARY is required when --pid is not specified\n");
         return 2;
     }
+    output.target_path = target_path;
 
     if (async_hop_count) {
         const struct async_hop_config *last =
@@ -1563,6 +2398,7 @@ int main(int argc, char **argv)
         output.show_return_value || output.show_duration;
     skeleton->rodata->trace_attribution = output.show_attribution;
     skeleton->rodata->trace_async = output.show_async;
+    skeleton->rodata->trace_discovery = output.show_discovery;
     skeleton->rodata->async_source_arg = async_source_arg;
     skeleton->rodata->async_target_arg = async_target_arg;
     skeleton->rodata->async_max_age_ns =
@@ -1576,6 +2412,16 @@ int main(int argc, char **argv)
         if (error) {
             fprintf(stderr,
                     "failed to disable scheduler attribution programs: %s\n",
+                    strerror(-error));
+            goto cleanup;
+        }
+    }
+    if (!output.show_discovery) {
+        error = bpf_program__set_autoload(
+            skeleton->progs.trace_sched_waking, false);
+        if (error) {
+            fprintf(stderr,
+                    "failed to disable async discovery program: %s\n",
                     strerror(-error));
             goto cleanup;
         }
@@ -1610,6 +2456,8 @@ int main(int argc, char **argv)
         goto cleanup;
     }
     output.async_stack_map_fd = bpf_map__fd(skeleton->maps.async_stacks);
+    output.discovery_stack_map_fd =
+        bpf_map__fd(skeleton->maps.discovery_stacks);
 
     if (output.show_attribution) {
         error = attach_raw_tracepoint(
@@ -1619,6 +2467,12 @@ int main(int argc, char **argv)
             error = attach_raw_tracepoint(
                 skeleton->progs.trace_sched_wakeup,
                 &skeleton->links.trace_sched_wakeup, "sched_wakeup");
+        if (error)
+            goto cleanup;
+    } else if (output.show_discovery) {
+        error = attach_raw_tracepoint(
+            skeleton->progs.trace_sched_waking,
+            &skeleton->links.trace_sched_waking, "sched_waking");
         if (error)
             goto cleanup;
     }
@@ -1650,6 +2504,9 @@ int main(int argc, char **argv)
         size_t i;
 
         for (i = 0; i + 1 < async_hop_count; i++) {
+            uint64_t target_cookie =
+                (1ULL << 32) | async_hops[i].target_arg;
+
             error = attach_named_uprobe(
                 skeleton->progs.trace_async_target_return,
                 &async_links[async_link_count], target_path,
@@ -1660,16 +2517,20 @@ int main(int argc, char **argv)
             error = attach_named_uprobe(
                 skeleton->progs.trace_async_target,
                 &async_links[async_link_count], target_path,
-                async_hops[i].target, async_hops[i].target_arg, false);
+                async_hops[i].target, target_cookie, false);
             if (error)
                 goto cleanup;
             async_link_count++;
         }
         for (i = 0; i < async_hop_count; i++) {
+            uint64_t source_cookie =
+                ((uint64_t)(i + 1) << 32) |
+                async_hops[i].source_arg;
+
             error = attach_named_uprobe(
                 skeleton->progs.trace_async_source,
                 &async_links[async_link_count], target_path,
-                async_hops[i].source, async_hops[i].source_arg, false);
+                async_hops[i].source, source_cookie, false);
             if (error)
                 goto cleanup;
             async_link_count++;
@@ -1711,29 +2572,114 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    if (offset_text)
-        printf("Tracing %s+0x%zx", target_path, function_offset);
-    else
-        printf("Tracing %s:%s", target_path, function_name);
-    if (target_pid > 0)
-        printf(" in PID %d", target_pid);
-    else
-        printf(" in all processes");
-    if (output.show_return_value)
-        printf(", return values enabled");
-    if (output.show_duration)
-        printf(", timing enabled");
-    if (output.show_attribution)
-        printf(", scheduler attribution enabled");
-    if (async_hop_count)
-        printf(", %zu async hop%s enabled", async_hop_count,
-               async_hop_count == 1 ? "" : "s");
-    else if (output.show_async)
-        printf(", async source %s:%s arg%u -> target arg%u",
-               async_source_path, async_source_name,
-               async_source_arg, async_target_arg);
-    printf(". Press Ctrl+C to stop.\n");
+    if (json_output) {
+        if (output_path) {
+            output.json_stream = fopen(output_path, "w");
+            if (!output.json_stream) {
+                error = -errno;
+                fprintf(stderr, "cannot create JSON output %s: %s\n",
+                        output_path, strerror(errno));
+                goto cleanup;
+            }
+        } else {
+            output.json_stream = stdout;
+        }
+    }
+    if (report_path) {
+        FILE *report_stream = fopen(report_path, "w");
 
+        if (!report_stream) {
+            error = -errno;
+            fprintf(stderr, "cannot create HTML report %s: %s\n",
+                    report_path, strerror(errno));
+            goto cleanup;
+        }
+        output.report_first = true;
+        if (cw_html_report_begin(report_stream)) {
+            error = -(errno ? errno : EIO);
+            fprintf(stderr, "cannot initialize HTML report %s: %s\n",
+                    report_path, strerror(-error));
+            fclose(report_stream);
+            goto cleanup;
+        }
+        output.report_stream = report_stream;
+    }
+
+    if (json_output) {
+        if (offset_text)
+            fprintf(stderr, "Tracing %s+0x%zx", target_path,
+                    function_offset);
+        else
+            fprintf(stderr, "Tracing %s:%s", target_path, function_name);
+        if (target_pid > 0)
+            fprintf(stderr, " in PID %d", target_pid);
+        else
+            fprintf(stderr, " in all processes");
+        fprintf(stderr, ", JSON Lines output");
+        if (output_path)
+            fprintf(stderr, " to %s", output_path);
+        if (report_path)
+            fprintf(stderr, ", HTML report %s", report_path);
+        fprintf(stderr, ". Press Ctrl+C to stop.\n");
+    } else {
+        if (offset_text)
+            printf("Tracing %s+0x%zx", target_path, function_offset);
+        else
+            printf("Tracing %s:%s", target_path, function_name);
+        if (target_pid > 0)
+            printf(" in PID %d", target_pid);
+        else
+            printf(" in all processes");
+        if (output.show_return_value)
+            printf(", return values enabled");
+        if (output.show_duration)
+            printf(", timing enabled");
+        if (output.show_attribution)
+            printf(", scheduler attribution enabled");
+        if (async_hop_count)
+            printf(", %zu async hop%s enabled", async_hop_count,
+                   async_hop_count == 1 ? "" : "s");
+        else if (output.show_async) {
+            if (async_target_arg)
+                printf(", async source %s:%s arg%u -> target arg%u",
+                       async_source_path, async_source_name,
+                       async_source_arg, async_target_arg);
+            else
+                printf(", async source %s:%s arg%u -> target auto",
+                       async_source_path, async_source_name,
+                       async_source_arg);
+        }
+        if (output.show_discovery) {
+            if (async_target_arg)
+                printf(", async discovery enabled for target arg%u",
+                       async_target_arg);
+            else
+                printf(", async discovery enabled for target auto");
+        }
+        if (output.min_total_ns) {
+            printf(",");
+            print_interval("min-total", output.min_total_ns);
+        }
+        if (output.min_queue_ns) {
+            printf(",");
+            print_interval("min-queue", output.min_queue_ns);
+        }
+        if (output.min_work_ns) {
+            printf(",");
+            print_interval("min-work", output.min_work_ns);
+        }
+        if (output.max_events)
+            printf(", max events %u", output.max_events);
+        if (duration_seconds)
+            printf(", duration %u s", duration_seconds);
+        if (report_path)
+            printf(", HTML report %s", report_path);
+        printf(". Press Ctrl+C to stop.\n");
+    }
+
+    if (duration_seconds)
+        stop_time_ns = monotonic_time_ns() +
+                       (uint64_t)duration_seconds * 1000000000ULL;
     while (!exiting) {
         error = ring_buffer__poll(ring_buffer, 250);
         if (error == -EINTR) {
@@ -1748,9 +2694,30 @@ int main(int argc, char **argv)
             break;
         }
         error = 0;
+        if (stop_time_ns && monotonic_time_ns() >= stop_time_ns)
+            break;
     }
 
 cleanup:
+    if (output.report_stream) {
+        if ((cw_html_report_end(output.report_stream) ||
+             fflush(output.report_stream)) && !error) {
+            error = -(errno ? errno : EIO);
+            fprintf(stderr, "failed to finalize HTML report: %s\n",
+                    strerror(-error));
+        }
+        if (fclose(output.report_stream) && !error)
+            error = -errno;
+    }
+    if (output.json_stream) {
+        if (fflush(output.json_stream) && !error)
+            error = -errno;
+        if (output.json_stream != stdout &&
+            fclose(output.json_stream) && !error)
+            error = -errno;
+    }
+    if (output.export_failed && !error)
+        error = -EIO;
     while (async_link_count)
         bpf_link__destroy(async_links[--async_link_count]);
     if (ring_buffer)
@@ -1758,5 +2725,6 @@ cleanup:
     if (skeleton)
         callweave_bpf__destroy(skeleton);
     free_async_hops(async_hops, async_hop_count);
+    free(configured_function);
     return error ? 1 : 0;
 }

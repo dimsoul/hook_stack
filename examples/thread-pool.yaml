@@ -1,0 +1,21 @@
+# callweave configuration for test/trace_thread_pool_test
+
+target:
+  function: write_result
+
+hops:
+  - source: submit_compute_task
+    source_arg: 2
+    target: process_request
+    target_arg: 1
+  - source: submit_storage_task
+    source_arg: 2
+    target: write_result
+    target_arg: 1
+
+filters:
+  min_total_ms: 100
+  min_queue_ms: 10
+  min_work_ms: 20
+  max_events: 10
+  duration: 30
