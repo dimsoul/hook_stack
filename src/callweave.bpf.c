@@ -11,10 +11,35 @@
 #define MAX_NESTED_CALLS 16
 #define ASYNC_HOP_ID_MASK 0xffffU
 #define ASYNC_TARGET_ARG_SHIFT 16
+#define FUTEX_CMD_MASK 0x7fU
+#define FUTEX_WAIT 0U
+#define FUTEX_WAKE 1U
+#define FUTEX_WAIT_BITSET 9U
+#define FUTEX_WAKE_BITSET 10U
+
+enum wait_kind {
+    WAIT_KIND_NONE,
+    WAIT_KIND_FUTEX,
+};
 
 enum event_type {
     EVENT_ENTRY,
     EVENT_RETURN,
+};
+
+struct wait_resource {
+    u64 address;
+    u64 duration_ns;
+    u64 wake_ns;
+    u32 kind;
+    u32 operation;
+    u32 waker_pid;
+    u32 waker_tid;
+    u32 waker_global_pid;
+    u32 waker_global_tid;
+    s32 waker_stack_id;
+    s32 waker_pidns_error;
+    char waker_comm[16];
 };
 
 struct async_hop_event {
@@ -31,6 +56,7 @@ struct async_hop_event {
     u64 offcpu_ns;
     u64 blocked_ns;
     u64 runqueue_ns;
+    struct wait_resource wait;
 };
 
 struct discovery_wakeup {
@@ -54,11 +80,13 @@ struct stack_trace_event {
     s32 pidns_error;
     u32 event_type;
     u32 reserved;
+    u64 timestamp_ns;
     u64 duration_ns;
     s64 return_value;
     u64 offcpu_ns;
     u64 blocked_ns;
     u64 runqueue_ns;
+    struct wait_resource wait;
     u32 async_hop_count;
     u32 async_truncated;
     struct async_hop_event async_hops[MAX_ASYNC_HOPS];
@@ -87,6 +115,9 @@ struct invocation_state {
     u64 offcpu_ns;
     u64 blocked_ns;
     u64 runqueue_ns;
+    struct wait_resource wait;
+    u32 async_stats_done;
+    u32 reserved;
 };
 
 struct async_context_key {
@@ -110,6 +141,7 @@ struct async_hop_context {
     u64 offcpu_ns;
     u64 blocked_ns;
     u64 runqueue_ns;
+    struct wait_resource wait;
 };
 
 struct async_chain {
@@ -125,9 +157,69 @@ struct async_target_thread {
     u64 wakeup_ns;
 };
 
-_Static_assert(__builtin_offsetof(struct stack_trace_event, stack) == 864,
+struct async_hop_stats {
+    u64 submitted;
+    u64 started;
+    u64 completed;
+    u64 pending;
+    u64 peak_pending;
+    u64 active;
+    u64 peak_active;
+    u64 queue_total_ns;
+    u64 work_total_ns;
+    u64 futex_waits;
+    u64 futex_wait_ns;
+    u64 duplicate_keys;
+    u64 expired;
+    u64 unmatched_targets;
+    u64 dropped;
+};
+
+struct async_worker_key {
+    u32 hop_index;
+    u32 global_tid;
+};
+
+struct async_worker_stats {
+    u64 started;
+    u64 completed;
+    u64 active;
+    u64 peak_active;
+    u64 work_total_ns;
+    u64 blocked_total_ns;
+    u64 futex_waits;
+    u32 pid;
+    u32 tid;
+    char comm[16];
+};
+
+struct futex_wait_state {
+    u64 address;
+    u64 start_ns;
+    u32 operation;
+    u32 reserved;
+};
+
+struct futex_resource_key {
+    u32 global_pid;
+    u32 reserved;
+    u64 address;
+};
+
+struct futex_waker {
+    u64 wake_ns;
+    u32 pid;
+    u32 tid;
+    u32 global_pid;
+    u32 global_tid;
+    s32 stack_id;
+    s32 pidns_error;
+    char comm[16];
+};
+
+_Static_assert(__builtin_offsetof(struct stack_trace_event, stack) == 1520,
                "unexpected BPF event layout");
-_Static_assert(sizeof(struct stack_trace_event) == 1888,
+_Static_assert(sizeof(struct stack_trace_event) == 2544,
                "unexpected BPF event size");
 
 const volatile __u64 pidns_dev;
@@ -140,6 +232,8 @@ const volatile __u32 trace_discovery;
 const volatile __u32 async_source_arg;
 const volatile __u32 async_target_arg;
 const volatile __u64 async_max_age_ns;
+const volatile __u32 async_final_hop_id;
+const volatile __s32 futex_syscall_nr;
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -229,6 +323,34 @@ struct {
     __type(key, u32);
     __type(value, u64[MAX_ASYNC_STACK_DEPTH]);
 } discovery_stacks SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 16384);
+    __type(key, u64);
+    __type(value, struct futex_wait_state);
+} futex_waits SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 16384);
+    __type(key, struct futex_resource_key);
+    __type(value, struct futex_waker);
+} futex_wakers SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, MAX_ASYNC_HOPS);
+    __type(key, u32);
+    __type(value, struct async_hop_stats);
+} async_hop_stats SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 4096);
+    __type(key, struct async_worker_key);
+    __type(value, struct async_worker_stats);
+} async_worker_stats SEC(".maps");
 
 static __always_inline int get_process_info(u64 *pid_tgid, u32 *global_pid,
                                             u32 *global_tid, u32 *pid,
@@ -394,6 +516,150 @@ static __always_inline void move_async_hop(
     destination->offcpu_ns = source->offcpu_ns;
     destination->blocked_ns = source->blocked_ns;
     destination->runqueue_ns = source->runqueue_ns;
+    __builtin_memcpy(&destination->wait, &source->wait,
+                     sizeof(destination->wait));
+}
+
+static __always_inline u32 async_hop_index(u32 reserved)
+{
+    u32 hop_id = reserved & ASYNC_HOP_ID_MASK;
+
+    return hop_id ? hop_id - 1 : 0;
+}
+
+static __always_inline void update_peak(u64 *peak, u64 value)
+{
+    u64 previous = *peak;
+
+    if (value > previous)
+        __sync_val_compare_and_swap(peak, previous, value);
+}
+
+static __always_inline void async_stats_submitted(u32 hop_index,
+                                                  int duplicate)
+{
+    struct async_hop_stats *stats;
+    u64 pending;
+
+    if (hop_index >= MAX_ASYNC_HOPS)
+        return;
+    stats = bpf_map_lookup_elem(&async_hop_stats, &hop_index);
+    if (!stats)
+        return;
+    __sync_fetch_and_add(&stats->submitted, 1);
+    if (duplicate) {
+        __sync_fetch_and_add(&stats->duplicate_keys, 1);
+        return;
+    }
+    pending = __sync_add_and_fetch(&stats->pending, 1);
+    update_peak(&stats->peak_pending, pending);
+}
+
+static __always_inline void async_stats_unmatched(u32 hop_index)
+{
+    struct async_hop_stats *stats;
+
+    if (hop_index >= MAX_ASYNC_HOPS)
+        return;
+    stats = bpf_map_lookup_elem(&async_hop_stats, &hop_index);
+    if (stats)
+        __sync_fetch_and_add(&stats->unmatched_targets, 1);
+}
+
+static __always_inline void async_stats_expired(u32 hop_index)
+{
+    struct async_hop_stats *stats;
+
+    if (hop_index >= MAX_ASYNC_HOPS)
+        return;
+    stats = bpf_map_lookup_elem(&async_hop_stats, &hop_index);
+    if (!stats)
+        return;
+    if (stats->pending)
+        __sync_fetch_and_sub(&stats->pending, 1);
+    __sync_fetch_and_add(&stats->expired, 1);
+}
+
+static __always_inline void async_stats_started(
+    u32 hop_index, u64 queue_ns, u32 pid, u32 tid, u32 global_tid)
+{
+    struct async_worker_key worker_key = {
+        .hop_index = hop_index,
+        .global_tid = global_tid,
+    };
+    struct async_worker_stats initial_worker = {
+        .pid = pid,
+        .tid = tid,
+    };
+    struct async_worker_stats *worker;
+    struct async_hop_stats *stats;
+    u64 active;
+    u64 worker_active;
+
+    if (hop_index >= MAX_ASYNC_HOPS)
+        return;
+    stats = bpf_map_lookup_elem(&async_hop_stats, &hop_index);
+    if (!stats)
+        return;
+    if (stats->pending)
+        __sync_fetch_and_sub(&stats->pending, 1);
+    __sync_fetch_and_add(&stats->started, 1);
+    __sync_fetch_and_add(&stats->queue_total_ns, queue_ns);
+    active = __sync_add_and_fetch(&stats->active, 1);
+    update_peak(&stats->peak_active, active);
+
+    bpf_get_current_comm(initial_worker.comm, sizeof(initial_worker.comm));
+    bpf_map_update_elem(&async_worker_stats, &worker_key,
+                        &initial_worker, BPF_NOEXIST);
+    worker = bpf_map_lookup_elem(&async_worker_stats, &worker_key);
+    if (!worker)
+        return;
+    worker->pid = pid;
+    worker->tid = tid;
+    __builtin_memcpy(worker->comm, initial_worker.comm,
+                     sizeof(worker->comm));
+    __sync_fetch_and_add(&worker->started, 1);
+    worker_active = __sync_add_and_fetch(&worker->active, 1);
+    update_peak(&worker->peak_active, worker_active);
+}
+
+static __always_inline void async_stats_completed(
+    u32 hop_index, u64 work_ns, u64 blocked_ns,
+    u32 wait_kind, u64 wait_duration_ns, u32 global_tid, int dropped)
+{
+    struct async_worker_key worker_key = {
+        .hop_index = hop_index,
+        .global_tid = global_tid,
+    };
+    struct async_worker_stats *worker;
+    struct async_hop_stats *stats;
+
+    if (hop_index >= MAX_ASYNC_HOPS)
+        return;
+    stats = bpf_map_lookup_elem(&async_hop_stats, &hop_index);
+    if (!stats)
+        return;
+    if (stats->active)
+        __sync_fetch_and_sub(&stats->active, 1);
+    __sync_fetch_and_add(&stats->completed, 1);
+    __sync_fetch_and_add(&stats->work_total_ns, work_ns);
+    if (wait_kind == WAIT_KIND_FUTEX) {
+        __sync_fetch_and_add(&stats->futex_waits, 1);
+        __sync_fetch_and_add(&stats->futex_wait_ns, wait_duration_ns);
+    }
+    if (dropped)
+        __sync_fetch_and_add(&stats->dropped, 1);
+
+    worker = bpf_map_lookup_elem(&async_worker_stats, &worker_key);
+    if (!worker)
+        return;
+    if (worker->active)
+        __sync_fetch_and_sub(&worker->active, 1);
+    __sync_fetch_and_add(&worker->completed, 1);
+    __sync_fetch_and_add(&worker->work_total_ns, work_ns);
+    __sync_fetch_and_add(&worker->blocked_total_ns, blocked_ns);
+    if (wait_kind == WAIT_KIND_FUTEX)
+        __sync_fetch_and_add(&worker->futex_waits, 1);
 }
 
 SEC("uprobe")
@@ -414,8 +680,10 @@ int trace_async_source(struct pt_regs *ctx)
     u32 zero = 0;
     u32 argument;
     u32 hop_index;
+    u32 stats_hop;
     u32 depth = 0;
     u64 now;
+    int duplicate;
     int i;
     s32 pidns_error;
 
@@ -430,6 +698,7 @@ int trace_async_source(struct pt_regs *ctx)
     key.value = read_uprobe_argument(ctx, argument);
     if (!key.value)
         return 0;
+    duplicate = bpf_map_lookup_elem(&async_contexts, &key) != NULL;
 
     scratch = bpf_map_lookup_elem(&async_scratch, &zero);
     if (!scratch)
@@ -451,7 +720,11 @@ int trace_async_source(struct pt_regs *ctx)
     if (active) {
         struct invocation_state *invocation;
 
-        __builtin_memcpy(scratch, active, sizeof(*scratch));
+        scratch->hop_count = active->hop_count;
+        scratch->truncated = active->truncated;
+#pragma unroll
+        for (i = 0; i < MAX_ASYNC_HOPS; i++)
+            move_async_hop(&scratch->hops[i], &active->hops[i]);
         lineage_key.pid_tgid = pid_tgid;
         lineage_key.depth = depth - 1;
         invocation = bpf_map_lookup_elem(&async_target_invocations,
@@ -467,6 +740,19 @@ int trace_async_source(struct pt_regs *ctx)
                 previous->offcpu_ns = invocation->offcpu_ns;
                 previous->blocked_ns = invocation->blocked_ns;
                 previous->runqueue_ns = invocation->runqueue_ns;
+                __builtin_memcpy(&previous->wait, &invocation->wait,
+                                 sizeof(previous->wait));
+                if (!invocation->async_stats_done) {
+                    invocation->async_stats_done = 1;
+                    async_stats_completed(
+                        async_hop_index(previous->reserved),
+                        previous->target_ns, previous->blocked_ns,
+                        previous->wait.kind, previous->wait.duration_ns,
+                        global_tid, 0);
+                    scratch = bpf_map_lookup_elem(&async_scratch, &zero);
+                    if (!scratch)
+                        return 0;
+                }
             }
         }
     } else {
@@ -498,11 +784,14 @@ int trace_async_source(struct pt_regs *ctx)
     hop->offcpu_ns = 0;
     hop->blocked_ns = 0;
     hop->runqueue_ns = 0;
+    __builtin_memset(&hop->wait, 0, sizeof(hop->wait));
     bpf_get_current_comm(hop->comm, sizeof(hop->comm));
     hop->stack_id = bpf_get_stackid(ctx, &async_stacks, BPF_F_USER_STACK);
     scratch->hop_count = hop_index + 1;
+    stats_hop = async_hop_index(hop->reserved);
 
     bpf_map_update_elem(&async_contexts, &key, scratch, BPF_ANY);
+    async_stats_submitted(stats_hop, duplicate);
     return 0;
 }
 
@@ -524,8 +813,11 @@ int trace_async_target(struct pt_regs *ctx)
     u32 tid;
     u32 argument;
     u32 matched_argument;
+    u32 expected_hop;
+    u32 stats_hop;
     u32 depth;
     u32 last;
+    u64 queue_ns;
     s32 pidns_error;
 
     if (!trace_async ||
@@ -551,15 +843,20 @@ int trace_async_target(struct pt_regs *ctx)
 
     cookie = bpf_get_attach_cookie(ctx);
     argument = cookie ? (u32)cookie : async_target_arg;
+    expected_hop = async_hop_index((u32)(cookie >> 32));
     context_key.global_pid = global_pid;
     context_key.value = resolve_target_key(ctx, global_pid, argument,
                                            &matched_argument);
-    if (!context_key.value)
+    if (!context_key.value) {
+        async_stats_unmatched(expected_hop);
         return 0;
+    }
 
     chain = bpf_map_lookup_elem(&async_contexts, &context_key);
-    if (!chain || !chain->hop_count)
+    if (!chain || !chain->hop_count) {
+        async_stats_unmatched(expected_hop);
         return 0;
+    }
     last = chain->hop_count - 1;
     if (last >= MAX_ASYNC_HOPS)
         return 0;
@@ -570,10 +867,13 @@ int trace_async_target(struct pt_regs *ctx)
     now = bpf_ktime_get_ns();
     if (async_max_age_ns &&
         now - chain->hops[last].source_ns > async_max_age_ns) {
+        async_stats_expired(async_hop_index(chain->hops[last].reserved));
         bpf_map_delete_elem(&async_contexts, &context_key);
         return 0;
     }
     chain->hops[last].queue_ns = now - chain->hops[last].source_ns;
+    stats_hop = async_hop_index(chain->hops[last].reserved);
+    queue_ns = chain->hops[last].queue_ns;
 
     lineage_key.pid_tgid = pid_tgid;
     lineage_key.depth = depth;
@@ -582,6 +882,7 @@ int trace_async_target(struct pt_regs *ctx)
                         &invocation, BPF_ANY);
     bpf_map_update_elem(&active_lineages, &lineage_key, chain, BPF_ANY);
     bpf_map_delete_elem(&async_contexts, &context_key);
+    async_stats_started(stats_hop, queue_ns, pid, tid, global_tid);
     return 0;
 }
 
@@ -590,7 +891,10 @@ int trace_async_target_return(struct pt_regs *ctx)
 {
     struct async_target_thread *target_thread;
     struct invocation_key lineage_key = {0};
+    struct invocation_state *invocation;
+    struct async_chain *lineage;
     u64 pid_tgid = bpf_get_current_pid_tgid();
+    u64 now = bpf_ktime_get_ns();
     u32 depth;
 
     (void)ctx;
@@ -606,6 +910,22 @@ int trace_async_target_return(struct pt_regs *ctx)
     if (depth < MAX_NESTED_CALLS) {
         lineage_key.pid_tgid = pid_tgid;
         lineage_key.depth = depth;
+        invocation = bpf_map_lookup_elem(&async_target_invocations,
+                                         &lineage_key);
+        lineage = bpf_map_lookup_elem(&active_lineages, &lineage_key);
+        if (invocation && !invocation->async_stats_done &&
+            lineage && lineage->hop_count) {
+            u32 last = lineage->hop_count - 1;
+
+            if (last < MAX_ASYNC_HOPS && now >= invocation->start_ns) {
+                invocation->async_stats_done = 1;
+                async_stats_completed(
+                    async_hop_index(lineage->hops[last].reserved),
+                    now - invocation->start_ns, invocation->blocked_ns,
+                    invocation->wait.kind, invocation->wait.duration_ns,
+                    (u32)pid_tgid, 1);
+            }
+        }
         bpf_map_delete_elem(&async_target_invocations, &lineage_key);
         bpf_map_delete_elem(&active_lineages, &lineage_key);
     }
@@ -662,6 +982,8 @@ static __always_inline void copy_async_hop_to_event(
     destination->offcpu_ns = source->offcpu_ns;
     destination->blocked_ns = source->blocked_ns;
     destination->runqueue_ns = source->runqueue_ns;
+    __builtin_memcpy(&destination->wait, &source->wait,
+                     sizeof(destination->wait));
 }
 
 static __always_inline void copy_async_chain_to_event(
@@ -693,25 +1015,34 @@ static __always_inline void copy_async_chain_to_event(
 
 static __always_inline void consume_async_context(
     struct pt_regs *ctx, struct stack_trace_event *event, u32 global_pid,
-    struct invocation_key *final_key)
+    u32 global_tid, u32 pid, u32 tid, struct invocation_key *final_key)
 {
     struct async_context_key key = {
         .global_pid = global_pid,
     };
     struct async_chain *chain;
     u64 now;
+    u64 queue_ns;
     u32 last;
     u32 matched_argument;
+    u32 stats_hop;
 
-    clear_async_event(event);
+    if (event)
+        clear_async_event(event);
     key.value = resolve_target_key(ctx, global_pid, async_target_arg,
                                    &matched_argument);
-    if (!key.value)
+    if (!key.value) {
+        if (async_final_hop_id)
+            async_stats_unmatched(async_final_hop_id - 1);
         return;
+    }
 
     chain = bpf_map_lookup_elem(&async_contexts, &key);
-    if (!chain || !chain->hop_count)
+    if (!chain || !chain->hop_count) {
+        if (async_final_hop_id)
+            async_stats_unmatched(async_final_hop_id - 1);
         return;
+    }
     last = chain->hop_count - 1;
     if (last >= MAX_ASYNC_HOPS)
         return;
@@ -721,17 +1052,22 @@ static __always_inline void consume_async_context(
     now = bpf_ktime_get_ns();
     if (async_max_age_ns &&
         now - chain->hops[last].source_ns > async_max_age_ns) {
+        async_stats_expired(async_hop_index(chain->hops[last].reserved));
         bpf_map_delete_elem(&async_contexts, &key);
         return;
     }
     chain->hops[last].queue_ns = now - chain->hops[last].source_ns;
+    stats_hop = async_hop_index(chain->hops[last].reserved);
+    queue_ns = chain->hops[last].queue_ns;
     if (final_key) {
         bpf_map_update_elem(&final_lineages, final_key, chain, BPF_ANY);
-        clear_async_event(event);
-    } else {
+        if (event)
+            clear_async_event(event);
+    } else if (event) {
         copy_async_chain_to_event(event, chain);
     }
     bpf_map_delete_elem(&async_contexts, &key);
+    async_stats_started(stats_hop, queue_ns, pid, tid, global_tid);
 }
 
 static __always_inline void fill_entry_event(
@@ -741,11 +1077,13 @@ static __always_inline void fill_entry_event(
     fill_process_info(event, global_pid, global_tid, pid, tid, pidns_error);
     event->event_type = EVENT_ENTRY;
     event->reserved = 0;
+    event->timestamp_ns = bpf_ktime_get_ns();
     event->duration_ns = 0;
     event->return_value = 0;
     event->offcpu_ns = 0;
     event->blocked_ns = 0;
     event->runqueue_ns = 0;
+    __builtin_memset(&event->wait, 0, sizeof(event->wait));
     event->stack_size = bpf_get_stack(ctx, event->stack,
                                       sizeof(event->stack),
                                       BPF_F_USER_STACK);
@@ -837,6 +1175,174 @@ static __always_inline void add_async_offcpu_interval(
     thread->wakeup_ns = 0;
 }
 
+static __always_inline int is_futex_wait_operation(u32 operation)
+{
+    return operation == FUTEX_WAIT || operation == FUTEX_WAIT_BITSET;
+}
+
+static __always_inline int is_futex_wake_operation(u32 operation)
+{
+    return operation == FUTEX_WAKE || operation == FUTEX_WAKE_BITSET;
+}
+
+static __always_inline int is_traced_invocation(u64 pid_tgid)
+{
+    struct thread_state *thread =
+        bpf_map_lookup_elem(&thread_states, &pid_tgid);
+    struct async_target_thread *async_thread =
+        bpf_map_lookup_elem(&async_target_threads, &pid_tgid);
+
+    return (thread && thread->depth) ||
+           (async_thread && async_thread->depth);
+}
+
+static __always_inline void update_regular_futex_wait(
+    u64 pid_tgid, const struct wait_resource *wait)
+{
+    struct thread_state *thread =
+        bpf_map_lookup_elem(&thread_states, &pid_tgid);
+    struct invocation_key key = {
+        .pid_tgid = pid_tgid,
+    };
+    struct invocation_state *invocation;
+
+    if (!thread || !thread->depth)
+        return;
+    key.depth = thread->depth - 1;
+    if (key.depth >= MAX_NESTED_CALLS)
+        return;
+    invocation = bpf_map_lookup_elem(&invocation_states, &key);
+    if (invocation && wait->duration_ns > invocation->wait.duration_ns)
+        __builtin_memcpy(&invocation->wait, wait,
+                         sizeof(invocation->wait));
+}
+
+static __always_inline void update_async_futex_wait(
+    u64 pid_tgid, const struct wait_resource *wait)
+{
+    struct async_target_thread *thread =
+        bpf_map_lookup_elem(&async_target_threads, &pid_tgid);
+    struct invocation_key key = {
+        .pid_tgid = pid_tgid,
+    };
+    struct invocation_state *invocation;
+
+    if (!thread || !thread->depth)
+        return;
+    key.depth = thread->depth - 1;
+    if (key.depth >= MAX_NESTED_CALLS)
+        return;
+    invocation = bpf_map_lookup_elem(&async_target_invocations, &key);
+    if (invocation && wait->duration_ns > invocation->wait.duration_ns)
+        __builtin_memcpy(&invocation->wait, wait,
+                         sizeof(invocation->wait));
+}
+
+SEC("raw_tp/sys_enter")
+int trace_sys_enter(struct bpf_raw_tracepoint_args *ctx)
+{
+    struct pt_regs *registers = (struct pt_regs *)ctx->args[0];
+    struct futex_wait_state wait = {0};
+    struct futex_resource_key resource_key = {0};
+    struct futex_waker waker = {0};
+    u64 pid_tgid;
+    u64 address;
+    u32 global_pid;
+    u32 global_tid;
+    u32 pid;
+    u32 tid;
+    u32 operation;
+    s32 pidns_error;
+
+    if (!trace_attribution || (s32)ctx->args[1] != futex_syscall_nr)
+        return 0;
+    if (!get_process_info(&pid_tgid, &global_pid, &global_tid, &pid, &tid,
+                          &pidns_error))
+        return 0;
+
+    address = PT_REGS_PARM1_CORE_SYSCALL(registers);
+    operation = (u32)PT_REGS_PARM2_CORE_SYSCALL(registers) &
+                FUTEX_CMD_MASK;
+    if (!address)
+        return 0;
+
+    if (is_futex_wait_operation(operation)) {
+        if (!is_traced_invocation(pid_tgid))
+            return 0;
+        wait.address = address;
+        wait.start_ns = bpf_ktime_get_ns();
+        wait.operation = operation;
+        bpf_map_update_elem(&futex_waits, &pid_tgid, &wait, BPF_ANY);
+        return 0;
+    }
+    if (!is_futex_wake_operation(operation))
+        return 0;
+
+    resource_key.global_pid = global_pid;
+    resource_key.address = address;
+    waker.wake_ns = bpf_ktime_get_ns();
+    waker.pid = pid;
+    waker.tid = tid;
+    waker.global_pid = global_pid;
+    waker.global_tid = global_tid;
+    waker.pidns_error = pidns_error;
+    bpf_get_current_comm(waker.comm, sizeof(waker.comm));
+    waker.stack_id = bpf_get_stackid(ctx, &discovery_stacks,
+                                     BPF_F_USER_STACK);
+    bpf_map_update_elem(&futex_wakers, &resource_key, &waker, BPF_ANY);
+    return 0;
+}
+
+SEC("raw_tp/sys_exit")
+int trace_sys_exit(struct bpf_raw_tracepoint_args *ctx)
+{
+    struct futex_wait_state *active;
+    struct futex_wait_state saved;
+    struct futex_resource_key resource_key = {0};
+    struct futex_waker *waker;
+    struct wait_resource wait = {0};
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u64 now;
+
+    (void)ctx;
+    if (!trace_attribution)
+        return 0;
+    active = bpf_map_lookup_elem(&futex_waits, &pid_tgid);
+    if (!active)
+        return 0;
+    __builtin_memcpy(&saved, active, sizeof(saved));
+    bpf_map_delete_elem(&futex_waits, &pid_tgid);
+
+    now = bpf_ktime_get_ns();
+    if (!saved.start_ns || now <= saved.start_ns)
+        return 0;
+    wait.kind = WAIT_KIND_FUTEX;
+    wait.operation = saved.operation;
+    wait.address = saved.address;
+    wait.duration_ns = now - saved.start_ns;
+    wait.waker_stack_id = -1;
+
+    resource_key.global_pid = pid_tgid >> 32;
+    resource_key.address = saved.address;
+    waker = bpf_map_lookup_elem(&futex_wakers, &resource_key);
+    if (waker && waker->wake_ns >= saved.start_ns &&
+        waker->wake_ns <= now) {
+        wait.wake_ns = waker->wake_ns - saved.start_ns;
+        wait.waker_pid = waker->pid;
+        wait.waker_tid = waker->tid;
+        wait.waker_global_pid = waker->global_pid;
+        wait.waker_global_tid = waker->global_tid;
+        wait.waker_stack_id = waker->stack_id;
+        wait.waker_pidns_error = waker->pidns_error;
+        __builtin_memcpy(wait.waker_comm, waker->comm,
+                         sizeof(wait.waker_comm));
+    }
+
+    update_regular_futex_wait(pid_tgid, &wait);
+    update_async_futex_wait(pid_tgid, &wait);
+    return 0;
+}
+
 SEC("uprobe")
 int trace_function(struct pt_regs *ctx)
 {
@@ -891,13 +1397,13 @@ int trace_function(struct pt_regs *ctx)
         }
     }
 
+    if (trace_async)
+        consume_async_context(ctx, NULL, global_pid, global_tid,
+                              pid, tid, final_key_pointer);
+
     event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
     if (event) {
-        if (trace_async)
-            consume_async_context(ctx, event, global_pid,
-                                  final_key_pointer);
-        else
-            clear_async_event(event);
+        clear_async_event(event);
         fill_entry_event(ctx, event, global_pid, global_tid, pid, tid,
                          pidns_error);
         fill_discovery_event(event, pid_tgid);
@@ -915,6 +1421,7 @@ int trace_function_return(struct pt_regs *ctx)
     struct invocation_state *invocation;
     struct async_chain *lineage;
     struct thread_state *thread;
+    struct wait_resource wait = {0};
     u64 end_ns = bpf_ktime_get_ns();
     u64 pid_tgid;
     u64 start_ns;
@@ -956,11 +1463,32 @@ int trace_function_return(struct pt_regs *ctx)
     offcpu_ns = invocation->offcpu_ns;
     blocked_ns = invocation->blocked_ns;
     runqueue_ns = invocation->runqueue_ns;
+    __builtin_memcpy(&wait, &invocation->wait, sizeof(wait));
     bpf_map_delete_elem(&invocation_states, &key);
     if (!depth)
         bpf_map_delete_elem(&thread_states, &pid_tgid);
     if (!start_ns)
         return 0;
+
+    lineage = bpf_map_lookup_elem(&final_lineages, &key);
+    if (lineage && lineage->hop_count) {
+        u32 last = lineage->hop_count - 1;
+
+        if (last < MAX_ASYNC_HOPS) {
+            lineage->hops[last].target_ns = end_ns - start_ns;
+            lineage->hops[last].offcpu_ns = offcpu_ns;
+            lineage->hops[last].blocked_ns = blocked_ns;
+            lineage->hops[last].runqueue_ns = runqueue_ns;
+            __builtin_memcpy(&lineage->hops[last].wait,
+                             &wait,
+                             sizeof(lineage->hops[last].wait));
+            async_stats_completed(
+                async_hop_index(lineage->hops[last].reserved),
+                lineage->hops[last].target_ns, blocked_ns,
+                wait.kind, wait.duration_ns,
+                global_tid, 0);
+        }
+    }
 
     event = bpf_ringbuf_reserve(
         &events, __builtin_offsetof(struct stack_trace_event, stack), 0);
@@ -973,11 +1501,13 @@ int trace_function_return(struct pt_regs *ctx)
     event->event_type = EVENT_RETURN;
     event->stack_size = 0;
     event->reserved = 0;
+    event->timestamp_ns = end_ns;
     event->duration_ns = end_ns - start_ns;
     event->return_value = (s64)PT_REGS_RC(ctx);
     event->offcpu_ns = offcpu_ns;
     event->blocked_ns = blocked_ns;
     event->runqueue_ns = runqueue_ns;
+    __builtin_memcpy(&event->wait, &wait, sizeof(event->wait));
     event->discovery_valid = 0;
     event->discovery_reserved = 0;
     event->discovery_wakeup_ns = 0;
@@ -986,10 +1516,6 @@ int trace_function_return(struct pt_regs *ctx)
         u32 last = lineage->hop_count - 1;
 
         if (last < MAX_ASYNC_HOPS) {
-            lineage->hops[last].target_ns = end_ns - start_ns;
-            lineage->hops[last].offcpu_ns = offcpu_ns;
-            lineage->hops[last].blocked_ns = blocked_ns;
-            lineage->hops[last].runqueue_ns = runqueue_ns;
             copy_async_chain_to_event(event, lineage);
         } else {
             clear_async_event(event);

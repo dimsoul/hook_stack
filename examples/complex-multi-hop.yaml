@@ -19,3 +19,4 @@ hops:
 filters:
   max_events: 5
   duration: 15
+  diagnostic_interval_ms: 1000

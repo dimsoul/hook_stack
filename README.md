@@ -28,6 +28,8 @@ the target application.
 - Optionally attach a return probe to report the raw return register value and
   function execution time.
 - Attribute latency to on-CPU, blocked, run-queue, and preempted/unknown time.
+- Identify the longest futex wait, its address, and the matching wake caller
+  thread and user stack.
 - Stitch a producer stack to a target running in another thread by matching a
   shared task pointer or request ID.
 - Discover the thread and user stack that most recently woke a target thread,
@@ -39,6 +41,9 @@ the target application.
   event count or duration.
 - Export completed chains as JSON Lines or a self-contained HTML report with a
   causal waterfall, per-hop scheduler breakdown, and aggregate latency cards.
+- Diagnose live queue backlog and thread-pool saturation with per-hop BPF
+  counters, exact accumulated averages, worker observations, and deterministic
+  hints.
 - Pair nested and recursive calls independently for each thread.
 - Stop cleanly on `SIGINT` or `SIGTERM`.
 
@@ -138,6 +143,10 @@ sudo ./callweave --binary ./program --offset 0x11c9 --ret --time
 `--return-value` is an alias for `--ret`, and `--latency` is an alias for
 `--time`. Return tracing is disabled unless at least one of these options is
 present, so the original entry-only mode has no return-probe bookkeeping.
+Event prefixes include microseconds, for example
+`[2026-07-27 10:28:26.123456]`. The timestamp is captured when the BPF event is
+created and converted from the kernel monotonic clock to local wall time; it
+is not the later time at which userspace happens to drain the ring buffer.
 
 Break function latency down by scheduler state:
 
@@ -164,7 +173,28 @@ The fields mean:
 
 This is scheduler-state attribution. It answers whether a slow call spent its
 time executing, blocked, or waiting for CPU. It does not yet name the exact
-syscall, lock, or kernel subsystem responsible for a blocked interval.
+kernel subsystem responsible for every blocked interval.
+
+When the longest wait inside a traced function is a futex wait, attribution
+also reports the futex address, operation, wait duration, and the latest thread
+observed calling `FUTEX_WAKE` or `FUTEX_WAKE_BITSET` for the same address. If a
+user stack is available, the wake caller's stack is symbolized:
+
+```text
+wait=futex operation=wait address=0x00005d9db3cf70e0 duration=248.643 ms
+  waker PID 4312/TID 4315 (trace_lock_test)
+  waker #0  libc.so.6  pthread_mutex_unlock
+  waker #1  trace_lock_test  release_shared_resource at test/test_lock.c:21
+  waker #2  trace_lock_test  lock_holder_main at test/test_lock.c:32
+```
+
+This detail is enabled automatically by `--attribution`, including asynchronous
+hop attribution. For each function or hop, callweave retains only the
+longest completed futex wait. The wake caller is strong causal evidence for
+normal pthread mutex and condition-variable paths, but it is not guaranteed to
+be a mutex owner: timeouts, signals, requeue operations, custom synchronization
+algorithms, and an unsuccessful wake syscall can produce an unobserved or
+candidate-only waker.
 
 If the asynchronous source is not known yet, inspect the most recent thread
 that woke the final target:
@@ -317,6 +347,7 @@ filters:
   min_work_ms: 20
   max_events: 10
   duration: 30
+  diagnostic_interval_ms: 1000
 ```
 
 Validate it without loading BPF, then run it against a process:
@@ -369,12 +400,71 @@ The report contains:
 - aggregate chain count, average, P95, and maximum latency;
 - a selectable causal waterfall whose rows preserve handoff order;
 - queue, on-CPU, blocked, run-queue, and preempted/unknown composition;
-- a per-hop comparison chart and raw correlation-key table.
+- a per-hop comparison chart and raw correlation-key table;
+- the longest futex wait and candidate waker for each asynchronous hop;
+- final live queue diagnostics collected in BPF, including pending/running
+  tasks, peak concurrency, averages, worker count, and a deterministic
+  bottleneck assessment;
+- exact per-hop latency distributions calculated from completed chains.
 
 No JavaScript libraries, fonts, or network requests are required. Open the
 generated file directly in a browser. Scheduler-state colors within a work
 segment show aggregate composition; they do not claim that those states
 occurred in that exact visual order.
+
+## Live queue and thread-pool diagnostics
+
+Async tracing maintains one real-time statistics record for every configured
+hop. The source probe increments `submitted` and `pending`; matching target
+entry decrements `pending`, increments `started` and `active`, and records queue
+latency; completion decrements `active`, increments `completed`, and records
+work latency. Intermediate-hop work ends at the next handoff, matching the
+causal-chain timing model. Final-hop work ends when the traced target returns.
+
+By default, a queue snapshot is printed every second and once more when
+callweave exits:
+
+```sh
+sudo ./callweave -p PID --config examples/complex-multi-hop.yaml \
+  --diagnostic-interval-ms 1000
+```
+
+Set the interval to `0` to suppress periodic snapshots while retaining the
+final JSON/HTML diagnostic:
+
+```sh
+sudo ./callweave -p PID --config examples/complex-multi-hop.yaml \
+  --diagnostic-interval-ms 0 \
+  --report /tmp/callweave-report.html
+```
+
+Each stage reports:
+
+- submit/start/complete rates;
+- current and peak pending tasks;
+- current and peak active target invocations;
+- exact accumulated average queue and work latency;
+- observed worker-thread count and the busiest worker;
+- futex-wait ratio, duplicate correlation keys, expired contexts, unmatched
+  targets, and targets that returned without handing off the next hop.
+
+The diagnosis is rule-based and reproducible: growing pending work indicates
+backlog, pending work while workers are active indicates saturation, and a high
+futex-wait ratio indicates lock contention. It does not require AI.
+
+The BPF side deliberately does not maintain latency histograms. The HTML report
+groups the exact `queue_ns` and `work_ns` values already carried by completed
+chains, sorts them in the browser, and calculates per-hop average, P50, P95,
+P99, and maximum latency. P95 is hidden below 20 completed samples and P99 is
+hidden below 100, so small test runs do not present an unstable tail percentile
+as a reliable result. Queue-versus-work observations are also withheld until
+at least 20 completed samples are available.
+
+The live counters include work that is still queued or running, unlike the
+completed-chain charts. `pending` is observational rather than an application
+queue's authoritative length: LRU eviction, process exit, dropped probes, or
+reused correlation keys can leave it approximate. The anomaly counters make
+those conditions visible.
 
 For automation or custom visualization, emit one completed asynchronous chain
 per line as JSON:
@@ -391,6 +481,8 @@ Without `--output`, JSON Lines are written to standard output and tracer status
 is written to standard error. `--format json` and `--report` currently require
 an async trace because their data model is a completed causal chain. Existing
 slow-chain filters are applied before either export is written.
+JSON Lines output uses `type: "chain"` for completed chains and appends one
+`type: "queue_diagnostics"` record on exit.
 
 The original explicit-path form remains available and traces every process
 executing the selected ELF:
@@ -546,11 +638,13 @@ pipeline, run:
 ./test/trace_complex_async_test
 ```
 
-The program uses four threads and three queues. Each stage performs nested
-synchronous calls, and each handoff deliberately uses a different key. The
-three target functions receive those keys in arguments 2, 3, and 8
-respectively. On x86-64, the last key is stack-passed rather than held in an
-argument register. Trace it with the supplied configuration:
+The program uses four pipeline threads, three queues, and a transient storage
+lock-holder thread. Each stage performs nested synchronous calls, and each
+handoff deliberately uses a different key. The three target functions receive
+those keys in arguments 2, 3, and 8 respectively. On x86-64, the last key is
+stack-passed rather than held in an argument register. The storage stage also
+waits on a contended mutex so the final hop demonstrates futex attribution.
+Trace it with the supplied configuration:
 
 ```sh
 sudo ./callweave -p PID \
@@ -573,6 +667,22 @@ A completed chain contains `async hop 0`, `async hop 1`, and `async hop 2`,
 with `target-arg=2`, `target-arg=3`, and `target-arg=8`. The target argument is
 reported so an automatically discovered configuration can later be made
 explicit if lower probe overhead is important.
+
+To test futex wait-resource attribution, run:
+
+```sh
+./test/trace_lock_test
+```
+
+Then use the PID printed by the program:
+
+```sh
+sudo ./callweave -p PID --time --attribution function_to_trace
+```
+
+`function_to_trace` waits on a mutex held for roughly 250 ms by
+`lock_holder_main`. The return event should report the futex address and show
+the holder's unlock path as the waker stack.
 
 For a more realistic example with two reusable worker pools, bounded queues,
 bursty submissions, and blocking target work, run the complete demo:
@@ -630,10 +740,11 @@ stack-walking support.
   output also reports the kernel-global PID and the translation error.
 - **Permission errors**: run as root or configure the required BPF and perf
   capabilities for your kernel and distribution.
-- **Scheduler tracepoint attachment fails**: verify that the kernel exposes the
-  `sched_switch`, `sched_wakeup`, and `sched_waking` raw tracepoints and that
-  the process has the required BPF/perf privileges. Running as root is the
-  simplest test.
+- **Attribution tracepoint attachment fails**: verify that the kernel exposes
+  the `sched_switch`, `sched_wakeup`, `sys_enter`, and `sys_exit` raw
+  tracepoints and that the process has the required BPF/perf privileges.
+  Discovery additionally uses `sched_waking`. Running as root is the simplest
+  test.
 - **No async origin is printed**: verify that both selected argument positions
   contain exactly the same nonzero pointer or integer value. Also check that
   the target runs before `--async-max-age-ms` expires. The context is
@@ -655,7 +766,11 @@ the entry timestamp in a per-thread nested-call state and attaches
 innermost outstanding call, reads the raw return register, and calculates the
 elapsed monotonic time. With `--attribution`, raw scheduler switch and wakeup
 tracepoints accumulate off-CPU, blocked, and run-queue intervals for every
-active nested call. The loader consumes events, derives on-CPU time, reads the
+active nested call. Raw syscall entry and exit tracepoints retain the longest
+futex wait for the currently executing invocation. Wake operations are keyed
+by process and futex address so the result can include the candidate wake
+caller and its user stack. The loader consumes events, derives on-CPU time,
+reads the
 process's memory mappings, computes each ELF load bias from its `PT_LOAD`
 segments, groups frames by module, and invokes `addr2line` without using a
 shell. Async source probes store stack IDs and metadata in an LRU map keyed by

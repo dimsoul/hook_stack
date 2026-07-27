@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -40,6 +41,26 @@ enum event_type {
     EVENT_RETURN,
 };
 
+enum wait_kind {
+    WAIT_KIND_NONE,
+    WAIT_KIND_FUTEX,
+};
+
+struct wait_resource {
+    uint64_t address;
+    uint64_t duration_ns;
+    uint64_t wake_ns;
+    uint32_t kind;
+    uint32_t operation;
+    uint32_t waker_pid;
+    uint32_t waker_tid;
+    uint32_t waker_global_pid;
+    uint32_t waker_global_tid;
+    int32_t waker_stack_id;
+    int32_t waker_pidns_error;
+    char waker_comm[16];
+};
+
 struct async_hop_event {
     uint32_t pid;
     uint32_t tid;
@@ -54,6 +75,7 @@ struct async_hop_event {
     uint64_t offcpu_ns;
     uint64_t blocked_ns;
     uint64_t runqueue_ns;
+    struct wait_resource wait;
 };
 
 struct discovery_wakeup {
@@ -77,11 +99,13 @@ struct stack_trace_event {
     int32_t pidns_error;
     uint32_t event_type;
     uint32_t reserved;
+    uint64_t timestamp_ns;
     uint64_t duration_ns;
     int64_t return_value;
     uint64_t offcpu_ns;
     uint64_t blocked_ns;
     uint64_t runqueue_ns;
+    struct wait_resource wait;
     uint32_t async_hop_count;
     uint32_t async_truncated;
     struct async_hop_event async_hops[MAX_ASYNC_HOPS];
@@ -99,6 +123,42 @@ struct async_hop_config {
     uint32_t target_arg;
 };
 
+struct async_hop_stats {
+    uint64_t submitted;
+    uint64_t started;
+    uint64_t completed;
+    uint64_t pending;
+    uint64_t peak_pending;
+    uint64_t active;
+    uint64_t peak_active;
+    uint64_t queue_total_ns;
+    uint64_t work_total_ns;
+    uint64_t futex_waits;
+    uint64_t futex_wait_ns;
+    uint64_t duplicate_keys;
+    uint64_t expired;
+    uint64_t unmatched_targets;
+    uint64_t dropped;
+};
+
+struct async_worker_key {
+    uint32_t hop_index;
+    uint32_t global_tid;
+};
+
+struct async_worker_stats {
+    uint64_t started;
+    uint64_t completed;
+    uint64_t active;
+    uint64_t peak_active;
+    uint64_t work_total_ns;
+    uint64_t blocked_total_ns;
+    uint64_t futex_waits;
+    uint32_t pid;
+    uint32_t tid;
+    char comm[16];
+};
+
 struct output_options {
     bool show_return_value;
     bool show_duration;
@@ -107,6 +167,9 @@ struct output_options {
     bool show_discovery;
     int async_stack_map_fd;
     int discovery_stack_map_fd;
+    int wait_stack_map_fd;
+    int async_hop_stats_map_fd;
+    int async_worker_stats_map_fd;
     const struct async_hop_config *async_hops;
     size_t async_hop_count;
     const char *async_source_name;
@@ -123,11 +186,14 @@ struct output_options {
     FILE *report_stream;
     bool report_first;
     bool export_failed;
+    uint32_t diagnostic_interval_ms;
+    uint64_t diagnostic_last_ns;
+    struct async_hop_stats diagnostic_previous[MAX_ASYNC_HOPS];
 };
 
-_Static_assert(offsetof(struct stack_trace_event, stack) == 864,
+_Static_assert(offsetof(struct stack_trace_event, stack) == 1520,
                "userspace and BPF event layouts differ");
-_Static_assert(sizeof(struct stack_trace_event) == 1888,
+_Static_assert(sizeof(struct stack_trace_event) == 2544,
                "userspace and BPF event sizes differ");
 
 struct proc_map {
@@ -265,7 +331,8 @@ static void usage(FILE *stream, const char *program)
             "  -o, --offset OFFSET       attach at an ELF file offset\n"
             "  -r, --ret                 print the raw function return value\n"
             "  -t, --time                print function execution time\n"
-            "  -a, --attribution         break time down by scheduler state\n"
+            "  -a, --attribution         break time down by scheduler state;\n"
+            "                             report the longest futex wait\n"
             "      --async-source FUNC    capture the producer stack at FUNC\n"
             "      --async-source-binary PATH\n"
             "                             ELF containing the producer function\n"
@@ -288,6 +355,9 @@ static void usage(FILE *stream, const char *program)
             "      --min-work-ms MS       require one hop with MS work time\n"
             "      --max-events N         stop after N matching chains\n"
             "      --duration SEC         stop tracing after SEC seconds\n"
+            "      --diagnostic-interval-ms MS\n"
+            "                             live queue snapshot interval "
+            "(default 1000; 0 disables periodic output)\n"
             "      --format FORMAT        text or json (default text)\n"
             "      --output PATH          write JSON Lines to PATH\n"
             "      --report PATH          write a self-contained HTML report\n"
@@ -923,15 +993,58 @@ static void resolve_frames(struct frame_info *frames, size_t frame_count)
     }
 }
 
-static void print_event_time(void)
+static uint64_t timespec_nanoseconds(const struct timespec *time)
+{
+    return (uint64_t)time->tv_sec * 1000000000ULL +
+           (uint64_t)time->tv_nsec;
+}
+
+static uint64_t event_realtime_nanoseconds(uint64_t timestamp_ns)
+{
+    static bool offset_initialized;
+    static int64_t realtime_monotonic_offset_ns;
+    struct timespec realtime;
+    struct timespec monotonic;
+    uint64_t realtime_ns;
+    uint64_t monotonic_ns;
+
+    if (!timestamp_ns) {
+        if (clock_gettime(CLOCK_REALTIME, &realtime))
+            return 0;
+        return timespec_nanoseconds(&realtime);
+    }
+    if (!offset_initialized) {
+        if (clock_gettime(CLOCK_MONOTONIC, &monotonic) ||
+            clock_gettime(CLOCK_REALTIME, &realtime))
+            return 0;
+        monotonic_ns = timespec_nanoseconds(&monotonic);
+        realtime_ns = timespec_nanoseconds(&realtime);
+        realtime_monotonic_offset_ns =
+            (int64_t)realtime_ns - (int64_t)monotonic_ns;
+        offset_initialized = true;
+    }
+    if (realtime_monotonic_offset_ns >= 0)
+        return timestamp_ns +
+               (uint64_t)realtime_monotonic_offset_ns;
+    if (timestamp_ns < (uint64_t)-realtime_monotonic_offset_ns)
+        return 0;
+    return timestamp_ns -
+           (uint64_t)-realtime_monotonic_offset_ns;
+}
+
+static void print_event_time(uint64_t timestamp_ns)
 {
     char buffer[32];
     struct tm local_time;
-    time_t now = time(NULL);
+    uint64_t realtime_ns =
+        event_realtime_nanoseconds(timestamp_ns);
+    time_t seconds = (time_t)(realtime_ns / 1000000000ULL);
+    unsigned long microseconds =
+        (unsigned long)(realtime_ns % 1000000000ULL / 1000ULL);
 
-    if (localtime_r(&now, &local_time) &&
+    if (realtime_ns && localtime_r(&seconds, &local_time) &&
         strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &local_time))
-        printf("[%s] ", buffer);
+        printf("[%s.%06lu] ", buffer, microseconds);
 }
 
 static uint64_t monotonic_time_ns(void)
@@ -958,6 +1071,211 @@ static void print_interval(const char *label, uint64_t nanoseconds)
     else
         printf(" %s=%llu ns", label,
                (unsigned long long)nanoseconds);
+}
+
+static void format_interval(char *buffer, size_t size, uint64_t nanoseconds)
+{
+    if (nanoseconds >= 1000000000ULL)
+        snprintf(buffer, size, "%.3f s",
+                 (double)nanoseconds / 1000000000.0);
+    else if (nanoseconds >= 1000000ULL)
+        snprintf(buffer, size, "%.3f ms",
+                 (double)nanoseconds / 1000000.0);
+    else if (nanoseconds >= 1000ULL)
+        snprintf(buffer, size, "%.3f us",
+                 (double)nanoseconds / 1000.0);
+    else
+        snprintf(buffer, size, "%llu ns",
+                 (unsigned long long)nanoseconds);
+}
+
+static void copy_queue_diagnostic(
+    struct cw_queue_diagnostic *destination,
+    const struct async_hop_stats *source, uint32_t index,
+    const struct output_options *output)
+{
+    memset(destination, 0, sizeof(*destination));
+    destination->index = index;
+    if (index < output->async_hop_count) {
+        destination->source = output->async_hops[index].source;
+        destination->target = output->async_hops[index].target;
+    } else {
+        destination->source = output->async_source_name ?
+            output->async_source_name : "source";
+        destination->target = output->final_target_name ?
+            output->final_target_name : "target";
+    }
+    destination->submitted = source->submitted;
+    destination->started = source->started;
+    destination->completed = source->completed;
+    destination->pending = source->pending;
+    destination->peak_pending = source->peak_pending;
+    destination->active = source->active;
+    destination->peak_active = source->peak_active;
+    destination->queue_total_ns = source->queue_total_ns;
+    destination->work_total_ns = source->work_total_ns;
+    destination->futex_waits = source->futex_waits;
+    destination->futex_wait_ns = source->futex_wait_ns;
+    destination->duplicate_keys = source->duplicate_keys;
+    destination->expired = source->expired;
+    destination->unmatched_targets = source->unmatched_targets;
+    destination->dropped = source->dropped;
+}
+
+static size_t read_queue_diagnostics(
+    const struct output_options *output,
+    struct cw_queue_diagnostic diagnostics[MAX_ASYNC_HOPS],
+    struct async_hop_stats raw[MAX_ASYNC_HOPS])
+{
+    struct async_worker_key key;
+    struct async_worker_key next;
+    size_t count = output->async_hop_count ?
+        output->async_hop_count : (output->show_async ? 1 : 0);
+    uint32_t index;
+
+    if (count > MAX_ASYNC_HOPS)
+        count = MAX_ASYNC_HOPS;
+    memset(raw, 0, sizeof(*raw) * MAX_ASYNC_HOPS);
+    memset(diagnostics, 0, sizeof(*diagnostics) * MAX_ASYNC_HOPS);
+    if (output->async_hop_stats_map_fd < 0)
+        return 0;
+    for (index = 0; index < count; index++) {
+        if (bpf_map_lookup_elem(output->async_hop_stats_map_fd,
+                                &index, &raw[index]))
+            continue;
+        copy_queue_diagnostic(&diagnostics[index], &raw[index],
+                              index, output);
+    }
+
+    if (output->async_worker_stats_map_fd < 0 ||
+        bpf_map_get_next_key(output->async_worker_stats_map_fd,
+                             NULL, &next))
+        return count;
+    do {
+        struct async_worker_stats worker;
+        struct cw_queue_diagnostic *diagnostic;
+
+        key = next;
+        if (!bpf_map_lookup_elem(output->async_worker_stats_map_fd,
+                                 &key, &worker) &&
+            key.hop_index < count) {
+            diagnostic = &diagnostics[key.hop_index];
+            diagnostic->worker_count++;
+            if (worker.started >
+                diagnostic->busiest_worker_started) {
+                diagnostic->busiest_worker_tid = worker.tid;
+                diagnostic->busiest_worker_started = worker.started;
+                diagnostic->busiest_worker_average_work_ns =
+                    worker.completed ?
+                        worker.work_total_ns / worker.completed : 0;
+            }
+        }
+    } while (!bpf_map_get_next_key(output->async_worker_stats_map_fd,
+                                    &key, &next));
+    return count;
+}
+
+static const char *queue_diagnosis(
+    const struct cw_queue_diagnostic *diagnostic,
+    uint64_t submitted_delta, uint64_t started_delta)
+{
+    uint64_t anomalies = diagnostic->duplicate_keys +
+        diagnostic->expired + diagnostic->dropped;
+
+    if (!diagnostic->submitted)
+        return "waiting for samples";
+    if (diagnostic->pending && submitted_delta > started_delta)
+        return "backlog growing";
+    if (diagnostic->pending && diagnostic->active &&
+        diagnostic->active >= diagnostic->peak_active)
+        return "workers saturated";
+    if (diagnostic->completed &&
+        diagnostic->futex_waits * 4 >= diagnostic->completed)
+        return "lock contention";
+    if (anomalies)
+        return "correlation loss observed";
+    return "no clear bottleneck";
+}
+
+static bool print_queue_diagnostics(struct output_options *output,
+                                    bool final)
+{
+    struct cw_queue_diagnostic diagnostics[MAX_ASYNC_HOPS];
+    struct async_hop_stats raw[MAX_ASYNC_HOPS];
+    uint64_t now = monotonic_time_ns();
+    uint64_t elapsed_ns = output->diagnostic_last_ns ?
+        now - output->diagnostic_last_ns : 0;
+    FILE *stream = output->json_output ? stderr : stdout;
+    size_t count;
+    size_t index;
+    bool changed = false;
+
+    count = read_queue_diagnostics(output, diagnostics, raw);
+    for (index = 0; index < count; index++) {
+        if (memcmp(&raw[index], &output->diagnostic_previous[index],
+                   sizeof(raw[index]))) {
+            changed = true;
+            break;
+        }
+    }
+    if (!changed && !final)
+        return false;
+
+    fprintf(stream, "\n[queue diagnostics%s]\n",
+            final ? " final" : "");
+    for (index = 0; index < count; index++) {
+        const struct cw_queue_diagnostic *diagnostic =
+            &diagnostics[index];
+        uint64_t submitted_delta = raw[index].submitted -
+            output->diagnostic_previous[index].submitted;
+        uint64_t started_delta = raw[index].started -
+            output->diagnostic_previous[index].started;
+        uint64_t completed_delta = raw[index].completed -
+            output->diagnostic_previous[index].completed;
+        double seconds = elapsed_ns ?
+            (double)elapsed_ns / 1000000000.0 : 0.0;
+        char average_queue[32];
+        char average_work[32];
+
+        format_interval(
+            average_queue, sizeof(average_queue),
+            diagnostic->started ?
+                diagnostic->queue_total_ns / diagnostic->started : 0);
+        format_interval(
+            average_work, sizeof(average_work),
+            diagnostic->completed ?
+                diagnostic->work_total_ns / diagnostic->completed : 0);
+        fprintf(stream,
+                "  hop %zu %s -> %s: "
+                "rate %.1f/%.1f/%.1f per s, "
+                "pending %llu (peak %llu), active %llu (peak %llu), "
+                "average queue %s, average work %s, workers %u, %s\n",
+                index, diagnostic->source, diagnostic->target,
+                seconds ? submitted_delta / seconds : 0.0,
+                seconds ? started_delta / seconds : 0.0,
+                seconds ? completed_delta / seconds : 0.0,
+                (unsigned long long)diagnostic->pending,
+                (unsigned long long)diagnostic->peak_pending,
+                (unsigned long long)diagnostic->active,
+                (unsigned long long)diagnostic->peak_active,
+                average_queue, average_work, diagnostic->worker_count,
+                queue_diagnosis(diagnostic, submitted_delta,
+                                started_delta));
+        if (diagnostic->duplicate_keys || diagnostic->expired ||
+            diagnostic->unmatched_targets || diagnostic->dropped) {
+            fprintf(stream,
+                    "    anomalies: duplicate=%llu expired=%llu "
+                    "unmatched=%llu no-handoff=%llu\n",
+                    (unsigned long long)diagnostic->duplicate_keys,
+                    (unsigned long long)diagnostic->expired,
+                    (unsigned long long)diagnostic->unmatched_targets,
+                    (unsigned long long)diagnostic->dropped);
+        }
+    }
+    fflush(stream);
+    memcpy(output->diagnostic_previous, raw, sizeof(raw));
+    output->diagnostic_last_ns = now;
+    return true;
 }
 
 static void calculate_attribution(uint64_t duration_ns, uint64_t offcpu_ns,
@@ -1090,6 +1408,82 @@ static void print_stack_frames(const uint64_t *stack, int32_t stack_size,
     }
 }
 
+static const char *futex_operation_name(uint32_t operation)
+{
+    switch (operation) {
+    case 0:
+        return "wait";
+    case 9:
+        return "wait-bitset";
+    default:
+        return "wait";
+    }
+}
+
+static void print_wait_resource(const struct wait_resource *wait,
+                                const struct output_options *output,
+                                const char *indent)
+{
+    struct map_list waker_maps = {0};
+    uint64_t waker_stack[MAX_ASYNC_STACK_DEPTH] = {0};
+    uint32_t maps_pid;
+
+    if (wait->kind != WAIT_KIND_FUTEX || !wait->duration_ns)
+        return;
+    printf("%swait=futex operation=%s address=0x%016llx",
+           indent, futex_operation_name(wait->operation),
+           (unsigned long long)wait->address);
+    print_interval("duration", wait->duration_ns);
+    putchar('\n');
+    if (!wait->waker_tid) {
+        printf("%s  waker=unobserved (timeout, signal, or unmatched wake)\n",
+               indent);
+        return;
+    }
+
+    printf("%s  waker PID %u/TID %u (%.*s)",
+           indent, wait->waker_pid, wait->waker_tid,
+           (int)sizeof(wait->waker_comm), wait->waker_comm);
+    if (wait->wake_ns)
+        print_interval("wake-after-wait-start", wait->wake_ns);
+    putchar('\n');
+    if (wait->waker_pid != wait->waker_global_pid ||
+        wait->waker_tid != wait->waker_global_tid)
+        printf("%s  waker global PID %u/TID %u\n", indent,
+               wait->waker_global_pid, wait->waker_global_tid);
+    if (wait->waker_pidns_error)
+        printf("%s  waker PID namespace translation failed: %s (%d)\n",
+               indent, strerror(-wait->waker_pidns_error),
+               wait->waker_pidns_error);
+    if (wait->waker_stack_id < 0) {
+        printf("%s  unable to collect waker user stack: %s (%d)\n",
+               indent, strerror(-wait->waker_stack_id),
+               wait->waker_stack_id);
+        return;
+    }
+    if (output->wait_stack_map_fd < 0) {
+        printf("%s  waker stack map is unavailable\n", indent);
+        return;
+    }
+    if (bpf_map_lookup_elem(output->wait_stack_map_fd,
+                            &wait->waker_stack_id, waker_stack)) {
+        printf("%s  waker stack id %d is unavailable: %s\n",
+               indent, wait->waker_stack_id, strerror(errno));
+        return;
+    }
+
+    maps_pid = wait->waker_pid;
+    if (read_process_maps(maps_pid, &waker_maps) &&
+        wait->waker_global_pid != maps_pid) {
+        map_list_free(&waker_maps);
+        maps_pid = wait->waker_global_pid;
+        read_process_maps(maps_pid, &waker_maps);
+    }
+    print_stack_frames(waker_stack, sizeof(waker_stack), &waker_maps,
+                       "waker ", NULL, NULL, 0);
+    map_list_free(&waker_maps);
+}
+
 static bool has_async_chain_filters(const struct output_options *output)
 {
     return output->min_total_ns || output->min_queue_ns ||
@@ -1131,14 +1525,9 @@ static bool async_chain_matches(const struct stack_trace_event *event,
            maximum_work_ns >= output->min_work_ns;
 }
 
-static uint64_t realtime_milliseconds(void)
+static uint64_t event_realtime_milliseconds(uint64_t timestamp_ns)
 {
-    struct timespec now;
-
-    if (clock_gettime(CLOCK_REALTIME, &now))
-        return 0;
-    return (uint64_t)now.tv_sec * 1000ULL +
-           (uint64_t)now.tv_nsec / 1000000ULL;
+    return event_realtime_nanoseconds(timestamp_ns) / 1000000ULL;
 }
 
 static void copy_report_comm(char destination[17],
@@ -1156,7 +1545,8 @@ static void build_report_chain(const struct stack_trace_event *event,
     uint32_t hop_index;
 
     memset(chain, 0, sizeof(*chain));
-    chain->timestamp_ms = realtime_milliseconds();
+    chain->timestamp_ms =
+        event_realtime_milliseconds(event->timestamp_ns);
     chain->pid = event->pid;
     chain->tid = event->tid;
     copy_report_comm(chain->comm, event->comm);
@@ -1206,6 +1596,15 @@ static void build_report_chain(const struct stack_trace_event *event,
         destination->offcpu_ns = source->offcpu_ns;
         destination->blocked_ns = source->blocked_ns;
         destination->runqueue_ns = source->runqueue_ns;
+        destination->wait_kind = source->wait.kind;
+        destination->wait_operation = source->wait.operation;
+        destination->wait_address = source->wait.address;
+        destination->wait_duration_ns = source->wait.duration_ns;
+        destination->wait_wake_ns = source->wait.wake_ns;
+        destination->waker_pid = source->wait.waker_pid;
+        destination->waker_tid = source->wait.waker_tid;
+        copy_report_comm(destination->waker_comm,
+                         source->wait.waker_comm);
     }
 }
 
@@ -1281,7 +1680,7 @@ static int handle_event(void *context, void *data, size_t data_size)
     }
     maps_pid = event->pid;
 
-    print_event_time();
+    print_event_time(event->timestamp_ns);
     printf("PID %u/TID %u (%.*s)", event->pid, event->tid,
            (int)sizeof(event->comm), event->comm);
     if (event->event_type == EVENT_RETURN) {
@@ -1296,6 +1695,9 @@ static int handle_event(void *context, void *data, size_t data_size)
             print_attribution(event->duration_ns, event->offcpu_ns,
                               event->blocked_ns, event->runqueue_ns, false);
         putchar('\n');
+        if (output->show_attribution &&
+            !(output->show_async && event->async_hop_count))
+            print_wait_resource(&event->wait, output, "  ");
     } else {
         if (output->show_return_value || output->show_duration)
             printf(" ENTRY");
@@ -1390,6 +1792,7 @@ static int handle_event(void *context, void *data, size_t data_size)
                 printf(" work=unavailable");
             }
             putchar('\n');
+            print_wait_resource(&hop->wait, output, "    ");
             if (hop->pid != hop->global_pid ||
                 hop->tid != hop->global_tid)
                 printf("  async global PID %u/TID %u\n",
@@ -1509,6 +1912,7 @@ enum long_option_id {
     OPT_MIN_WORK_MS,
     OPT_MAX_EVENTS,
     OPT_DURATION,
+    OPT_DIAGNOSTIC_INTERVAL_MS,
     OPT_FORMAT,
     OPT_OUTPUT,
     OPT_REPORT,
@@ -1799,6 +2203,15 @@ static int parse_trace_config(const char *path,
                             path, line_number, value);
                     goto cleanup;
                 }
+            } else if (!strcmp(key, "diagnostic_interval_ms")) {
+                if (parse_u32_range(
+                        value, 0, UINT32_MAX,
+                        &output->diagnostic_interval_ms)) {
+                    fprintf(stderr,
+                            "%s:%zu: invalid diagnostic_interval_ms '%s'\n",
+                            path, line_number, value);
+                    goto cleanup;
+                }
             } else {
                 fprintf(stderr, "%s:%zu: unknown filter key '%s'\n",
                         path, line_number, key);
@@ -1871,6 +2284,8 @@ int main(int argc, char **argv)
         {"min-work-ms", required_argument, NULL, OPT_MIN_WORK_MS},
         {"max-events", required_argument, NULL, OPT_MAX_EVENTS},
         {"duration", required_argument, NULL, OPT_DURATION},
+        {"diagnostic-interval-ms", required_argument, NULL,
+         OPT_DIAGNOSTIC_INTERVAL_MS},
         {"format", required_argument, NULL, OPT_FORMAT},
         {"output", required_argument, NULL, OPT_OUTPUT},
         {"report", required_argument, NULL, OPT_REPORT},
@@ -1886,6 +2301,10 @@ int main(int argc, char **argv)
     struct output_options output = {
         .async_stack_map_fd = -1,
         .discovery_stack_map_fd = -1,
+        .wait_stack_map_fd = -1,
+        .async_hop_stats_map_fd = -1,
+        .async_worker_stats_map_fd = -1,
+        .diagnostic_interval_ms = 1000,
     };
     struct callweave_bpf *skeleton = NULL;
     struct ring_buffer *ring_buffer = NULL;
@@ -2103,6 +2522,15 @@ int main(int argc, char **argv)
             if (parse_u32_range(optarg, 1, UINT32_MAX,
                                 &duration_seconds)) {
                 fprintf(stderr, "invalid duration: %s\n", optarg);
+                error = 2;
+                goto cleanup;
+            }
+            break;
+        case OPT_DIAGNOSTIC_INTERVAL_MS:
+            if (parse_u32_range(optarg, 0, UINT32_MAX,
+                                &output.diagnostic_interval_ms)) {
+                fprintf(stderr, "invalid diagnostic interval: %s\n",
+                        optarg);
                 error = 2;
                 goto cleanup;
             }
@@ -2403,12 +2831,22 @@ int main(int argc, char **argv)
     skeleton->rodata->async_target_arg = async_target_arg;
     skeleton->rodata->async_max_age_ns =
         (uint64_t)async_max_age_ms * 1000000ULL;
+    skeleton->rodata->async_final_hop_id =
+        output.show_async ?
+            (uint32_t)(async_hop_count ? async_hop_count : 1) : 0;
+    skeleton->rodata->futex_syscall_nr = SYS_futex;
     if (!output.show_attribution) {
         error = bpf_program__set_autoload(
             skeleton->progs.trace_sched_switch, false);
         if (!error)
             error = bpf_program__set_autoload(
                 skeleton->progs.trace_sched_wakeup, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_sys_enter, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_sys_exit, false);
         if (error) {
             fprintf(stderr,
                     "failed to disable scheduler attribution programs: %s\n",
@@ -2458,6 +2896,11 @@ int main(int argc, char **argv)
     output.async_stack_map_fd = bpf_map__fd(skeleton->maps.async_stacks);
     output.discovery_stack_map_fd =
         bpf_map__fd(skeleton->maps.discovery_stacks);
+    output.wait_stack_map_fd = output.discovery_stack_map_fd;
+    output.async_hop_stats_map_fd =
+        bpf_map__fd(skeleton->maps.async_hop_stats);
+    output.async_worker_stats_map_fd =
+        bpf_map__fd(skeleton->maps.async_worker_stats);
 
     if (output.show_attribution) {
         error = attach_raw_tracepoint(
@@ -2467,6 +2910,14 @@ int main(int argc, char **argv)
             error = attach_raw_tracepoint(
                 skeleton->progs.trace_sched_wakeup,
                 &skeleton->links.trace_sched_wakeup, "sched_wakeup");
+        if (!error)
+            error = attach_raw_tracepoint(
+                skeleton->progs.trace_sys_enter,
+                &skeleton->links.trace_sys_enter, "sys_enter");
+        if (!error)
+            error = attach_raw_tracepoint(
+                skeleton->progs.trace_sys_exit,
+                &skeleton->links.trace_sys_exit, "sys_exit");
         if (error)
             goto cleanup;
     } else if (output.show_discovery) {
@@ -2505,7 +2956,8 @@ int main(int argc, char **argv)
 
         for (i = 0; i + 1 < async_hop_count; i++) {
             uint64_t target_cookie =
-                (1ULL << 32) | async_hops[i].target_arg;
+                ((uint64_t)(i + 1) << 32) |
+                async_hops[i].target_arg;
 
             error = attach_named_uprobe(
                 skeleton->progs.trace_async_target_return,
@@ -2680,6 +3132,7 @@ int main(int argc, char **argv)
     if (duration_seconds)
         stop_time_ns = monotonic_time_ns() +
                        (uint64_t)duration_seconds * 1000000000ULL;
+    output.diagnostic_last_ns = monotonic_time_ns();
     while (!exiting) {
         error = ring_buffer__poll(ring_buffer, 250);
         if (error == -EINTR) {
@@ -2694,13 +3147,29 @@ int main(int argc, char **argv)
             break;
         }
         error = 0;
+        if (output.show_async && output.diagnostic_interval_ms) {
+            uint64_t now = monotonic_time_ns();
+
+            if (now - output.diagnostic_last_ns >=
+                (uint64_t)output.diagnostic_interval_ms * 1000000ULL)
+                print_queue_diagnostics(&output, false);
+        }
         if (stop_time_ns && monotonic_time_ns() >= stop_time_ns)
             break;
     }
 
 cleanup:
+    if (output.show_async && output.diagnostic_last_ns &&
+        output.async_hop_stats_map_fd >= 0)
+        print_queue_diagnostics(&output, true);
     if (output.report_stream) {
-        if ((cw_html_report_end(output.report_stream) ||
+        struct cw_queue_diagnostic diagnostics[MAX_ASYNC_HOPS];
+        struct async_hop_stats raw[MAX_ASYNC_HOPS];
+        size_t diagnostic_count =
+            read_queue_diagnostics(&output, diagnostics, raw);
+
+        if ((cw_html_report_end(output.report_stream, diagnostics,
+                                diagnostic_count) ||
              fflush(output.report_stream)) && !error) {
             error = -(errno ? errno : EIO);
             fprintf(stderr, "failed to finalize HTML report: %s\n",
@@ -2710,6 +3179,15 @@ cleanup:
             error = -errno;
     }
     if (output.json_stream) {
+        struct cw_queue_diagnostic diagnostics[MAX_ASYNC_HOPS];
+        struct async_hop_stats raw[MAX_ASYNC_HOPS];
+        size_t diagnostic_count =
+            read_queue_diagnostics(&output, diagnostics, raw);
+
+        if ((cw_write_queue_diagnostics_json(
+                 output.json_stream, diagnostics, diagnostic_count) ||
+             fputc('\n', output.json_stream) == EOF) && !error)
+            error = -(errno ? errno : EIO);
         if (fflush(output.json_stream) && !error)
             error = -errno;
         if (output.json_stream != stdout &&

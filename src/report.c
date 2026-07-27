@@ -72,7 +72,7 @@ int cw_write_chain_json(FILE *stream, const struct cw_report_chain *chain)
     uint32_t index;
 
     if (fprintf(stream,
-                "{\"timestamp_ms\":%" PRIu64
+                "{\"type\":\"chain\",\"timestamp_ms\":%" PRIu64
                 ",\"pid\":%u,\"tid\":%u,\"comm\":",
                 chain->timestamp_ms, chain->pid, chain->tid) < 0 ||
         write_json_string(stream, chain->comm) ||
@@ -111,10 +111,88 @@ int cw_write_chain_json(FILE *stream, const struct cw_report_chain *chain)
                     ",\"work_ns\":%" PRIu64
                     ",\"offcpu_ns\":%" PRIu64
                     ",\"blocked_ns\":%" PRIu64
-                    ",\"runqueue_ns\":%" PRIu64 "}",
+                    ",\"runqueue_ns\":%" PRIu64,
                     hop->key, hop->queue_ns, hop->work_ns,
                     hop->offcpu_ns, hop->blocked_ns,
                     hop->runqueue_ns) < 0)
+            return -1;
+        if (hop->wait_kind) {
+            if (fprintf(stream,
+                        ",\"wait\":{\"kind\":\"futex\","
+                        "\"operation\":%u,"
+                        "\"address\":\"0x%016" PRIx64 "\","
+                        "\"duration_ns\":%" PRIu64 ","
+                        "\"wake_after_start_ns\":%" PRIu64 ","
+                        "\"waker_pid\":%u,\"waker_tid\":%u,"
+                        "\"waker_comm\":",
+                        hop->wait_operation, hop->wait_address,
+                        hop->wait_duration_ns, hop->wait_wake_ns,
+                        hop->waker_pid, hop->waker_tid) < 0 ||
+                write_json_string(stream, hop->waker_comm) ||
+                fputc('}', stream) == EOF)
+                return -1;
+        } else if (fputs(",\"wait\":null", stream) == EOF) {
+            return -1;
+        }
+        if (fputc('}', stream) == EOF)
+            return -1;
+    }
+    return fputs("]}", stream) == EOF ? -1 : 0;
+}
+
+static int write_queue_diagnostic(FILE *stream,
+                                  const struct cw_queue_diagnostic *item)
+{
+    if (fprintf(stream, "{\"index\":%u,\"source\":", item->index) < 0 ||
+        write_json_string(stream, item->source) ||
+        fputs(",\"target\":", stream) == EOF ||
+        write_json_string(stream, item->target) ||
+        fprintf(stream,
+                ",\"submitted\":%" PRIu64
+                ",\"started\":%" PRIu64
+                ",\"completed\":%" PRIu64
+                ",\"pending\":%" PRIu64
+                ",\"peak_pending\":%" PRIu64
+                ",\"active\":%" PRIu64
+                ",\"peak_active\":%" PRIu64
+                ",\"queue_total_ns\":%" PRIu64
+                ",\"work_total_ns\":%" PRIu64
+                ",\"futex_waits\":%" PRIu64
+                ",\"futex_wait_ns\":%" PRIu64
+                ",\"duplicate_keys\":%" PRIu64
+                ",\"expired\":%" PRIu64
+                ",\"unmatched_targets\":%" PRIu64
+                ",\"dropped\":%" PRIu64
+                ",\"worker_count\":%u"
+                ",\"busiest_worker_tid\":%u"
+                ",\"busiest_worker_started\":%" PRIu64
+                ",\"busiest_worker_average_work_ns\":%" PRIu64 "}",
+                item->submitted, item->started, item->completed,
+                item->pending, item->peak_pending, item->active,
+                item->peak_active, item->queue_total_ns,
+                item->work_total_ns, item->futex_waits,
+                item->futex_wait_ns, item->duplicate_keys,
+                item->expired, item->unmatched_targets, item->dropped,
+                item->worker_count, item->busiest_worker_tid,
+                item->busiest_worker_started,
+                item->busiest_worker_average_work_ns) < 0)
+        return -1;
+    return 0;
+}
+
+int cw_write_queue_diagnostics_json(
+    FILE *stream, const struct cw_queue_diagnostic *diagnostics,
+    size_t count)
+{
+    size_t index;
+
+    if (fputs("{\"type\":\"queue_diagnostics\",\"hops\":[",
+              stream) == EOF)
+        return -1;
+    for (index = 0; index < count; index++) {
+        if (index && fputc(',', stream) == EOF)
+            return -1;
+        if (write_queue_diagnostic(stream, &diagnostics[index]))
             return -1;
     }
     return fputs("]}", stream) == EOF ? -1 : 0;
@@ -201,11 +279,26 @@ int cw_html_report_begin(FILE *stream)
         "<section class=\"panel\"><div class=\"panel-head\"><div><h2>Per-hop "
         "latency composition</h2><p>Bars share one scale for direct comparison."
         "</p></div></div><div id=\"breakdown\" class=\"breakdown\"></div></section>\n"
+        "<section class=\"panel\"><div class=\"panel-head\"><div><h2>Live queue "
+        "diagnostics</h2><p>Final BPF counters include queued and running work, "
+        "not only completed chains.</p></div></div><div style=\"overflow:auto\">"
+        "<table><thead><tr><th>Stage</th><th>Submitted / started / done</th>"
+        "<th>Pending</th><th>Active</th><th>Average queue</th>"
+        "<th>Average work</th><th>Workers</th><th>Diagnosis</th>"
+        "</tr></thead><tbody id=\"diagnostics\"></tbody></table></div></section>\n"
+        "<section class=\"panel\"><div class=\"panel-head\"><div><h2>Completed-"
+        "chain latency</h2><p>Exact values calculated from the completed chains "
+        "embedded in this report. P95 requires 20 samples; P99 requires 100."
+        "</p></div></div><div style=\"overflow:auto\"><table><thead><tr>"
+        "<th>Stage</th><th>Samples</th><th>Queue avg / P50 / P95 / P99 / max</th>"
+        "<th>Work avg / P50 / P95 / P99 / max</th><th>Observation</th>"
+        "</tr></thead><tbody id=\"latencyStats\"></tbody></table></div></section>\n"
         "<section class=\"panel\"><div class=\"panel-head\"><div><h2>Hop details"
         "</h2><p>Raw correlation and scheduler timing for the selected chain."
         "</p></div></div><div style=\"overflow:auto\"><table><thead><tr>"
         "<th>Hop</th><th>Source → target</th><th>Threads</th><th>Key</th>"
-        "<th>Queue</th><th>Work</th><th>Dominant</th></tr></thead>"
+        "<th>Queue</th><th>Work</th><th>Dominant</th><th>Wait</th>"
+        "<th>Waker</th></tr></thead>"
         "<tbody id=\"details\"></tbody></table></div></section>\n"
         "<footer>Generated locally by callweave. No external scripts or network "
         "requests.</footer></main>\n"
@@ -225,10 +318,12 @@ int cw_html_report_write(FILE *stream, const struct cw_report_chain *chain,
     return 0;
 }
 
-int cw_html_report_end(FILE *stream)
+int cw_html_report_end(FILE *stream,
+                       const struct cw_queue_diagnostic *diagnostics,
+                       size_t count)
 {
     static const char footer[] =
-        "];\n"
+        ";\n"
         "const $=id=>document.getElementById(id);"
         "const ns=n=>{if(n>=1e9)return(n/1e9).toFixed(n>=1e10?2:3)+' s';"
         "if(n>=1e6)return(n/1e6).toFixed(n>=1e8?1:3)+' ms';"
@@ -246,6 +341,55 @@ int cw_html_report_end(FILE *stream)
         "{n:'run queue',v:h.runqueue_ns,c:'runq'},"
         "{n:'preempt / unknown',v:unknown,c:'unknown'}]};"
         "const dominant=h=>parts(h).reduce((a,b)=>b.v>a.v?b:a,{n:'none',v:0});"
+        "const diagnose=d=>{const anomalies=d.duplicate_keys+d.expired+d.dropped;"
+        "if(!d.submitted)return'waiting for samples';"
+        "if(d.pending&&d.active&&d.active>=d.peak_active)return'workers saturated';"
+        "if(d.completed&&d.futex_waits*4>=d.completed)return'lock contention';"
+        "if(anomalies)return'correlation loss observed';return'no clear bottleneck'};"
+        "function renderDiagnostics(){const body=$('diagnostics');"
+        "body.replaceChildren();diagnosticReport.hops.forEach(d=>{"
+        "const tr=document.createElement('tr');const worker=d.worker_count+"
+        "(d.busiest_worker_tid?' (busiest TID '+d.busiest_worker_tid+')':'');"
+        "const avgQueue=d.started?d.queue_total_ns/d.started:0;"
+        "const avgWork=d.completed?d.work_total_ns/d.completed:0;"
+        "[d.index+' · '+d.source+' → '+d.target,d.submitted+' / '+d.started+"
+        "' / '+d.completed,d.pending+' (peak '+d.peak_pending+')',"
+        "d.active+' (peak '+d.peak_active+')',ns(avgQueue),ns(avgWork),"
+        "worker,diagnose(d)]."
+        "forEach(v=>{const td=document.createElement('td');td.textContent=v;"
+        "tr.appendChild(td)});body.appendChild(tr)});if(!diagnosticReport.hops."
+        "length)body.innerHTML='<tr><td colspan=\"8\">No queue diagnostics."
+        "</td></tr>'};"
+        "const percentile=(sorted,p)=>sorted[Math.min(sorted.length-1,"
+        "Math.ceil(sorted.length*p)-1)];"
+        "const distribution=v=>{if(!v.length)return'n/a';const s=[...v].sort("
+        "(a,b)=>a-b),avg=s.reduce((a,b)=>a+b,0)/s.length,p50=percentile(s,.5),"
+        "p95=s.length>=20?exact(percentile(s,.95)):'n/a (<20)',"
+        "p99=s.length>=100?exact(percentile(s,.99)):'n/a (<100)';return exact(avg)+"
+        "' / '+exact(p50)+' / '+p95+' / '+p99+' / '+exact(s[s.length-1])};"
+        "function completedStages(){const stages=new Map();chains.forEach(c=>"
+        "c.hops.forEach(h=>{const key=h.index+'\\u0000'+h.source+'\\u0000'+h.target;"
+        "if(!stages.has(key))stages.set(key,{index:h.index,source:h.source,"
+        "target:h.target,queue:[],work:[]});const s=stages.get(key);"
+        "s.queue.push(h.queue_ns);s.work.push(h.work_ns)}));return[...stages.values()]"
+        ".sort((a,b)=>a.index-b.index)}"
+        "function latencyObservation(s){if(s.queue.length<20||s.work.length<20)"
+        "return'not enough samples';const q=[...s.queue].sort((a,b)=>a-b),"
+        "w=[...s.work].sort((a,b)=>a-b),qp=percentile(q,.95),wp=percentile(w,.95);"
+        "if(qp>wp*2)return'queue/capacity pressure';if(wp>qp*2)return'slow task "
+        "execution';return'balanced latency'}"
+        "function renderLatencyStats(){const body=$('latencyStats');"
+        "body.replaceChildren();completedStages().forEach(s=>{const tr=document."
+        "createElement('tr');[s.index+' · '+s.source+' → '+s.target,"
+        "Math.min(s.queue.length,s.work.length),distribution(s.queue),"
+        "distribution(s.work),latencyObservation(s)].forEach(v=>{const td=document."
+        "createElement('td');td.textContent=v;tr.appendChild(td)});body.appendChild("
+        "tr)});if(!body.children.length)body.innerHTML='<tr><td colspan=\"5\">No "
+        "completed chains.</td></tr>'};"
+        "const waitText=h=>h.wait?'futex '+h.wait.address+' · '+"
+        "exact(h.wait.duration_ns):'—';"
+        "const wakerText=h=>h.wait&&h.wait.waker_tid?"
+        "h.wait.waker_pid+'/'+h.wait.waker_tid+' '+h.wait.waker_comm:'—';"
         "function segment(track,p,left,total){if(!p.v)return;const d=document."
         "createElement('div');d.className='segment '+p.c;d.style.left=(left/"
         "total*100)+'%';d.style.width=(p.v/total*100)+'%';d.title=p.n+': '+"
@@ -283,17 +427,18 @@ int cw_html_report_end(FILE *stream)
         "const details=$('details');details.replaceChildren();c.hops.forEach(h=>{"
         "const tr=document.createElement('tr');[h.index,h.source+' → '+h.target,"
         "h.pid+'/'+h.tid+' → '+h.target_tid,h.key,exact(h.queue_ns),"
-        "exact(h.work_ns),dominant(h).n+' '+exact(dominant(h).v)].forEach(v=>{"
+        "exact(h.work_ns),dominant(h).n+' '+exact(dominant(h).v),waitText(h),"
+        "wakerText(h)].forEach(v=>{"
         "const td=document."
         "createElement('td');td.textContent=v;tr.appendChild(td)});details."
         "appendChild(tr)})}"
-        "function init(){if(!chains.length){$('chain').innerHTML='<option>No "
+        "function init(){renderDiagnostics();renderLatencyStats();if(!chains.length){$('chain').innerHTML='<option>No "
         "completed async chains</option>';['timeline','breakdown'].forEach(id=>"
         "$(id).innerHTML='<div class=\"empty\">No matching chain was captured."
         "</div>');return}const totals=chains.map(sum).sort((a,b)=>a-b);"
         "$('count').textContent=chains.length;$('average').textContent=exact("
-        "totals.reduce((a,b)=>a+b,0)/totals.length);$('p95').textContent=exact("
-        "totals[Math.min(totals.length-1,Math.ceil(totals.length*.95)-1)]);"
+        "totals.reduce((a,b)=>a+b,0)/totals.length);$('p95').textContent="
+        "totals.length>=20?exact(percentile(totals,.95)):'n/a (<20 samples)';"
         "$('maximum').textContent=exact(totals[totals.length-1]);"
         "const select=$('chain');"
         "chains.forEach((c,i)=>{const o=document.createElement('option');o.value=i;"
@@ -304,5 +449,18 @@ int cw_html_report_end(FILE *stream)
         "select.value=slow;select.onchange=()=>render(+select.value);render(slow)}"
         "init();</script></body></html>\n";
 
+    size_t index;
+
+    if (fputs("];\nconst diagnosticReport={\"type\":"
+              "\"queue_diagnostics\",\"hops\":[", stream) == EOF)
+        return -1;
+    for (index = 0; index < count; index++) {
+        if (index && fputc(',', stream) == EOF)
+            return -1;
+        if (write_queue_diagnostic(stream, &diagnostics[index]))
+            return -1;
+    }
+    if (fputs("]}", stream) == EOF)
+        return -1;
     return fputs(footer, stream) == EOF ? -1 : 0;
 }

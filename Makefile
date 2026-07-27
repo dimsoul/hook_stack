@@ -43,6 +43,7 @@ TEST_BINARY := test/trace_test
 ASYNC_TEST_BINARY := test/trace_async_test
 THREAD_POOL_TEST_BINARY := test/trace_thread_pool_test
 COMPLEX_ASYNC_TEST_BINARY := test/trace_complex_async_test
+LOCK_TEST_BINARY := test/trace_lock_test
 BPF_OBJECT := src/callweave.bpf.o
 VMLINUX_HEADER := src/vmlinux.h
 SKELETON_HEADER := src/callweave.skel.h
@@ -51,7 +52,8 @@ SKELETON_HEADER := src/callweave.skel.h
 .PHONY: all clean test-program demo-async
 
 all: $(BINARY) $(TEST_BINARY) $(ASYNC_TEST_BINARY) \
-	$(THREAD_POOL_TEST_BINARY) $(COMPLEX_ASYNC_TEST_BINARY)
+	$(THREAD_POOL_TEST_BINARY) $(COMPLEX_ASYNC_TEST_BINARY) \
+	$(LOCK_TEST_BINARY)
 
 $(VMLINUX_HEADER):
 	@test -r /sys/kernel/btf/vmlinux || \
@@ -85,14 +87,20 @@ $(COMPLEX_ASYNC_TEST_BINARY): test/test_complex_async.c
 	$(CC) -std=gnu11 -O0 -g -Wall -Wextra -fno-omit-frame-pointer -fno-inline \
 		-rdynamic $< -o $@ -pthread
 
+$(LOCK_TEST_BINARY): test/test_lock.c
+	$(CC) -std=gnu11 -O0 -g -Wall -Wextra -fno-omit-frame-pointer -fno-inline \
+		-rdynamic $< -o $@ -pthread
+
 test-program: $(TEST_BINARY) $(ASYNC_TEST_BINARY) \
-	$(THREAD_POOL_TEST_BINARY) $(COMPLEX_ASYNC_TEST_BINARY)
+	$(THREAD_POOL_TEST_BINARY) $(COMPLEX_ASYNC_TEST_BINARY) \
+	$(LOCK_TEST_BINARY)
 
 demo-async: all
 	bash test/run_async_demo.sh
 
 clean:
 	rm -f $(BINARY) $(TEST_BINARY) $(ASYNC_TEST_BINARY) \
-		$(THREAD_POOL_TEST_BINARY) $(COMPLEX_ASYNC_TEST_BINARY) $(BPF_OBJECT) \
+		$(THREAD_POOL_TEST_BINARY) $(COMPLEX_ASYNC_TEST_BINARY) \
+		$(LOCK_TEST_BINARY) $(BPF_OBJECT) \
 		$(VMLINUX_HEADER) \
 		$(SKELETON_HEADER)

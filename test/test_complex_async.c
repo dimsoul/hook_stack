@@ -5,6 +5,7 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,6 +51,8 @@ struct stage_queue {
 static struct stage_queue decode_queue;
 static struct stage_queue enrich_queue;
 static struct stage_queue persist_queue;
+static pthread_mutex_t storage_mutex = PTHREAD_MUTEX_INITIALIZER;
+static atomic_bool storage_holder_ready;
 static volatile sig_atomic_t exiting;
 
 __attribute__((noinline))
@@ -251,9 +254,28 @@ static void flush_storage_record(struct complex_request *request)
            (unsigned long long)request->checksum);
 }
 
+__attribute__((noinline))
+static void release_storage_mutex(void)
+{
+    pthread_mutex_unlock(&storage_mutex);
+}
+
+__attribute__((noinline))
+static void *storage_lock_holder(void *argument)
+{
+    (void)argument;
+    pthread_mutex_lock(&storage_mutex);
+    atomic_store_explicit(&storage_holder_ready, true,
+                          memory_order_release);
+    usleep(60000);
+    release_storage_mutex();
+    return NULL;
+}
+
 /*
  * Hop 2 target key is arg8. On x86-64 this forces auto discovery to read the
  * second stack-passed integer/pointer argument after checking six registers.
+ * It also waits on storage_mutex so the final hop exercises futex attribution.
  */
 __attribute__((noinline))
 void persist_result(const char *backend, unsigned int flags,
@@ -263,6 +285,7 @@ void persist_result(const char *backend, unsigned int flags,
 {
     struct complex_request *request = token->request;
 
+    pthread_mutex_lock(&storage_mutex);
     printf("persist backend=%s request=%llu flags=%u attempt=%llu "
            "status=%d region=%s epoch=%llu observer=%p key=%p\n",
            backend, (unsigned long long)request->id, flags,
@@ -270,6 +293,7 @@ void persist_result(const char *backend, unsigned int flags,
            (unsigned long long)epoch, observer, (void *)token);
     encode_storage_record(request);
     flush_storage_record(request);
+    pthread_mutex_unlock(&storage_mutex);
     free(request);
 }
 
@@ -306,9 +330,29 @@ static void *stage_worker(void *argument)
                            5000000000ULL);
             break;
         case STAGE_PERSIST:
+        {
+            pthread_t holder;
+            int error;
+
+            atomic_store_explicit(&storage_holder_ready, false,
+                                  memory_order_relaxed);
+            error = pthread_create(&holder, NULL, storage_lock_holder,
+                                   NULL);
+            if (error) {
+                fprintf(stderr, "cannot start storage lock holder: %s\n",
+                        strerror(error));
+                persist_result("local-store", 0x42, 1, 0, "primary",
+                               1700000000ULL, queue, item);
+                break;
+            }
+            while (!atomic_load_explicit(&storage_holder_ready,
+                                         memory_order_acquire))
+                usleep(1000);
             persist_result("local-store", 0x42, 1, 0, "primary",
                            1700000000ULL, queue, item);
+            pthread_join(holder, NULL);
             break;
+        }
         }
     }
 }
