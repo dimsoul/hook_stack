@@ -118,6 +118,27 @@ Set tool variables when the defaults are not appropriate, for example:
 make CLANG=clang-18 BPFTOOL=/usr/sbin/bpftool
 ```
 
+### Source layout
+
+The implementation is split by responsibility so changes to one tracer mode
+do not require editing a single monolithic loader:
+
+- `src/callweave.c`: command-line handling, probe attachment, and lifecycle.
+- `src/config.c`: YAML-like trace configuration and option value parsing.
+- `src/symbols.c`: process maps, ELF symbol lookup, and `addr2line` resolution.
+- `src/async_output.c`: async-chain filtering, queue diagnostics, and event
+  rendering.
+- `src/io_uring.c`: io_uring event handling and callback correlation.
+- `src/io_uring_report.c`: io_uring aggregation plus text and JSON summaries.
+- `src/io_uring_resources.c`: submitter maps and file-descriptor resources.
+- `src/report.c`: async JSON Lines and self-contained HTML reports.
+- `src/callweave.bpf.c`: common eBPF probes and async tracing.
+- `src/io_uring.bpf.maps.h` and `src/io_uring.bpf.progs.h`: io_uring eBPF maps
+  and probe programs.
+- `src/io_uring_shared.h` and `src/async_events.h`: kernel/userspace event
+  layouts. Generated `src/vmlinux.h` and `src/callweave.skel.h` remain build
+  artifacts.
+
 ## Usage
 
 ```text
