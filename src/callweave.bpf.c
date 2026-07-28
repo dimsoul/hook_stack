@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 #include "vmlinux.h"
-#include "io_uring_shared.h"
+#include "io_uring/io_uring_shared.h"
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
@@ -361,7 +361,7 @@ struct {
     __type(value, struct async_worker_stats);
 } async_worker_stats SEC(".maps");
 
-#include "io_uring.bpf.maps.h"
+#include "io_uring/io_uring.bpf.maps.h"
 
 static __always_inline int get_process_info(u64 *pid_tgid, u32 *global_pid,
                                             u32 *global_tid, u32 *pid,
@@ -1649,6 +1649,6 @@ int trace_sched_waking(struct bpf_raw_tracepoint_args *ctx)
                                   (struct task_struct *)ctx->args[0]);
 }
 
-#include "io_uring.bpf.progs.h"
+#include "io_uring/io_uring.bpf.progs.h"
 
 char LICENSE[] SEC("license") = "GPL";

@@ -13,7 +13,7 @@
 
 #include <linux/types.h>
 
-#include "io_uring_shared.h"
+#include "io_uring/io_uring_shared.h"
 
 #define MAX_STACK_DEPTH 128
 #define MAX_ASYNC_STACK_DEPTH 127

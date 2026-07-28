@@ -36,7 +36,7 @@
 #include "async_output.h"
 #include "callweave_internal.h"
 #include "config.h"
-#include "io_uring.h"
+#include "io_uring/io_uring.h"
 #include "report.h"
 #include "symbols.h"
 

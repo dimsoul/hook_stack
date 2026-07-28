@@ -61,8 +61,9 @@ $(VMLINUX_HEADER):
 		{ echo "error: /sys/kernel/btf/vmlinux is unavailable" >&2; exit 1; }
 	$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c > $@
 
-$(BPF_OBJECT): src/callweave.bpf.c src/io_uring_shared.h \
-		src/io_uring.bpf.maps.h src/io_uring.bpf.progs.h \
+$(BPF_OBJECT): src/callweave.bpf.c src/io_uring/io_uring_shared.h \
+		src/io_uring/io_uring.bpf.maps.h \
+		src/io_uring/io_uring.bpf.progs.h \
 		$(VMLINUX_HEADER)
 	$(CLANG) $(BPF_CFLAGS) -Isrc -c $< -o $@
 
@@ -70,16 +71,20 @@ $(SKELETON_HEADER): $(BPF_OBJECT)
 	$(BPFTOOL) gen skeleton $< > $@
 
 $(BINARY): src/callweave.c src/async_output.c src/config.c \
-		src/symbols.c src/io_uring.c src/io_uring_report.c \
-		src/io_uring_resources.c src/io_uring.h \
-		src/io_uring_internal.h src/io_uring_shared.h \
+		src/symbols.c src/io_uring/io_uring.c \
+		src/io_uring/io_uring_report.c \
+		src/io_uring/io_uring_resources.c \
+		src/io_uring/io_uring.h \
+		src/io_uring/io_uring_internal.h \
+		src/io_uring/io_uring_shared.h \
 		src/async_events.h src/async_output.h \
 		src/callweave_internal.h src/config.h src/symbols.h \
 		src/report.c src/report.h $(SKELETON_HEADER)
 	$(CC) $(CFLAGS) $(LIBBPF_CFLAGS) $(LIBELF_CFLAGS) -Isrc \
 		src/callweave.c src/async_output.c src/config.c \
-		src/symbols.c src/io_uring.c src/io_uring_report.c \
-		src/io_uring_resources.c src/report.c -o $@ \
+		src/symbols.c src/io_uring/io_uring.c \
+		src/io_uring/io_uring_report.c \
+		src/io_uring/io_uring_resources.c src/report.c -o $@ \
 		$(LIBBPF_LIBS) $(LIBELF_LIBS) $(ZLIB_LIBS)
 
 $(TEST_BINARY): test/test.c
