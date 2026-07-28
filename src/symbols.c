@@ -8,6 +8,7 @@
 #include <gelf.h>
 #include <libelf.h>
 #include <limits.h>
+#include <poll.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -496,27 +497,65 @@ fallback:
     return map->load_bias;
 }
 
-static int wait_for_child(pid_t child, int *status)
+static int wait_for_child(pid_t child, int *status,
+                          struct cw_capture_control *control)
 {
     pid_t result;
 
+    if (!control) {
+        do {
+            result = waitpid(child, status, 0);
+        } while (result < 0 && errno == EINTR);
+        return result < 0 ? -1 : 0;
+    }
     for (;;) {
-        if (force_exit) {
-            kill(child, SIGTERM);
+        if (cw_capture_cancelled(control)) {
+            kill(child, SIGKILL);
             do {
                 result = waitpid(child, status, 0);
             } while (result < 0 && errno == EINTR);
             return -1;
         }
-        result = waitpid(child, status, 0);
-        if (result >= 0 || errno != EINTR)
-            break;
+        result = waitpid(child, status, WNOHANG);
+        if (result == child)
+            return 0;
+        if (result < 0 && errno != EINTR)
+            return -1;
+        cw_capture_wait(control, 50);
     }
-    return result < 0 ? -1 : 0;
+}
+
+static bool wait_for_symbol_output(
+    FILE *output, struct cw_capture_control *control)
+{
+    struct pollfd descriptors[2] = {
+        {
+            .fd = fileno(output),
+            .events = POLLIN,
+        },
+        {
+            .fd = cw_capture_signal_fd(control),
+            .events = POLLIN,
+        },
+    };
+    nfds_t count = descriptors[1].fd >= 0 ? 2 : 1;
+    int result;
+
+    do {
+        result = poll(descriptors, count, -1);
+    } while (result < 0 && errno == EINTR);
+    if (result <= 0)
+        return false;
+    if (count == 2 && descriptors[1].revents)
+        cw_capture_drain_signals(control);
+    if (cw_capture_cancelled(control))
+        return false;
+    return descriptors[0].revents & (POLLIN | POLLHUP);
 }
 
 static int symbolize_group(struct frame_info *frames, const size_t *indices,
-                           size_t count, const char *module_path)
+                           size_t count, const char *module_path,
+                           struct cw_capture_control *control)
 {
     char *arguments[MAX_STACK_DEPTH + 8];
     char *line = NULL;
@@ -553,6 +592,7 @@ static int symbolize_group(struct frame_info *frames, const size_t *indices,
         if (dup2(pipe_fds[1], STDOUT_FILENO) < 0)
             _exit(126);
         close(pipe_fds[1]);
+        cw_capture_prepare_child(control);
         execvp(arguments[0], arguments);
         _exit(127);
     }
@@ -561,18 +601,23 @@ static int symbolize_group(struct frame_info *frames, const size_t *indices,
     output = fdopen(pipe_fds[0], "r");
     if (!output) {
         close(pipe_fds[0]);
-        wait_for_child(child, &status);
+        wait_for_child(child, &status, control);
         return -1;
     }
+    setvbuf(output, NULL, _IONBF, 0);
 
-    for (i = 0; i < count && getline(&line, &line_capacity, output) >= 0; i++) {
+    for (i = 0;
+         i < count && !cw_capture_cancelled(control) &&
+         wait_for_symbol_output(output, control) &&
+         getline(&line, &line_capacity, output) >= 0;
+         i++) {
         line[strcspn(line, "\r\n")] = '\0';
         frames[indices[i]].symbol = strdup(line);
     }
 
     free(line);
     fclose(output);
-    if (wait_for_child(child, &status))
+    if (wait_for_child(child, &status, control))
         return -1;
     return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
 }
@@ -583,14 +628,15 @@ static const char *path_basename(const char *path)
     return slash ? slash + 1 : path;
 }
 
-static void resolve_frames(struct frame_info *frames, size_t frame_count)
+static void resolve_frames(struct frame_info *frames, size_t frame_count,
+                           struct cw_capture_control *control)
 {
     bool grouped[MAX_STACK_DEPTH] = {0};
     size_t indices[MAX_STACK_DEPTH];
     size_t i, j;
 
     for (i = 0; i < frame_count; i++) {
-        if (force_exit)
+        if (cw_capture_cancelled(control))
             break;
         size_t group_count = 0;
 
@@ -603,14 +649,16 @@ static void resolve_frames(struct frame_info *frames, size_t frame_count)
                 indices[group_count++] = j;
             }
         }
-        symbolize_group(frames, indices, group_count, frames[i].map->path);
+        symbolize_group(frames, indices, group_count,
+                        frames[i].map->path, control);
     }
 }
 
 void print_stack_frames(const uint64_t *stack, int32_t stack_size,
                         struct map_list *maps, const char *prefix,
                         const char *candidate_path,
-                        char *candidate, size_t candidate_size)
+                        char *candidate, size_t candidate_size,
+                        struct cw_capture_control *control)
 {
     struct frame_info frames[MAX_STACK_DEPTH] = {0};
     size_t frame_count;
@@ -636,7 +684,9 @@ void print_stack_frames(const uint64_t *stack, int32_t stack_size,
         return;
     }
 
-    for (i = 0; i < frame_count && !force_exit; i++) {
+    for (i = 0;
+         i < frame_count && !cw_capture_cancelled(control);
+         i++) {
         frames[i].ip = stack[i];
         frames[i].map = find_map(maps, frames[i].ip);
         if (frames[i].map && frames[i].map->path[0]) {
@@ -649,8 +699,8 @@ void print_stack_frames(const uint64_t *stack, int32_t stack_size,
         }
     }
 
-    resolve_frames(frames, frame_count);
-    if (force_exit) {
+    resolve_frames(frames, frame_count, control);
+    if (cw_capture_cancelled(control)) {
         for (i = 0; i < frame_count; i++)
             free(frames[i].symbol);
         return;

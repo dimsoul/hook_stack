@@ -124,19 +124,21 @@ The implementation is split by responsibility so changes to one tracer mode
 do not require editing a single monolithic loader:
 
 - `src/callweave.c`: command-line handling, probe attachment, and lifecycle.
+- `src/core/`: target-selection and core function-tracing configuration,
+  plus the capture lifecycle and signal state machine.
+- `src/async/`: async-chain configuration, event ABI, filtering, queue
+  diagnostics, and event rendering.
 - `src/config.c`: YAML-like trace configuration and option value parsing.
 - `src/symbols.c`: process maps, ELF symbol lookup, and `addr2line` resolution.
-- `src/async_output.c`: async-chain filtering, queue diagnostics, and event
-  rendering.
 - `src/io_uring/`: the complete io_uring feature module. Its event handling,
-  aggregation/reporting, resource resolution, shared ABI, BPF maps, and BPF
-  probes live together so future runtime integrations can use parallel
-  directories.
+  configuration, event handling, aggregation/reporting, resource resolution,
+  shared ABI, BPF maps, and BPF probes live together so future runtime
+  integrations can use parallel directories.
 - `src/report.c`: async JSON Lines and self-contained HTML reports.
 - `src/callweave.bpf.c`: common eBPF probes and async tracing.
-- `src/async_events.h` and `src/io_uring/io_uring_shared.h`: kernel/userspace
-  event layouts. Generated `src/vmlinux.h` and `src/callweave.skel.h` remain
-  build artifacts.
+- `src/async/async_events.h` and `src/io_uring/io_uring_shared.h`:
+  kernel/userspace event layouts. Generated `src/vmlinux.h` and
+  `src/callweave.skel.h` remain build artifacts.
 
 ## Usage
 

@@ -333,7 +333,7 @@ static void print_wait_resource(const struct wait_resource *wait,
         read_process_maps(maps_pid, &waker_maps);
     }
     print_stack_frames(waker_stack, sizeof(waker_stack), &waker_maps,
-                       "waker ", NULL, NULL, 0);
+                       "waker ", NULL, NULL, 0, output->control);
     map_list_free(&waker_maps);
 }
 
@@ -485,7 +485,7 @@ static void export_completed_chain(const struct stack_trace_event *event,
         fprintf(stderr, "failed to write trace export: %s\n",
                 strerror(errno ? errno : EIO));
         output->export_failed = true;
-        exiting = 1;
+        cw_capture_request_stop(output->control, CW_STOP_OUTPUT_ERROR);
     }
 }
 
@@ -494,7 +494,7 @@ static void count_completed_chain(struct output_options *output)
     output->emitted_events++;
     if (output->max_events &&
         output->emitted_events >= output->max_events)
-        exiting = 1;
+        cw_capture_request_stop(output->control, CW_STOP_MAX_EVENTS);
 }
 
 int handle_event(void *context, void *data, size_t data_size)
@@ -506,8 +506,7 @@ int handle_event(void *context, void *data, size_t data_size)
     size_t entry_size = sizeof(*event);
     uint32_t maps_pid;
 
-    if (output->max_events &&
-        output->emitted_events >= output->max_events)
+    if (!cw_capture_running(output->control))
         return 0;
     if (data_size < header_size) {
         fprintf(stderr,
@@ -662,7 +661,8 @@ int handle_event(void *context, void *data, size_t data_size)
                        hop->stack_id, strerror(errno));
             } else {
                 print_stack_frames(async_stack, sizeof(async_stack),
-                                   &maps, "async ", NULL, NULL, 0);
+                                   &maps, "async ", NULL, NULL, 0,
+                                   output->control);
             }
         }
     }
@@ -706,7 +706,7 @@ int handle_event(void *context, void *data, size_t data_size)
             print_stack_frames(waker_stack, sizeof(waker_stack),
                                &waker_maps, "waker ",
                                output->target_path, candidate,
-                               sizeof(candidate));
+                               sizeof(candidate), output->control);
         }
 
         if (candidate[0]) {
@@ -743,7 +743,7 @@ int handle_event(void *context, void *data, size_t data_size)
         return 0;
     }
     print_stack_frames(event->stack, event->stack_size, &maps, "",
-                       NULL, NULL, 0);
+                       NULL, NULL, 0, output->control);
     putchar('\n');
 
     map_list_free(&maps);

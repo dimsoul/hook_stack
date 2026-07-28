@@ -135,10 +135,7 @@ int cw_io_uring_handle_event(void *context, void *data, size_t data_size)
 
     if (data_size < sizeof(*event))
         return 0;
-    if (exiting)
-        return 0;
-    if (output->max_events &&
-        output->emitted_events >= output->max_events)
+    if (!cw_capture_running(output->control))
         return 0;
 
     cw_io_uring_cache_fd_resource(output, event->fd);
@@ -199,7 +196,9 @@ int cw_io_uring_handle_event(void *context, void *data, size_t data_size)
             fprintf(stderr, "failed to write io_uring JSON output: %s\n",
                     strerror(errno ? errno : EIO));
             output->export_failed = true;
-            exiting = 1;
+            cw_capture_request_stop(
+                output->control, CW_STOP_OUTPUT_ERROR);
+            return 0;
         }
     } else {
         uint64_t stack[MAX_ASYNC_STACK_DEPTH] = {0};
@@ -248,7 +247,7 @@ int cw_io_uring_handle_event(void *context, void *data, size_t data_size)
         putchar('\n');
         printf("  submit stack:\n");
 
-        if (!exiting && event->stack_id >= 0 &&
+        if (event->stack_id >= 0 &&
             output->io_uring_stack_map_fd >= 0) {
             struct map_list *maps;
 
@@ -265,25 +264,24 @@ int cw_io_uring_handle_event(void *context, void *data, size_t data_size)
                            strerror(errno));
                 } else {
                     print_stack_frames(stack, sizeof(stack), maps,
-                                       "  ", NULL, NULL, 0);
+                                       "  ", NULL, NULL, 0,
+                                       output->control);
                 }
             }
-        } else if (!exiting && event->sq_thread) {
+        } else if (event->sq_thread) {
             printf("    unavailable: request was issued by "
                    "an io_uring SQPOLL thread\n");
-        } else if (!exiting) {
+        } else {
             printf("    unavailable\n");
         }
         putchar('\n');
     }
 
-    if (exiting)
-        return 0;
     output->emitted_events++;
     if (output->max_events &&
-        output->emitted_events >= output->max_events) {
-        exiting = 1;
-    }
+        output->emitted_events >= output->max_events)
+        cw_capture_request_stop(
+            output->control, CW_STOP_MAX_EVENTS);
     return 0;
 }
 
@@ -294,7 +292,8 @@ int cw_io_uring_handle_callback_event(
     const struct io_uring_callback_event *event = data;
     const char *operation;
 
-    if (data_size < sizeof(*event) || exiting)
+    if (data_size < sizeof(*event) ||
+        !cw_capture_running(output->control))
         return 0;
     operation = cw_io_uring_opcode_name(event->opcode);
     if (output->json_output) {
@@ -341,7 +340,8 @@ int cw_io_uring_handle_callback_event(
                     "failed to write io_uring callback JSON: %s\n",
                     strerror(errno ? errno : EIO));
             output->export_failed = true;
-            exiting = 1;
+            cw_capture_request_stop(
+                output->control, CW_STOP_OUTPUT_ERROR);
         }
         return 0;
     }
@@ -374,7 +374,8 @@ int cw_io_uring_handle_callback_event(
             maps = cw_io_uring_get_maps(output, &map_event);
             if (maps)
                 print_stack_frames(stack, sizeof(stack), maps,
-                                   "  ", NULL, NULL, 0);
+                                   "  ", NULL, NULL, 0,
+                                   output->control);
             else
                 printf("    unavailable: process maps disappeared\n");
         }

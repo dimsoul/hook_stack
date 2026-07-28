@@ -4,7 +4,6 @@
 #define CALLWEAVE_INTERNAL_H
 
 #include <limits.h>
-#include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -13,6 +12,7 @@
 
 #include <linux/types.h>
 
+#include "core/capture_control.h"
 #include "io_uring/io_uring_shared.h"
 
 #define MAX_STACK_DEPTH 128
@@ -68,6 +68,7 @@ struct io_uring_fd_resource {
 };
 
 struct output_options {
+    struct cw_capture_control *control;
     bool show_return_value;
     bool show_duration;
     bool show_attribution;
@@ -119,9 +120,6 @@ struct output_options {
     bool target_exited;
 };
 
-extern volatile sig_atomic_t exiting;
-extern volatile sig_atomic_t force_exit;
-
 void map_list_free(struct map_list *maps);
 int read_process_maps(uint32_t pid, struct map_list *maps);
 uint64_t event_realtime_nanoseconds(uint64_t timestamp_ns);
@@ -132,6 +130,7 @@ void format_interval(char *buffer, size_t size, uint64_t nanoseconds);
 void print_stack_frames(const uint64_t *stack, int32_t stack_size,
                         struct map_list *maps, const char *prefix,
                         const char *candidate_path,
-                        char *candidate, size_t candidate_size);
+                        char *candidate, size_t candidate_size,
+                        struct cw_capture_control *control);
 
 #endif

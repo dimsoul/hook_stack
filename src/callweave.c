@@ -31,9 +31,12 @@
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 
+#include "core/core_config.h"
+#include "async/async_config.h"
+#include "io_uring/io_uring_config.h"
 #include "callweave.skel.h"
-#include "async_events.h"
-#include "async_output.h"
+#include "async/async_events.h"
+#include "async/async_output.h"
 #include "callweave_internal.h"
 #include "config.h"
 #include "io_uring/io_uring.h"
@@ -50,35 +53,6 @@ _Static_assert(sizeof(struct io_uring_result_key) == 8,
                "userspace and BPF io_uring result keys differ");
 _Static_assert(sizeof(struct io_uring_callback_event) == 104,
                "userspace and BPF io_uring callback events differ");
-
-volatile sig_atomic_t exiting;
-volatile sig_atomic_t force_exit;
-static volatile sig_atomic_t interrupt_count;
-
-static void handle_signal(int signo)
-{
-    if (signo == SIGINT) {
-        if (interrupt_count < 2)
-            interrupt_count++;
-        if (interrupt_count > 1)
-            force_exit = 1;
-    }
-    exiting = 1;
-}
-
-static int install_signal_handlers(void)
-{
-    struct sigaction action = {
-        .sa_handler = handle_signal,
-    };
-
-    sigemptyset(&action.sa_mask);
-    if (sigaction(SIGINT, &action, NULL) || sigaction(SIGTERM, &action, NULL)) {
-        fprintf(stderr, "failed to install signal handlers: %s\n", strerror(errno));
-        return -1;
-    }
-    return 0;
-}
 
 static bool target_process_exited(struct output_options *output)
 {
@@ -114,8 +88,8 @@ static int configure_pid_namespace(struct callweave_bpf *skeleton)
         return -saved_error;
     }
 
-    skeleton->rodata->pidns_dev = (uint64_t)namespace_status.st_dev;
-    skeleton->rodata->pidns_ino = (uint64_t)namespace_status.st_ino;
+    skeleton->rodata->cw_target_cfg.pidns_dev = (uint64_t)namespace_status.st_dev;
+    skeleton->rodata->cw_target_cfg.pidns_ino = (uint64_t)namespace_status.st_ino;
     return 0;
 }
 
@@ -551,7 +525,10 @@ int main(int argc, char **argv)
         .sz = sizeof(return_options),
         .retprobe = true,
     };
+    struct cw_capture_control control =
+        CW_CAPTURE_CONTROL_INITIALIZER;
     struct output_options output = {
+        .control = &control,
         .async_stack_map_fd = -1,
         .discovery_stack_map_fd = -1,
         .wait_stack_map_fd = -1,
@@ -602,6 +579,7 @@ int main(int argc, char **argv)
     bool io_callback_option_seen = false;
     bool check_config = false;
     bool json_output = false;
+    bool finalize_outputs = true;
     int remaining_arguments;
     int option;
     int error = 0;
@@ -1201,42 +1179,45 @@ trace_target_ready:
             }
         }
     }
-    if (install_signal_handlers()) {
-        error = -errno;
+    error = cw_capture_control_init(&control);
+    if (error) {
+        fprintf(stderr, "failed to initialize capture control: %s\n",
+                strerror(-error));
         goto cleanup;
     }
 
     skeleton = callweave_bpf__open();
     if (!skeleton) {
         fprintf(stderr, "failed to open BPF skeleton\n");
-        return 1;
+        error = -ENOMEM;
+        goto cleanup;
     }
     error = configure_pid_namespace(skeleton);
     if (error)
         goto cleanup;
-    skeleton->rodata->target_pid =
+    skeleton->rodata->cw_target_cfg.target_pid =
         target_pid > 0 ? (uint32_t)target_pid : 0;
-    skeleton->rodata->trace_returns =
+    skeleton->rodata->cw_trace_cfg.returns_enabled =
         output.show_return_value || output.show_duration;
-    skeleton->rodata->trace_attribution = output.show_attribution;
-    skeleton->rodata->trace_async = output.show_async;
-    skeleton->rodata->trace_discovery = output.show_discovery;
-    skeleton->rodata->trace_io_uring = output.io_uring_mode;
-    skeleton->rodata->enable_io_uring_callback =
+    skeleton->rodata->cw_trace_cfg.attribution_enabled = output.show_attribution;
+    skeleton->rodata->cw_async_cfg.enabled = output.show_async;
+    skeleton->rodata->cw_async_cfg.discovery_enabled = output.show_discovery;
+    skeleton->rodata->cw_io_uring_cfg.enabled = output.io_uring_mode;
+    skeleton->rodata->cw_io_uring_cfg.callback_enabled =
         output.io_uring_callback_name != NULL;
-    skeleton->rodata->io_uring_callback_arg = io_callback_arg;
-    skeleton->rodata->io_uring_min_latency_ns =
+    skeleton->rodata->cw_io_uring_cfg.callback_arg = io_callback_arg;
+    skeleton->rodata->cw_io_uring_cfg.min_latency_ns =
         output.io_uring_min_latency_ns;
-    skeleton->rodata->io_uring_errors_only =
+    skeleton->rodata->cw_io_uring_cfg.errors_only =
         output.io_uring_errors_only;
-    skeleton->rodata->async_source_arg = async_source_arg;
-    skeleton->rodata->async_target_arg = async_target_arg;
-    skeleton->rodata->async_max_age_ns =
+    skeleton->rodata->cw_async_cfg.source_arg = async_source_arg;
+    skeleton->rodata->cw_async_cfg.target_arg = async_target_arg;
+    skeleton->rodata->cw_async_cfg.max_age_ns =
         (uint64_t)async_max_age_ms * 1000000ULL;
-    skeleton->rodata->async_final_hop_id =
+    skeleton->rodata->cw_async_cfg.final_hop_id =
         output.show_async ?
             (uint32_t)(async_hop_count ? async_hop_count : 1) : 0;
-    skeleton->rodata->futex_syscall_nr = SYS_futex;
+    skeleton->rodata->cw_trace_cfg.futex_syscall_nr = SYS_futex;
     if (!output.io_uring_mode) {
         error = bpf_program__set_autoload(
             skeleton->progs.trace_io_uring_submit_req, false);
@@ -1735,12 +1716,23 @@ trace_target_ready:
         stop_time_ns = monotonic_time_ns() +
                        (uint64_t)duration_seconds * 1000000000ULL;
     output.diagnostic_last_ns = monotonic_time_ns();
-    while (!exiting) {
+    while (cw_capture_running(&control)) {
+        int signal_error;
+
         error = ring_buffer__poll(ring_buffer, 250);
+        signal_error = cw_capture_drain_signals(&control);
+        if (signal_error) {
+            error = signal_error;
+            fprintf(stderr, "failed to read capture signal: %s\n",
+                    strerror(-error));
+            break;
+        }
+        if (!cw_capture_running(&control)) {
+            error = 0;
+            break;
+        }
         if (error == -EINTR) {
             error = 0;
-            if (exiting)
-                break;
             continue;
         }
         if (target_process_exited(&output)) {
@@ -1748,6 +1740,8 @@ trace_target_ready:
             fprintf(output.json_output ? stderr : stdout,
                     "Target PID %d exited; stopping trace.\n",
                     target_pid);
+            cw_capture_request_stop(
+                &control, CW_STOP_TARGET_EXIT);
             break;
         }
         if (error < 0) {
@@ -1763,10 +1757,13 @@ trace_target_ready:
                 (uint64_t)output.diagnostic_interval_ms * 1000000ULL)
                 print_queue_diagnostics(&output, false);
         }
-        if (stop_time_ns && monotonic_time_ns() >= stop_time_ns)
+        if (stop_time_ns && monotonic_time_ns() >= stop_time_ns) {
+            cw_capture_request_stop(&control, CW_STOP_DURATION);
             break;
+        }
     }
-    if (ring_buffer && output.io_uring_callback_name && !force_exit) {
+    if (ring_buffer && output.io_uring_callback_name &&
+        cw_capture_should_finalize(&control)) {
         int consume_error = ring_buffer__consume(ring_buffer);
 
         if (consume_error < 0 && !error)
@@ -1774,40 +1771,48 @@ trace_target_ready:
     }
 
 cleanup:
+    cw_capture_drain_signals(&control);
+    finalize_outputs = cw_capture_should_finalize(&control);
     if (output.io_uring_mode)
         detach_io_uring_links(skeleton);
-    if (interrupt_count == 1 && !force_exit &&
+    if (cw_capture_stopped_by_signal(&control) &&
         output.io_uring_mode && output.io_uring_top)
         fprintf(output.json_output ? stderr : stdout,
                 "Capture stopped; resolving unique top stacks. "
                 "Press Ctrl+C again to exit immediately.\n");
-    if (output.show_async && output.diagnostic_last_ns &&
+    if (finalize_outputs && output.show_async &&
+        output.diagnostic_last_ns &&
         output.async_hop_stats_map_fd >= 0)
         print_queue_diagnostics(&output, true);
-    if (output.io_uring_mode && output.diagnostic_last_ns &&
-        output.io_uring_counters_map_fd >= 0 && !force_exit)
+    if (finalize_outputs && output.io_uring_mode &&
+        output.diagnostic_last_ns &&
+        output.io_uring_counters_map_fd >= 0)
         cw_io_uring_print_summary(&output);
+    finalize_outputs = !cw_capture_cancelled(&control);
     if (output.report_stream) {
-        struct cw_queue_diagnostic diagnostics[MAX_ASYNC_HOPS];
-        struct async_hop_stats raw[MAX_ASYNC_HOPS];
-        size_t diagnostic_count =
-            read_queue_diagnostics(&output, diagnostics, raw);
+        if (finalize_outputs) {
+            struct cw_queue_diagnostic diagnostics[MAX_ASYNC_HOPS];
+            struct async_hop_stats raw[MAX_ASYNC_HOPS];
+            size_t diagnostic_count =
+                read_queue_diagnostics(&output, diagnostics, raw);
 
-        if ((cw_html_report_end(output.report_stream, diagnostics,
-                                diagnostic_count) ||
-             fflush(output.report_stream)) && !error) {
-            error = -(errno ? errno : EIO);
-            fprintf(stderr, "failed to finalize HTML report: %s\n",
-                    strerror(-error));
+            if ((cw_html_report_end(output.report_stream, diagnostics,
+                                    diagnostic_count) ||
+                 fflush(output.report_stream)) && !error) {
+                error = -(errno ? errno : EIO);
+                fprintf(stderr, "failed to finalize HTML report: %s\n",
+                        strerror(-error));
+            }
         }
         if (fclose(output.report_stream) && !error)
             error = -errno;
     }
     if (output.json_stream) {
-        if (output.io_uring_mode && !force_exit) {
+        finalize_outputs = !cw_capture_cancelled(&control);
+        if (output.io_uring_mode && finalize_outputs) {
             if (cw_io_uring_write_summary_json(&output) && !error)
                 error = -(errno ? errno : EIO);
-        } else if (!output.io_uring_mode) {
+        } else if (!output.io_uring_mode && finalize_outputs) {
             struct cw_queue_diagnostic diagnostics[MAX_ASYNC_HOPS];
             struct async_hop_stats raw[MAX_ASYNC_HOPS];
             size_t diagnostic_count =
@@ -1834,6 +1839,7 @@ cleanup:
         callweave_bpf__destroy(skeleton);
     if (output.target_pidfd >= 0)
         close(output.target_pidfd);
+    cw_capture_control_destroy(&control);
     cw_io_uring_cleanup(&output);
     free_async_hops(async_hops, async_hop_count);
     free(configured_function);

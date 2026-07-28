@@ -38,7 +38,7 @@ int trace_io_uring_create(struct bpf_raw_tracepoint_args *ctx)
     u32 tid;
     s32 pidns_error;
 
-    if (!trace_io_uring ||
+    if (!cw_io_uring_cfg.enabled ||
         !get_process_info(&pid_tgid, &global_pid, &global_tid,
                           &pid, &tid, &pidns_error))
         return 0;
@@ -58,10 +58,12 @@ int trace_io_uring_register(struct bpf_raw_tracepoint_args *ctx)
     u64 ring_ctx = ctx->args[0];
     struct io_uring_ring_stats *stats;
 
-    if (!trace_io_uring)
+    if (!cw_io_uring_cfg.enabled)
         return 0;
     stats = bpf_map_lookup_elem(&io_uring_ring_stats, &ring_ctx);
-    if (!stats || (target_pid && target_pid != stats->owner_pid))
+    if (!stats ||
+        (cw_target_cfg.target_pid &&
+         cw_target_cfg.target_pid != stats->owner_pid))
         return 0;
     __sync_fetch_and_add(&stats->registrations, 1);
     stats->registered_files = (u32)ctx->args[2];
@@ -87,7 +89,7 @@ int trace_io_uring_submit_req(struct bpf_raw_tracepoint_args *ctx)
     u8 one = 1;
     s32 pidns_error;
 
-    if (!trace_io_uring || !request)
+    if (!cw_io_uring_cfg.enabled || !request)
         return 0;
 
     uring_task = BPF_CORE_READ(request, tctx);
@@ -111,7 +113,7 @@ int trace_io_uring_submit_req(struct bpf_raw_tracepoint_args *ctx)
         state.stack_id = bpf_get_stackid(ctx, &io_uring_stacks,
                                          BPF_F_USER_STACK);
     } else {
-        if (target_pid && target_pid != state.global_pid)
+        if (cw_target_cfg.target_pid && cw_target_cfg.target_pid != state.global_pid)
             return 0;
         state.sq_thread = 1;
         __builtin_memcpy(state.comm, "sqpoll", sizeof("sqpoll"));
@@ -153,7 +155,7 @@ int trace_io_uring_defer(struct bpf_raw_tracepoint_args *ctx)
     struct io_uring_request_state *state;
     struct io_uring_ring_stats *ring_stats;
 
-    if (!trace_io_uring || !request_key)
+    if (!cw_io_uring_cfg.enabled || !request_key)
         return 0;
     state = bpf_map_lookup_elem(&io_uring_requests, &request_key);
     if (!state)
@@ -176,7 +178,7 @@ int trace_io_uring_queue_async_work(struct bpf_raw_tracepoint_args *ctx)
     struct io_uring_request_state *state;
     struct io_uring_ring_stats *ring_stats;
 
-    if (!trace_io_uring || !request_key)
+    if (!cw_io_uring_cfg.enabled || !request_key)
         return 0;
     state = bpf_map_lookup_elem(&io_uring_requests, &request_key);
     if (!state)
@@ -203,7 +205,7 @@ int BPF_KPROBE(trace_io_wq_submit_work, struct io_wq_work *work)
     struct io_uring_request_state *state;
     u64 request_key;
 
-    if (!trace_io_uring || !work)
+    if (!cw_io_uring_cfg.enabled || !work)
         return 0;
     request = (struct io_kiocb *)((char *)work -
         bpf_core_field_offset(struct io_kiocb, work));
@@ -221,7 +223,7 @@ int trace_io_uring_poll_arm(struct bpf_raw_tracepoint_args *ctx)
     struct io_uring_request_state *state;
     struct io_uring_ring_stats *ring_stats;
 
-    if (!trace_io_uring || !request_key)
+    if (!cw_io_uring_cfg.enabled || !request_key)
         return 0;
     state = bpf_map_lookup_elem(&io_uring_requests, &request_key);
     if (!state || state->poll_armed)
@@ -241,7 +243,7 @@ int trace_io_uring_file_get(struct bpf_raw_tracepoint_args *ctx)
     struct io_uring_request_state *state;
     u64 request_key = (u64)request;
 
-    if (!trace_io_uring || !request)
+    if (!cw_io_uring_cfg.enabled || !request)
         return 0;
     state = bpf_map_lookup_elem(&io_uring_requests, &request_key);
     if (state)
@@ -255,10 +257,12 @@ int trace_io_uring_cqring_wait(struct bpf_raw_tracepoint_args *ctx)
     u64 ring_ctx = ctx->args[0];
     struct io_uring_ring_stats *stats;
 
-    if (!trace_io_uring)
+    if (!cw_io_uring_cfg.enabled)
         return 0;
     stats = bpf_map_lookup_elem(&io_uring_ring_stats, &ring_ctx);
-    if (stats && (!target_pid || target_pid == stats->owner_pid))
+    if (stats &&
+        (!cw_target_cfg.target_pid ||
+         cw_target_cfg.target_pid == stats->owner_pid))
         __sync_fetch_and_add(&stats->cq_waits, 1);
     return 0;
 }
@@ -269,10 +273,12 @@ int trace_io_uring_cqe_overflow(struct bpf_raw_tracepoint_args *ctx)
     u64 ring_ctx = ctx->args[0];
     struct io_uring_ring_stats *stats;
 
-    if (!trace_io_uring)
+    if (!cw_io_uring_cfg.enabled)
         return 0;
     stats = bpf_map_lookup_elem(&io_uring_ring_stats, &ring_ctx);
-    if (stats && (!target_pid || target_pid == stats->owner_pid))
+    if (stats &&
+        (!cw_target_cfg.target_pid ||
+         cw_target_cfg.target_pid == stats->owner_pid))
         __sync_fetch_and_add(&stats->cq_overflows, 1);
     return 0;
 }
@@ -297,7 +303,7 @@ int trace_io_uring_req_failed(struct bpf_raw_tracepoint_args *ctx)
     u32 tid;
     s32 pidns_error;
 
-    if (!trace_io_uring || !sqe || !request)
+    if (!cw_io_uring_cfg.enabled || !sqe || !request)
         return 0;
     if (!get_process_info(&pid_tgid, &global_pid, &global_tid,
                           &pid, &tid, &pidns_error))
@@ -351,7 +357,7 @@ static __always_inline void record_io_uring_link(
     child_state = bpf_map_lookup_elem(
         &io_uring_requests, &child_key);
     if (!parent_state ||
-        (target_pid && target_pid != parent_state->pid))
+        (cw_target_cfg.target_pid && cw_target_cfg.target_pid != parent_state->pid))
         return;
     key.ring_ctx = parent_state->ring_ctx;
     key.parent_user_data = parent_state->user_data;
@@ -389,7 +395,7 @@ static __always_inline void record_io_uring_link(
 SEC("raw_tp/io_uring_link")
 int trace_io_uring_link(struct bpf_raw_tracepoint_args *ctx)
 {
-    if (trace_io_uring)
+    if (cw_io_uring_cfg.enabled)
         record_io_uring_link(
             (struct io_kiocb *)ctx->args[1],
             (struct io_kiocb *)ctx->args[0], false);
@@ -399,7 +405,7 @@ int trace_io_uring_link(struct bpf_raw_tracepoint_args *ctx)
 SEC("raw_tp/io_uring_fail_link")
 int trace_io_uring_fail_link(struct bpf_raw_tracepoint_args *ctx)
 {
-    if (trace_io_uring)
+    if (cw_io_uring_cfg.enabled)
         record_io_uring_link(
             (struct io_kiocb *)ctx->args[0],
             (struct io_kiocb *)ctx->args[1], true);
@@ -435,7 +441,7 @@ int trace_io_uring_complete(struct bpf_raw_tracepoint_args *ctx)
     u32 zero = 0;
     bool is_error;
 
-    if (!trace_io_uring || !request || !completion)
+    if (!cw_io_uring_cfg.enabled || !request || !completion)
         return 0;
     state = bpf_map_lookup_elem(&io_uring_requests, &request_key);
     if (!state) {
@@ -464,7 +470,7 @@ int trace_io_uring_complete(struct bpf_raw_tracepoint_args *ctx)
         !(saved.opcode == IO_URING_OP_TIMEOUT &&
           result == -IO_URING_ETIME);
 
-    if (enable_io_uring_callback) {
+    if (cw_io_uring_cfg.callback_enabled) {
         struct io_uring_completion_key completion_key = {
             .global_pid = saved.global_pid,
             .user_data = BPF_CORE_READ(completion, user_data),
@@ -562,8 +568,8 @@ int trace_io_uring_complete(struct bpf_raw_tracepoint_args *ctx)
             __sync_fetch_and_add(&aggregate->errors, 1);
         __sync_fetch_and_add(&aggregate->total_ns, duration_ns);
         update_peak(&aggregate->maximum_ns, duration_ns);
-        if (io_uring_min_latency_ns &&
-            duration_ns >= io_uring_min_latency_ns)
+        if (cw_io_uring_cfg.min_latency_ns &&
+            duration_ns >= cw_io_uring_cfg.min_latency_ns)
             __sync_fetch_and_add(&aggregate->slow_count, 1);
         if (saved.deferred)
             __sync_fetch_and_add(&aggregate->deferred_count, 1);
@@ -578,9 +584,9 @@ int trace_io_uring_complete(struct bpf_raw_tracepoint_args *ctx)
         }
     }
 
-    if ((io_uring_errors_only && !is_error) ||
-        (io_uring_min_latency_ns &&
-         duration_ns < io_uring_min_latency_ns)) {
+    if ((cw_io_uring_cfg.errors_only && !is_error) ||
+        (cw_io_uring_cfg.min_latency_ns &&
+         duration_ns < cw_io_uring_cfg.min_latency_ns)) {
         if (!(cqe_flags & IO_URING_CQE_F_MORE))
             bpf_map_delete_elem(&io_uring_requests, &request_key);
         return 0;
@@ -651,13 +657,13 @@ int trace_io_uring_callback(struct pt_regs *ctx)
     s32 pidns_error;
     struct io_uring_counters *counters;
 
-    if (!enable_io_uring_callback ||
+    if (!cw_io_uring_cfg.callback_enabled ||
         !get_process_info(&pid_tgid, &global_pid, &global_tid,
                           &pid, &tid, &pidns_error))
         return 0;
     key.global_pid = global_pid;
     key.user_data =
-        read_uprobe_argument(ctx, io_uring_callback_arg);
+        read_uprobe_argument(ctx, cw_io_uring_cfg.callback_arg);
     completion = bpf_map_lookup_elem(&io_uring_completions, &key);
     counters = bpf_map_lookup_elem(&io_uring_counters, &zero);
     if (!completion) {

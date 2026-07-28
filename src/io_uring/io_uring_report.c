@@ -756,7 +756,7 @@ static void print_io_uring_aggregates(struct output_options *output,
         char maximum[32];
         char resource[PATH_MAX];
 
-        if (force_exit)
+        if (cw_capture_cancelled(output->control))
             break;
         snprintf(operation, sizeof(operation), "%s(%u)",
                  cw_io_uring_opcode_name((uint8_t)row->key.opcode),
@@ -833,7 +833,8 @@ static void print_io_uring_aggregates(struct output_options *output,
         } else if (output->io_uring_maps) {
             print_stack_frames(stack, sizeof(stack),
                                output->io_uring_maps,
-                               "       ", NULL, NULL, 0);
+                               "       ", NULL, NULL, 0,
+                               output->control);
         } else {
             fprintf(stream, "         submitter maps unavailable\n");
         }
