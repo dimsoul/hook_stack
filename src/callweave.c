@@ -2,6 +2,7 @@
 
 #define _GNU_SOURCE
 
+#include <arpa/inet.h>
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -9,6 +10,8 @@
 #include <limits.h>
 #include <libelf.h>
 #include <gelf.h>
+#include <dirent.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -24,6 +27,7 @@
 #include <unistd.h>
 
 #include <linux/types.h>
+#include <linux/io_uring.h>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 
@@ -159,6 +163,220 @@ struct async_worker_stats {
     char comm[16];
 };
 
+struct io_uring_event {
+    uint64_t timestamp_ns;
+    uint64_t submit_ns;
+    uint64_t duration_ns;
+    uint64_t defer_delay_ns;
+    uint64_t io_wq_queue_ns;
+    uint64_t after_io_wq_ns;
+    uint64_t ring_ctx;
+    uint64_t request;
+    uint64_t user_data;
+    uint64_t request_flags;
+    uint32_t submit_pid;
+    uint32_t submit_tid;
+    uint32_t submit_global_pid;
+    uint32_t submit_global_tid;
+    uint32_t complete_global_pid;
+    uint32_t complete_global_tid;
+    int32_t fd;
+    int32_t result;
+    uint32_t cqe_flags;
+    int32_t stack_id;
+    uint8_t opcode;
+    uint8_t sq_thread;
+    uint8_t deferred;
+    uint8_t io_wq;
+    uint8_t io_wq_hashed;
+    uint8_t poll_armed;
+    uint16_t reserved;
+    char submit_comm[16];
+    char complete_comm[16];
+};
+
+struct io_uring_counters {
+    uint64_t submitted;
+    uint64_t completions;
+    uint64_t finished;
+    uint64_t pending;
+    uint64_t peak_pending;
+    uint64_t unmatched;
+    uint64_t dropped_events;
+    uint64_t errors;
+    uint64_t expected_timeouts;
+    uint64_t callback_matched;
+    uint64_t callback_unmatched;
+    uint64_t callback_dropped;
+};
+
+struct io_uring_aggregate_key {
+    uint64_t ring_ctx;
+    int32_t stack_id;
+    int32_t fd;
+    uint32_t opcode;
+    uint32_t reserved;
+};
+
+struct io_uring_aggregate {
+    uint64_t count;
+    uint64_t errors;
+    uint64_t total_ns;
+    uint64_t maximum_ns;
+    uint64_t slow_count;
+    uint64_t deferred_count;
+    uint64_t io_wq_count;
+    uint64_t io_wq_queue_total_ns;
+    uint64_t io_wq_queue_maximum_ns;
+};
+
+struct io_uring_aggregate_row {
+    struct io_uring_aggregate_key key;
+    struct io_uring_aggregate value;
+};
+
+struct io_uring_result_key {
+    int32_t result;
+    uint32_t opcode;
+};
+
+struct io_uring_result_row {
+    struct io_uring_result_key key;
+    uint64_t count;
+};
+
+struct io_uring_error_code_summary {
+    int32_t result;
+    uint64_t count;
+};
+
+struct io_uring_operation_summary {
+    uint64_t completions;
+    uint64_t errors;
+    uint64_t expected_timeouts;
+    uint64_t total_ns;
+    uint64_t maximum_ns;
+    uint64_t deferred;
+    uint64_t io_wq;
+    uint64_t io_wq_queue_total_ns;
+    uint64_t io_wq_queue_maximum_ns;
+    int32_t top_error_result;
+    uint64_t top_error_count;
+};
+
+struct io_uring_ring_stats {
+    uint64_t submitted;
+    uint64_t completions;
+    uint64_t errors;
+    uint64_t expected_timeouts;
+    uint64_t pending;
+    uint64_t peak_pending;
+    uint64_t total_ns;
+    uint64_t maximum_ns;
+    uint64_t deferred;
+    uint64_t io_wq;
+    uint64_t io_wq_hashed;
+    uint64_t io_wq_queue_total_ns;
+    uint64_t io_wq_queue_maximum_ns;
+    uint64_t poll_armed;
+    uint64_t cq_waits;
+    uint64_t cq_overflows;
+    uint64_t request_failures;
+    uint64_t links;
+    uint64_t failed_links;
+    uint64_t registrations;
+    uint32_t owner_pid;
+    int32_t ring_fd;
+    uint32_t flags;
+    uint32_t sq_entries;
+    uint32_t cq_entries;
+    uint32_t registered_files;
+    uint32_t registered_buffers;
+};
+
+struct io_uring_ring_row {
+    uint64_t ring_ctx;
+    struct io_uring_ring_stats value;
+};
+
+struct io_uring_failure_key {
+    uint64_t ring_ctx;
+    int32_t error;
+    uint32_t opcode;
+};
+
+struct io_uring_failure_stats {
+    uint64_t count;
+    uint64_t user_data;
+    uint64_t offset;
+    uint64_t address;
+    uint64_t address3;
+    uint32_t length;
+    uint32_t operation_flags;
+    uint32_t file_index;
+    uint16_t buffer_index;
+    uint8_t sqe_flags;
+    uint8_t ioprio;
+};
+
+struct io_uring_failure_row {
+    struct io_uring_failure_key key;
+    struct io_uring_failure_stats value;
+};
+
+struct io_uring_link_key {
+    uint64_t ring_ctx;
+    uint64_t parent_user_data;
+    uint64_t child_user_data;
+};
+
+struct io_uring_link_stats {
+    uint64_t parent_request;
+    uint64_t child_request;
+    uint64_t count;
+    uint64_t failures;
+    uint8_t parent_opcode;
+    uint8_t child_opcode;
+    uint16_t reserved;
+    uint32_t reserved2;
+};
+
+struct io_uring_link_row {
+    struct io_uring_link_key key;
+    struct io_uring_link_stats value;
+};
+
+struct io_uring_callback_event {
+    uint64_t timestamp_ns;
+    uint64_t completion_ns;
+    uint64_t callback_delay_ns;
+    uint64_t request_duration_ns;
+    uint64_t ring_ctx;
+    uint64_t request;
+    uint64_t user_data;
+    uint32_t pid;
+    uint32_t tid;
+    uint32_t global_pid;
+    uint32_t global_tid;
+    int32_t result;
+    uint32_t cqe_flags;
+    int32_t stack_id;
+    uint8_t opcode;
+    uint8_t reserved[3];
+    char comm[16];
+};
+
+struct map_list;
+
+struct io_uring_fd_resource {
+    int fd;
+    char path[PATH_MAX];
+};
+
+struct output_options;
+static void cache_io_uring_fd_resource(
+    struct output_options *output, int fd);
+
 struct output_options {
     bool show_return_value;
     bool show_duration;
@@ -170,6 +388,14 @@ struct output_options {
     int wait_stack_map_fd;
     int async_hop_stats_map_fd;
     int async_worker_stats_map_fd;
+    int io_uring_stack_map_fd;
+    int io_uring_counters_map_fd;
+    int io_uring_aggregate_map_fd;
+    int io_uring_result_map_fd;
+    int io_uring_ring_stats_map_fd;
+    int io_uring_failure_map_fd;
+    int io_uring_link_map_fd;
+    const char *io_uring_callback_name;
     const struct async_hop_config *async_hops;
     size_t async_hop_count;
     const char *async_source_name;
@@ -186,15 +412,37 @@ struct output_options {
     FILE *report_stream;
     bool report_first;
     bool export_failed;
+    bool io_uring_mode;
+    bool io_uring_errors_only;
+    uint64_t io_uring_min_latency_ns;
+    uint32_t io_uring_top;
     uint32_t diagnostic_interval_ms;
     uint64_t diagnostic_last_ns;
     struct async_hop_stats diagnostic_previous[MAX_ASYNC_HOPS];
+    struct map_list *io_uring_maps;
+    struct io_uring_fd_resource *io_uring_resources;
+    size_t io_uring_resource_count;
+    size_t io_uring_resource_capacity;
+    uint32_t io_uring_maps_pid;
+    pid_t target_pid;
+    int target_pidfd;
+    bool target_exited;
 };
 
 _Static_assert(offsetof(struct stack_trace_event, stack) == 1520,
                "userspace and BPF event layouts differ");
 _Static_assert(sizeof(struct stack_trace_event) == 2544,
                "userspace and BPF event sizes differ");
+_Static_assert(sizeof(struct io_uring_event) == 160,
+               "userspace and BPF io_uring event sizes differ");
+_Static_assert(sizeof(struct io_uring_aggregate_key) == 24,
+               "userspace and BPF io_uring aggregate keys differ");
+_Static_assert(sizeof(struct io_uring_aggregate) == 72,
+               "userspace and BPF io_uring aggregates differ");
+_Static_assert(sizeof(struct io_uring_result_key) == 8,
+               "userspace and BPF io_uring result keys differ");
+_Static_assert(sizeof(struct io_uring_callback_event) == 104,
+               "userspace and BPF io_uring callback events differ");
 
 struct proc_map {
     uint64_t start;
@@ -227,12 +475,19 @@ struct elf_symbol_info {
 };
 
 static volatile sig_atomic_t exiting;
+static volatile sig_atomic_t force_exit;
+static volatile sig_atomic_t interrupt_count;
 
 static const char *path_basename(const char *path);
 
 static void handle_signal(int signo)
 {
-    (void)signo;
+    if (signo == SIGINT) {
+        if (interrupt_count < 2)
+            interrupt_count++;
+        if (interrupt_count > 1)
+            force_exit = 1;
+    }
     exiting = 1;
 }
 
@@ -248,6 +503,28 @@ static int install_signal_handlers(void)
         return -1;
     }
     return 0;
+}
+
+static bool target_process_exited(struct output_options *output)
+{
+    if (output->target_exited)
+        return true;
+    if (output->target_pidfd >= 0) {
+        struct pollfd descriptor = {
+            .fd = output->target_pidfd,
+            .events = POLLIN,
+        };
+        int result = poll(&descriptor, 1, 0);
+
+        if (result > 0 &&
+            (descriptor.revents & (POLLIN | POLLHUP | POLLERR)))
+            output->target_exited = true;
+    } else if (output->target_pid > 0 &&
+               kill(output->target_pid, 0) &&
+               errno == ESRCH) {
+        output->target_exited = true;
+    }
+    return output->target_exited;
 }
 
 static int configure_pid_namespace(struct callweave_bpf *skeleton)
@@ -283,6 +560,71 @@ static int attach_raw_tracepoint(struct bpf_program *program,
     fprintf(stderr, "failed to attach raw tracepoint %s: %s\n",
             tracepoint, strerror(-error));
     return error;
+}
+
+static bool attach_optional_raw_tracepoint(
+    struct bpf_program *program, struct bpf_link **link,
+    const char *tracepoint)
+{
+    int error;
+
+    *link = bpf_program__attach_raw_tracepoint(program, tracepoint);
+    error = *link ? libbpf_get_error(*link) :
+                    (errno ? -errno : -EINVAL);
+    if (!error)
+        return true;
+    *link = NULL;
+    fprintf(stderr,
+            "warning: optional io_uring tracepoint %s unavailable: %s\n",
+            tracepoint, strerror(-error));
+    return false;
+}
+
+static bool attach_optional_kprobe(struct bpf_program *program,
+                                   struct bpf_link **link,
+                                   const char *function)
+{
+    int error;
+
+    *link = bpf_program__attach_kprobe(program, false, function);
+    error = *link ? libbpf_get_error(*link) :
+                    (errno ? -errno : -EINVAL);
+    if (!error)
+        return true;
+    *link = NULL;
+    fprintf(stderr,
+            "warning: optional io_uring kprobe %s unavailable: %s\n",
+            function, strerror(-error));
+    return false;
+}
+
+static void detach_link(struct bpf_link **link)
+{
+    if (!link || !*link)
+        return;
+    bpf_link__destroy(*link);
+    *link = NULL;
+}
+
+static void detach_io_uring_links(struct callweave_bpf *skeleton)
+{
+    if (!skeleton)
+        return;
+    detach_link(&skeleton->links.trace_io_uring_submit_req);
+    detach_link(&skeleton->links.trace_io_uring_file_get);
+    detach_link(&skeleton->links.trace_io_uring_complete);
+    detach_link(&skeleton->links.trace_io_uring_create);
+    detach_link(&skeleton->links.trace_io_uring_register);
+    detach_link(&skeleton->links.trace_io_uring_defer);
+    detach_link(&skeleton->links.trace_io_uring_queue_async_work);
+    detach_link(&skeleton->links.trace_io_wq_submit_work);
+    detach_link(&skeleton->links.trace_io_uring_poll_arm);
+    detach_link(&skeleton->links.trace_io_uring_cqring_wait);
+    detach_link(&skeleton->links.trace_io_uring_cqe_overflow);
+    detach_link(&skeleton->links.trace_io_uring_req_failed);
+    detach_link(&skeleton->links.trace_io_uring_link);
+    detach_link(&skeleton->links.trace_io_uring_fail_link);
+    detach_link(&skeleton->links.trace_io_uring_callback);
 }
 
 static int attach_named_uprobe(struct bpf_program *program,
@@ -321,6 +663,7 @@ static void usage(FILE *stream, const char *program)
             "  %s --binary BINARY --offset OFFSET\n"
             "  %s -p PID --discover-async FUNCTION\n"
             "  %s -p PID --config PATH\n"
+            "  %s -p PID --io-uring\n"
             "  %s --check-config PATH\n"
             "\n"
             "Options:\n"
@@ -361,11 +704,26 @@ static void usage(FILE *stream, const char *program)
             "      --format FORMAT        text or json (default text)\n"
             "      --output PATH          write JSON Lines to PATH\n"
             "      --report PATH          write a self-contained HTML report\n"
+            "      --io-uring             trace io_uring submission-to-CQE "
+            "latency\n"
+            "      --min-io-latency-us US only emit io_uring requests at "
+            "least US\n"
+            "      --io-errors-only        only emit failed io_uring "
+            "requests\n"
+            "      --io-top N              show N slowest opcode/fd/stack "
+            "groups\n"
+            "      --io-callback FUNC      correlate CQE to a user callback\n"
+            "      --io-callback-binary PATH\n"
+            "                             ELF containing the callback "
+            "(default /proc/PID/exe)\n"
+            "      --io-callback-arg N     callback argument containing "
+            "user_data, 1-8 (default 1)\n"
             "  -h, --help                show this help\n"
             "\n"
             "When -p is used without --binary or --module, /proc/PID/exe is used.\n"
             "Without -p, an explicit BINARY is required.\n",
-            program, program, program, program, program, program, program);
+            program, program, program, program, program, program, program,
+            program);
 }
 
 static int parse_pid(const char *text, pid_t *pid)
@@ -440,6 +798,46 @@ static void map_list_free(struct map_list *maps)
     maps->items = NULL;
     maps->count = 0;
     maps->capacity = 0;
+}
+
+static int read_process_maps(uint32_t pid, struct map_list *maps);
+
+static struct map_list *get_io_uring_maps(
+    struct output_options *output,
+    const struct io_uring_event *event)
+{
+    struct map_list *maps;
+    uint32_t maps_pid = event->submit_pid;
+
+    if (output->io_uring_maps &&
+        output->io_uring_maps_pid == maps_pid)
+        return output->io_uring_maps;
+
+    if (output->io_uring_maps) {
+        map_list_free(output->io_uring_maps);
+        free(output->io_uring_maps);
+        output->io_uring_maps = NULL;
+        output->io_uring_maps_pid = 0;
+    }
+    maps = calloc(1, sizeof(*maps));
+    if (!maps)
+        return NULL;
+    if (read_process_maps(maps_pid, maps) &&
+        event->submit_pid != event->submit_global_pid) {
+        map_list_free(maps);
+        maps_pid = event->submit_global_pid;
+        if (read_process_maps(maps_pid, maps)) {
+            free(maps);
+            return NULL;
+        }
+    } else if (!maps->count) {
+        map_list_free(maps);
+        free(maps);
+        return NULL;
+    }
+    output->io_uring_maps = maps;
+    output->io_uring_maps_pid = maps_pid;
+    return maps;
 }
 
 static int map_list_append(struct map_list *maps, const struct proc_map *map)
@@ -897,9 +1295,18 @@ static int wait_for_child(pid_t child, int *status)
 {
     pid_t result;
 
-    do {
+    for (;;) {
+        if (force_exit) {
+            kill(child, SIGTERM);
+            do {
+                result = waitpid(child, status, 0);
+            } while (result < 0 && errno == EINTR);
+            return -1;
+        }
         result = waitpid(child, status, 0);
-    } while (result < 0 && errno == EINTR);
+        if (result >= 0 || errno != EINTR)
+            break;
+    }
     return result < 0 ? -1 : 0;
 }
 
@@ -978,6 +1385,8 @@ static void resolve_frames(struct frame_info *frames, size_t frame_count)
     size_t i, j;
 
     for (i = 0; i < frame_count; i++) {
+        if (force_exit)
+            break;
         size_t group_count = 0;
 
         if (grouped[i] || !frames[i].map || !frames[i].map->path[0])
@@ -1057,20 +1466,26 @@ static uint64_t monotonic_time_ns(void)
            (uint64_t)now.tv_nsec;
 }
 
-static void print_interval(const char *label, uint64_t nanoseconds)
+static void fprint_interval(FILE *stream, const char *label,
+                            uint64_t nanoseconds)
 {
     if (nanoseconds >= 1000000000ULL)
-        printf(" %s=%.6f s", label,
-               (double)nanoseconds / 1000000000.0);
+        fprintf(stream, " %s=%.6f s", label,
+                (double)nanoseconds / 1000000000.0);
     else if (nanoseconds >= 1000000ULL)
-        printf(" %s=%.3f ms", label,
-               (double)nanoseconds / 1000000.0);
+        fprintf(stream, " %s=%.3f ms", label,
+                (double)nanoseconds / 1000000.0);
     else if (nanoseconds >= 1000ULL)
-        printf(" %s=%.3f us", label,
-               (double)nanoseconds / 1000.0);
+        fprintf(stream, " %s=%.3f us", label,
+                (double)nanoseconds / 1000.0);
     else
-        printf(" %s=%llu ns", label,
-               (unsigned long long)nanoseconds);
+        fprintf(stream, " %s=%llu ns", label,
+                (unsigned long long)nanoseconds);
+}
+
+static void print_interval(const char *label, uint64_t nanoseconds)
+{
+    fprint_interval(stdout, label, nanoseconds);
 }
 
 static void format_interval(char *buffer, size_t size, uint64_t nanoseconds)
@@ -1363,7 +1778,7 @@ static void print_stack_frames(const uint64_t *stack, int32_t stack_size,
         return;
     }
 
-    for (i = 0; i < frame_count; i++) {
+    for (i = 0; i < frame_count && !force_exit; i++) {
         frames[i].ip = stack[i];
         frames[i].map = find_map(maps, frames[i].ip);
         if (frames[i].map && frames[i].map->path[0]) {
@@ -1377,6 +1792,11 @@ static void print_stack_frames(const uint64_t *stack, int32_t stack_size,
     }
 
     resolve_frames(frames, frame_count);
+    if (force_exit) {
+        for (i = 0; i < frame_count; i++)
+            free(frames[i].symbol);
+        return;
+    }
     for (i = 0; i < frame_count; i++) {
         if (candidate && candidate_size && !candidate[0] &&
             candidate_path && frames[i].map &&
@@ -1406,6 +1826,1897 @@ static void print_stack_frames(const uint64_t *stack, int32_t stack_size,
         }
         free(frames[i].symbol);
     }
+}
+
+static const char *io_uring_opcode_name(uint8_t opcode)
+{
+    switch (opcode) {
+    case IORING_OP_NOP:
+        return "NOP";
+    case IORING_OP_READV:
+        return "READV";
+    case IORING_OP_WRITEV:
+        return "WRITEV";
+    case IORING_OP_FSYNC:
+        return "FSYNC";
+    case IORING_OP_READ_FIXED:
+        return "READ_FIXED";
+    case IORING_OP_WRITE_FIXED:
+        return "WRITE_FIXED";
+    case IORING_OP_POLL_ADD:
+        return "POLL_ADD";
+    case IORING_OP_POLL_REMOVE:
+        return "POLL_REMOVE";
+    case IORING_OP_SYNC_FILE_RANGE:
+        return "SYNC_FILE_RANGE";
+    case IORING_OP_SENDMSG:
+        return "SENDMSG";
+    case IORING_OP_RECVMSG:
+        return "RECVMSG";
+    case IORING_OP_TIMEOUT:
+        return "TIMEOUT";
+    case IORING_OP_TIMEOUT_REMOVE:
+        return "TIMEOUT_REMOVE";
+    case IORING_OP_ACCEPT:
+        return "ACCEPT";
+    case IORING_OP_ASYNC_CANCEL:
+        return "ASYNC_CANCEL";
+    case IORING_OP_LINK_TIMEOUT:
+        return "LINK_TIMEOUT";
+    case IORING_OP_CONNECT:
+        return "CONNECT";
+    case IORING_OP_FALLOCATE:
+        return "FALLOCATE";
+    case IORING_OP_OPENAT:
+        return "OPENAT";
+    case IORING_OP_CLOSE:
+        return "CLOSE";
+    case IORING_OP_FILES_UPDATE:
+        return "FILES_UPDATE";
+    case IORING_OP_STATX:
+        return "STATX";
+    case IORING_OP_READ:
+        return "READ";
+    case IORING_OP_WRITE:
+        return "WRITE";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static int write_json_string(FILE *stream, const char *text, size_t size)
+{
+    size_t index;
+
+    if (fputc('"', stream) == EOF)
+        return -1;
+    for (index = 0; index < size && text[index]; index++) {
+        unsigned char character = (unsigned char)text[index];
+
+        switch (character) {
+        case '"':
+            if (fputs("\\\"", stream) == EOF)
+                return -1;
+            break;
+        case '\\':
+            if (fputs("\\\\", stream) == EOF)
+                return -1;
+            break;
+        case '\b':
+            if (fputs("\\b", stream) == EOF)
+                return -1;
+            break;
+        case '\f':
+            if (fputs("\\f", stream) == EOF)
+                return -1;
+            break;
+        case '\n':
+            if (fputs("\\n", stream) == EOF)
+                return -1;
+            break;
+        case '\r':
+            if (fputs("\\r", stream) == EOF)
+                return -1;
+            break;
+        case '\t':
+            if (fputs("\\t", stream) == EOF)
+                return -1;
+            break;
+        default:
+            if (character < 0x20) {
+                if (fprintf(stream, "\\u%04x", character) < 0)
+                    return -1;
+            } else if (fputc(character, stream) == EOF) {
+                return -1;
+            }
+        }
+    }
+    return fputc('"', stream) == EOF ? -1 : 0;
+}
+
+static int handle_io_uring_event(void *context, void *data, size_t data_size)
+{
+    struct output_options *output = context;
+    const struct io_uring_event *event = data;
+    const char *operation;
+
+    if (data_size < sizeof(*event))
+        return 0;
+    if (exiting)
+        return 0;
+    if (output->max_events &&
+        output->emitted_events >= output->max_events)
+        return 0;
+
+    cache_io_uring_fd_resource(output, event->fd);
+    operation = io_uring_opcode_name(event->opcode);
+
+    if (output->json_output) {
+        FILE *stream = output->json_stream;
+        uint64_t realtime_ns =
+            event_realtime_nanoseconds(event->timestamp_ns);
+
+        if (!stream)
+            return 0;
+        if (fprintf(stream,
+                    "{\"type\":\"io_uring\",\"timestamp_ns\":%llu,"
+                    "\"submit_pid\":%u,\"submit_tid\":%u,"
+                    "\"submit_global_pid\":%u,"
+                    "\"submit_global_tid\":%u,"
+                    "\"complete_global_pid\":%u,"
+                    "\"complete_global_tid\":%u,"
+                    "\"opcode\":%u,\"operation\":",
+                    (unsigned long long)realtime_ns,
+                    event->submit_pid, event->submit_tid,
+                    event->submit_global_pid,
+                    event->submit_global_tid,
+                    event->complete_global_pid,
+                    event->complete_global_tid,
+                    event->opcode) < 0 ||
+            write_json_string(stream, operation, strlen(operation)) ||
+            fprintf(stream,
+                    ",\"fd\":%d,\"user_data\":\"0x%016llx\","
+                    "\"result\":%d,\"cqe_flags\":%u,"
+                    "\"duration_ns\":%llu,"
+                    "\"defer_delay_ns\":%llu,"
+                    "\"io_wq_queue_ns\":%llu,"
+                    "\"after_io_wq_ns\":%llu,"
+                    "\"deferred\":%s,\"io_wq\":%s,"
+                    "\"io_wq_hashed\":%s,\"poll_armed\":%s,"
+                    "\"sq_thread\":%s,"
+                    "\"submit_comm\":",
+                    event->fd, (unsigned long long)event->user_data,
+                    event->result, event->cqe_flags,
+                    (unsigned long long)event->duration_ns,
+                    (unsigned long long)event->defer_delay_ns,
+                    (unsigned long long)event->io_wq_queue_ns,
+                    (unsigned long long)event->after_io_wq_ns,
+                    event->deferred ? "true" : "false",
+                    event->io_wq ? "true" : "false",
+                    event->io_wq_hashed ? "true" : "false",
+                    event->poll_armed ? "true" : "false",
+                    event->sq_thread ? "true" : "false") < 0 ||
+            write_json_string(stream, event->submit_comm,
+                              sizeof(event->submit_comm)) ||
+            fputs(",\"complete_comm\":", stream) == EOF ||
+            write_json_string(stream, event->complete_comm,
+                              sizeof(event->complete_comm)) ||
+            fputs("}\n", stream) == EOF ||
+            fflush(stream)) {
+            fprintf(stderr, "failed to write io_uring JSON output: %s\n",
+                    strerror(errno ? errno : EIO));
+            output->export_failed = true;
+            exiting = 1;
+        }
+    } else {
+        uint64_t stack[MAX_ASYNC_STACK_DEPTH] = {0};
+
+        print_event_time(event->timestamp_ns);
+        printf("IO_URING request user_data=0x%016llx\n",
+               (unsigned long long)event->user_data);
+        printf("  SQE submit: PID %u/TID %u (%.*s) opcode=%s(%u)",
+               event->submit_pid, event->submit_tid,
+               (int)sizeof(event->submit_comm), event->submit_comm,
+               operation, event->opcode);
+        if (event->fd >= 0)
+            printf(" fd=%d", event->fd);
+        if (event->sq_thread)
+            printf(" via=sqpoll");
+        putchar('\n');
+        printf("  CQE complete: global PID %u/TID %u (%.*s) "
+               "result=%d",
+               event->complete_global_pid, event->complete_global_tid,
+               (int)sizeof(event->complete_comm), event->complete_comm,
+               event->result);
+        if (event->result < 0 && event->result >= -4095)
+            printf(" (%s)", strerror(-event->result));
+        printf(" flags=0x%x", event->cqe_flags);
+        if (event->cqe_flags & IORING_CQE_F_MORE)
+            printf(" [MORE]");
+        putchar('\n');
+        printf("  latency:");
+        print_interval("SQE->CQE", event->duration_ns);
+        putchar('\n');
+        printf("  path: %s",
+               event->io_wq ? "io-wq" :
+               event->deferred ? "deferred" :
+               event->poll_armed ? "poll" : "inline/async-device");
+        if (event->io_wq_hashed)
+            printf(" (hashed)");
+        if (event->defer_delay_ns)
+            print_interval("submit->defer",
+                           event->defer_delay_ns);
+        if (event->io_wq_queue_ns)
+            print_interval("io-wq-queue",
+                           event->io_wq_queue_ns);
+        if (event->after_io_wq_ns)
+            print_interval("worker-start->CQE",
+                           event->after_io_wq_ns);
+        putchar('\n');
+        printf("  submit stack:\n");
+
+        if (!exiting && event->stack_id >= 0 &&
+            output->io_uring_stack_map_fd >= 0) {
+            struct map_list *maps;
+
+            if (bpf_map_lookup_elem(output->io_uring_stack_map_fd,
+                                    &event->stack_id, stack)) {
+                printf("  unable to read submitter stack %d: %s\n",
+                       event->stack_id, strerror(errno));
+            } else {
+                maps = get_io_uring_maps(output, event);
+                if (!maps) {
+                    printf("  warning: cannot read submitter maps for "
+                           "PID %u (global PID %u): %s\n",
+                           event->submit_pid, event->submit_global_pid,
+                           strerror(errno));
+                } else {
+                    print_stack_frames(stack, sizeof(stack), maps,
+                                       "  ", NULL, NULL, 0);
+                }
+            }
+        } else if (!exiting && event->sq_thread) {
+            printf("    unavailable: request was issued by "
+                   "an io_uring SQPOLL thread\n");
+        } else if (!exiting) {
+            printf("    unavailable\n");
+        }
+        putchar('\n');
+    }
+
+    if (exiting)
+        return 0;
+    output->emitted_events++;
+    if (output->max_events &&
+        output->emitted_events >= output->max_events) {
+        exiting = 1;
+    }
+    return 0;
+}
+
+static int handle_io_uring_callback_event(
+    void *context, void *data, size_t data_size)
+{
+    struct output_options *output = context;
+    const struct io_uring_callback_event *event = data;
+    const char *operation;
+
+    if (data_size < sizeof(*event) || exiting)
+        return 0;
+    operation = io_uring_opcode_name(event->opcode);
+    if (output->json_output) {
+        FILE *stream = output->json_stream;
+        uint64_t realtime_ns =
+            event_realtime_nanoseconds(event->timestamp_ns);
+
+        if (!stream)
+            return 0;
+        if (fprintf(
+                stream,
+                "{\"type\":\"io_uring_callback\","
+                "\"timestamp_ns\":%llu,\"pid\":%u,\"tid\":%u,"
+                "\"global_pid\":%u,\"global_tid\":%u,"
+                "\"ring_ctx\":\"0x%016llx\","
+                "\"request\":\"0x%016llx\","
+                "\"user_data\":\"0x%016llx\","
+                "\"opcode\":%u,\"operation\":",
+                (unsigned long long)realtime_ns,
+                event->pid, event->tid, event->global_pid,
+                event->global_tid,
+                (unsigned long long)event->ring_ctx,
+                (unsigned long long)event->request,
+                (unsigned long long)event->user_data,
+                event->opcode) < 0 ||
+            write_json_string(stream, operation, strlen(operation)) ||
+            fprintf(
+                stream,
+                ",\"result\":%d,\"cqe_flags\":%u,"
+                "\"request_duration_ns\":%llu,"
+                "\"callback_delay_ns\":%llu,\"callback\":",
+                event->result, event->cqe_flags,
+                (unsigned long long)event->request_duration_ns,
+                (unsigned long long)event->callback_delay_ns) < 0 ||
+            write_json_string(
+                stream, output->io_uring_callback_name,
+                strlen(output->io_uring_callback_name)) ||
+            fputs(",\"comm\":", stream) == EOF ||
+            write_json_string(stream, event->comm,
+                              sizeof(event->comm)) ||
+            fputs("}\n", stream) == EOF ||
+            fflush(stream)) {
+            fprintf(stderr,
+                    "failed to write io_uring callback JSON: %s\n",
+                    strerror(errno ? errno : EIO));
+            output->export_failed = true;
+            exiting = 1;
+        }
+        return 0;
+    }
+
+    print_event_time(event->timestamp_ns);
+    printf("IO_URING CQE -> callback user_data=0x%016llx "
+           "opcode=%s(%u)\n",
+           (unsigned long long)event->user_data,
+           operation, event->opcode);
+    printf("  callback: %s PID %u/TID %u (%.*s)",
+           output->io_uring_callback_name,
+           event->pid, event->tid,
+           (int)sizeof(event->comm), event->comm);
+    print_interval("CQE->callback", event->callback_delay_ns);
+    putchar('\n');
+    printf("  callback stack:\n");
+    if (event->stack_id >= 0 && output->io_uring_stack_map_fd >= 0) {
+        uint64_t stack[MAX_ASYNC_STACK_DEPTH] = {0};
+        struct io_uring_event map_event = {
+            .submit_pid = event->pid,
+            .submit_global_pid = event->global_pid,
+        };
+        struct map_list *maps;
+
+        if (bpf_map_lookup_elem(output->io_uring_stack_map_fd,
+                                &event->stack_id, stack)) {
+            printf("    unavailable: cannot read stack %d: %s\n",
+                   event->stack_id, strerror(errno));
+        } else {
+            maps = get_io_uring_maps(output, &map_event);
+            if (maps)
+                print_stack_frames(stack, sizeof(stack), maps,
+                                   "  ", NULL, NULL, 0);
+            else
+                printf("    unavailable: process maps disappeared\n");
+        }
+    } else {
+        printf("    unavailable\n");
+    }
+    putchar('\n');
+    return 0;
+}
+
+static int compare_io_uring_aggregate_rows(const void *left,
+                                           const void *right)
+{
+    const struct io_uring_aggregate_row *a = left;
+    const struct io_uring_aggregate_row *b = right;
+    uint64_t average_a;
+    uint64_t average_b;
+
+    if (a->value.maximum_ns < b->value.maximum_ns)
+        return 1;
+    if (a->value.maximum_ns > b->value.maximum_ns)
+        return -1;
+    average_a = a->value.count ?
+        a->value.total_ns / a->value.count : 0;
+    average_b = b->value.count ?
+        b->value.total_ns / b->value.count : 0;
+    if (average_a < average_b)
+        return 1;
+    if (average_a > average_b)
+        return -1;
+    return 0;
+}
+
+static size_t read_io_uring_aggregates(
+    const struct output_options *output,
+    struct io_uring_aggregate_row **rows)
+{
+    struct io_uring_aggregate_row *items = NULL;
+    struct io_uring_aggregate_key current = {0};
+    struct io_uring_aggregate_key next;
+    size_t capacity = 0;
+    size_t count = 0;
+    bool have_current = false;
+
+    *rows = NULL;
+    if (output->io_uring_aggregate_map_fd < 0)
+        return 0;
+    while (!bpf_map_get_next_key(
+               output->io_uring_aggregate_map_fd,
+               have_current ? &current : NULL, &next)) {
+        struct io_uring_aggregate value;
+
+        current = next;
+        have_current = true;
+        if (bpf_map_lookup_elem(output->io_uring_aggregate_map_fd,
+                                &next, &value))
+            continue;
+        if (count == capacity) {
+            size_t next_capacity = capacity ? capacity * 2 : 32;
+            void *resized = realloc(
+                items, next_capacity * sizeof(*items));
+
+            if (!resized)
+                break;
+            items = resized;
+            capacity = next_capacity;
+        }
+        items[count].key = next;
+        items[count].value = value;
+        count++;
+    }
+    if (count > 1)
+        qsort(items, count, sizeof(*items),
+              compare_io_uring_aggregate_rows);
+    *rows = items;
+    return count;
+}
+
+static int compare_io_uring_result_rows(const void *left,
+                                        const void *right)
+{
+    const struct io_uring_result_row *a = left;
+    const struct io_uring_result_row *b = right;
+
+    if (a->count < b->count)
+        return 1;
+    if (a->count > b->count)
+        return -1;
+    if (a->key.result > b->key.result)
+        return 1;
+    if (a->key.result < b->key.result)
+        return -1;
+    return 0;
+}
+
+static size_t read_io_uring_results(
+    const struct output_options *output,
+    struct io_uring_result_row **rows)
+{
+    struct io_uring_result_row *items = NULL;
+    struct io_uring_result_key current = {0};
+    struct io_uring_result_key next;
+    size_t capacity = 0;
+    size_t count = 0;
+    bool have_current = false;
+
+    *rows = NULL;
+    if (output->io_uring_result_map_fd < 0)
+        return 0;
+    while (!bpf_map_get_next_key(
+               output->io_uring_result_map_fd,
+               have_current ? &current : NULL, &next)) {
+        uint64_t value;
+
+        current = next;
+        have_current = true;
+        if (bpf_map_lookup_elem(output->io_uring_result_map_fd,
+                                &next, &value))
+            continue;
+        if (count == capacity) {
+            size_t next_capacity = capacity ? capacity * 2 : 16;
+            void *resized = realloc(
+                items, next_capacity * sizeof(*items));
+
+            if (!resized)
+                break;
+            items = resized;
+            capacity = next_capacity;
+        }
+        items[count].key = next;
+        items[count].count = value;
+        count++;
+    }
+    if (count > 1)
+        qsort(items, count, sizeof(*items),
+              compare_io_uring_result_rows);
+    *rows = items;
+    return count;
+}
+
+static bool io_uring_result_is_expected_timeout(
+    const struct io_uring_result_key *key)
+{
+    return key->opcode == IORING_OP_TIMEOUT &&
+           key->result == -ETIME;
+}
+
+static const char *errno_symbol(int error_number)
+{
+    if (error_number == EACCES)
+        return "EACCES";
+    if (error_number == EAGAIN)
+        return "EAGAIN";
+    if (error_number == EBADF)
+        return "EBADF";
+    if (error_number == ECANCELED)
+        return "ECANCELED";
+    if (error_number == ECONNREFUSED)
+        return "ECONNREFUSED";
+    if (error_number == EEXIST)
+        return "EEXIST";
+    if (error_number == EFAULT)
+        return "EFAULT";
+    if (error_number == EFBIG)
+        return "EFBIG";
+    if (error_number == EINTR)
+        return "EINTR";
+    if (error_number == EINVAL)
+        return "EINVAL";
+    if (error_number == EIO)
+        return "EIO";
+    if (error_number == EISDIR)
+        return "EISDIR";
+    if (error_number == EMFILE)
+        return "EMFILE";
+    if (error_number == ENFILE)
+        return "ENFILE";
+    if (error_number == ENOBUFS)
+        return "ENOBUFS";
+    if (error_number == ENODEV)
+        return "ENODEV";
+    if (error_number == ENOENT)
+        return "ENOENT";
+    if (error_number == ENOMEM)
+        return "ENOMEM";
+    if (error_number == ENOSPC)
+        return "ENOSPC";
+    if (error_number == ENOSYS)
+        return "ENOSYS";
+    if (error_number == ENXIO)
+        return "ENXIO";
+    if (error_number == EOPNOTSUPP)
+        return "EOPNOTSUPP";
+    if (error_number == EPERM)
+        return "EPERM";
+    if (error_number == EPIPE)
+        return "EPIPE";
+    if (error_number == ETIME)
+        return "ETIME";
+    if (error_number == ETIMEDOUT)
+        return "ETIMEDOUT";
+    return "ERRNO";
+}
+
+static void collect_io_uring_operation_summaries(
+    const struct output_options *output,
+    struct io_uring_operation_summary summaries[256])
+{
+    struct io_uring_aggregate_row *aggregates = NULL;
+    struct io_uring_result_row *results = NULL;
+    size_t aggregate_count;
+    size_t result_count;
+    size_t index;
+
+    memset(summaries, 0, 256 * sizeof(*summaries));
+    aggregate_count = read_io_uring_aggregates(output, &aggregates);
+    for (index = 0; index < aggregate_count; index++) {
+        const struct io_uring_aggregate_row *row = &aggregates[index];
+        struct io_uring_operation_summary *summary;
+
+        if (row->key.opcode >= 256)
+            continue;
+        summary = &summaries[row->key.opcode];
+        summary->completions += row->value.count;
+        summary->errors += row->value.errors;
+        summary->total_ns += row->value.total_ns;
+        summary->deferred += row->value.deferred_count;
+        summary->io_wq += row->value.io_wq_count;
+        summary->io_wq_queue_total_ns +=
+            row->value.io_wq_queue_total_ns;
+        if (row->value.maximum_ns > summary->maximum_ns)
+            summary->maximum_ns = row->value.maximum_ns;
+        if (row->value.io_wq_queue_maximum_ns >
+            summary->io_wq_queue_maximum_ns)
+            summary->io_wq_queue_maximum_ns =
+                row->value.io_wq_queue_maximum_ns;
+    }
+    free(aggregates);
+
+    result_count = read_io_uring_results(output, &results);
+    for (index = 0; index < result_count; index++) {
+        const struct io_uring_result_row *row = &results[index];
+        struct io_uring_operation_summary *summary;
+
+        if (row->key.opcode >= 256)
+            continue;
+        summary = &summaries[row->key.opcode];
+        if (io_uring_result_is_expected_timeout(&row->key)) {
+            summary->expected_timeouts += row->count;
+        } else if (row->key.result < 0 &&
+                   row->count > summary->top_error_count) {
+            summary->top_error_result = row->key.result;
+            summary->top_error_count = row->count;
+        }
+    }
+    free(results);
+}
+
+static double io_uring_error_rate(uint64_t errors, uint64_t completions)
+{
+    if (!completions)
+        return 0.0;
+    return (double)errors * 100.0 / (double)completions;
+}
+
+static int compare_io_uring_error_code_summaries(
+    const void *left, const void *right)
+{
+    const struct io_uring_error_code_summary *a = left;
+    const struct io_uring_error_code_summary *b = right;
+
+    if (a->count < b->count)
+        return 1;
+    if (a->count > b->count)
+        return -1;
+    if (a->result > b->result)
+        return 1;
+    if (a->result < b->result)
+        return -1;
+    return 0;
+}
+
+static size_t collect_io_uring_error_codes(
+    const struct output_options *output,
+    struct io_uring_error_code_summary **summaries)
+{
+    struct io_uring_result_row *rows = NULL;
+    struct io_uring_error_code_summary *items = NULL;
+    size_t row_count = read_io_uring_results(output, &rows);
+    size_t capacity = 0;
+    size_t count = 0;
+    size_t row_index;
+
+    *summaries = NULL;
+    for (row_index = 0; row_index < row_count; row_index++) {
+        const struct io_uring_result_row *row = &rows[row_index];
+        size_t index;
+
+        if (row->key.result >= 0 ||
+            io_uring_result_is_expected_timeout(&row->key))
+            continue;
+        for (index = 0; index < count; index++) {
+            if (items[index].result == row->key.result) {
+                items[index].count += row->count;
+                break;
+            }
+        }
+        if (index < count)
+            continue;
+        if (count == capacity) {
+            size_t next_capacity = capacity ? capacity * 2 : 8;
+            void *resized = realloc(
+                items, next_capacity * sizeof(*items));
+
+            if (!resized)
+                break;
+            items = resized;
+            capacity = next_capacity;
+        }
+        items[count].result = row->key.result;
+        items[count].count = row->count;
+        count++;
+    }
+    free(rows);
+    if (count > 1)
+        qsort(items, count, sizeof(*items),
+              compare_io_uring_error_code_summaries);
+    *summaries = items;
+    return count;
+}
+
+static bool format_proc_net_endpoint(
+    const char *encoded, bool ipv6, char *buffer, size_t size)
+{
+    char address_text[INET6_ADDRSTRLEN];
+    char copy[80];
+    char *separator;
+    unsigned long port;
+
+    snprintf(copy, sizeof(copy), "%s", encoded);
+    separator = strrchr(copy, ':');
+    if (!separator)
+        return false;
+    *separator++ = '\0';
+    errno = 0;
+    port = strtoul(separator, NULL, 16);
+    if (errno || port > UINT16_MAX)
+        return false;
+    if (!ipv6) {
+        struct in_addr address;
+        unsigned long raw = strtoul(copy, NULL, 16);
+
+        if (strlen(copy) != 8 || raw > UINT32_MAX)
+            return false;
+        address.s_addr = (uint32_t)raw;
+        if (!inet_ntop(AF_INET, &address, address_text,
+                       sizeof(address_text)))
+            return false;
+        snprintf(buffer, size, "%s:%lu", address_text, port);
+        return true;
+    } else {
+        struct in6_addr address = {0};
+        size_t word;
+
+        if (strlen(copy) != 32)
+            return false;
+        for (word = 0; word < 4; word++) {
+            char hex[9] = {0};
+            unsigned long raw;
+
+            memcpy(hex, copy + word * 8, 8);
+            raw = strtoul(hex, NULL, 16);
+            if (raw > UINT32_MAX)
+                return false;
+            memcpy(address.s6_addr + word * 4, &raw, 4);
+        }
+        if (!inet_ntop(AF_INET6, &address, address_text,
+                       sizeof(address_text)))
+            return false;
+        snprintf(buffer, size, "[%s]:%lu", address_text, port);
+        return true;
+    }
+}
+
+static bool lookup_proc_inet_socket(
+    pid_t pid, unsigned long long inode, const char *table,
+    const char *protocol, bool ipv6, char *buffer, size_t size)
+{
+    char path[80];
+    char line[512];
+    FILE *file;
+
+    snprintf(path, sizeof(path), "/proc/%d/net/%s", (int)pid, table);
+    file = fopen(path, "r");
+    if (!file)
+        return false;
+    while (fgets(line, sizeof(line), file)) {
+        char *tokens[16] = {0};
+        char *save = NULL;
+        char *token;
+        size_t count = 0;
+        unsigned long long row_inode;
+        char local[INET6_ADDRSTRLEN + 16];
+        char remote[INET6_ADDRSTRLEN + 16];
+
+        for (token = strtok_r(line, " \t\r\n", &save);
+             token && count < 16;
+             token = strtok_r(NULL, " \t\r\n", &save))
+            tokens[count++] = token;
+        if (count <= 9)
+            continue;
+        row_inode = strtoull(tokens[9], NULL, 10);
+        if (row_inode != inode)
+            continue;
+        if (!format_proc_net_endpoint(tokens[1], ipv6,
+                                      local, sizeof(local)) ||
+            !format_proc_net_endpoint(tokens[2], ipv6,
+                                      remote, sizeof(remote)))
+            continue;
+        snprintf(buffer, size, "%s %s -> %s state=%s",
+                 protocol, local, remote, tokens[3]);
+        fclose(file);
+        return true;
+    }
+    fclose(file);
+    return false;
+}
+
+static bool lookup_proc_unix_socket(
+    pid_t pid, unsigned long long inode, char *buffer, size_t size)
+{
+    char path[80];
+    char line[512];
+    FILE *file;
+
+    snprintf(path, sizeof(path), "/proc/%d/net/unix", (int)pid);
+    file = fopen(path, "r");
+    if (!file)
+        return false;
+    while (fgets(line, sizeof(line), file)) {
+        char *tokens[10] = {0};
+        char *save = NULL;
+        char *token;
+        size_t count = 0;
+
+        for (token = strtok_r(line, " \t\r\n", &save);
+             token && count < 10;
+             token = strtok_r(NULL, " \t\r\n", &save))
+            tokens[count++] = token;
+        if (count <= 6 || strtoull(tokens[6], NULL, 10) != inode)
+            continue;
+        snprintf(buffer, size, "unix %s",
+                 count > 7 ? tokens[7] : "(anonymous)");
+        fclose(file);
+        return true;
+    }
+    fclose(file);
+    return false;
+}
+
+static void enrich_socket_resource(
+    pid_t pid, char *buffer, size_t size)
+{
+    unsigned long long inode;
+    char endpoint[256];
+    char original[64];
+    bool found;
+
+    if (sscanf(buffer, "socket:[%llu]", &inode) != 1)
+        return;
+    snprintf(original, sizeof(original), "%s", buffer);
+    found =
+        lookup_proc_inet_socket(pid, inode, "tcp", "tcp", false,
+                                endpoint, sizeof(endpoint)) ||
+        lookup_proc_inet_socket(pid, inode, "tcp6", "tcp6", true,
+                                endpoint, sizeof(endpoint)) ||
+        lookup_proc_inet_socket(pid, inode, "udp", "udp", false,
+                                endpoint, sizeof(endpoint)) ||
+        lookup_proc_inet_socket(pid, inode, "udp6", "udp6", true,
+                                endpoint, sizeof(endpoint)) ||
+        lookup_proc_unix_socket(pid, inode, endpoint,
+                                sizeof(endpoint));
+    if (found)
+        snprintf(buffer, size, "%s %s", original, endpoint);
+}
+
+static void resolve_io_uring_fd_resource(
+    const struct output_options *output, int fd,
+    char *buffer, size_t size)
+{
+    char path[64];
+    ssize_t length;
+
+    if (!buffer || !size)
+        return;
+    buffer[0] = '\0';
+    for (size_t index = 0;
+         index < output->io_uring_resource_count; index++) {
+        if (output->io_uring_resources[index].fd == fd) {
+            snprintf(buffer, size, "%s",
+                     output->io_uring_resources[index].path);
+            return;
+        }
+    }
+    if (fd < 0 || output->target_pid <= 0)
+        return;
+    snprintf(path, sizeof(path), "/proc/%d/fd/%d",
+             (int)output->target_pid, fd);
+    length = readlink(path, buffer, size - 1);
+    if (length < 0) {
+        buffer[0] = '\0';
+        return;
+    }
+    buffer[length] = '\0';
+    enrich_socket_resource(output->target_pid, buffer, size);
+}
+
+static void cache_io_uring_fd_resource(
+    struct output_options *output, int fd)
+{
+    struct io_uring_fd_resource *resized;
+    char resource[PATH_MAX];
+    size_t next_capacity;
+
+    if (fd < 0)
+        return;
+    for (size_t index = 0;
+         index < output->io_uring_resource_count; index++) {
+        if (output->io_uring_resources[index].fd == fd)
+            return;
+    }
+    resolve_io_uring_fd_resource(
+        output, fd, resource, sizeof(resource));
+    if (!resource[0])
+        return;
+    if (output->io_uring_resource_count ==
+        output->io_uring_resource_capacity) {
+        next_capacity = output->io_uring_resource_capacity ?
+            output->io_uring_resource_capacity * 2 : 16;
+        resized = realloc(
+            output->io_uring_resources,
+            next_capacity * sizeof(*resized));
+        if (!resized)
+            return;
+        output->io_uring_resources = resized;
+        output->io_uring_resource_capacity = next_capacity;
+    }
+    output->io_uring_resources[
+        output->io_uring_resource_count].fd = fd;
+    snprintf(
+        output->io_uring_resources[
+            output->io_uring_resource_count].path,
+        PATH_MAX, "%s", resource);
+    output->io_uring_resource_count++;
+}
+
+static void cache_all_io_uring_fd_resources(
+    struct output_options *output)
+{
+    char directory_path[64];
+    struct dirent *entry;
+    DIR *directory;
+
+    if (output->target_pid <= 0)
+        return;
+    snprintf(directory_path, sizeof(directory_path), "/proc/%d/fd",
+             (int)output->target_pid);
+    directory = opendir(directory_path);
+    if (!directory)
+        return;
+    while ((entry = readdir(directory)) != NULL) {
+        char *end = NULL;
+        long fd;
+
+        errno = 0;
+        fd = strtol(entry->d_name, &end, 10);
+        if (errno || end == entry->d_name || *end ||
+            fd < 0 || fd > INT_MAX)
+            continue;
+        cache_io_uring_fd_resource(output, (int)fd);
+    }
+    closedir(directory);
+}
+
+static size_t read_io_uring_ring_rows(
+    const struct output_options *output,
+    struct io_uring_ring_row **rows)
+{
+    struct io_uring_ring_row *items = NULL;
+    uint64_t current = 0;
+    uint64_t next;
+    size_t capacity = 0;
+    size_t count = 0;
+    bool have_current = false;
+
+    *rows = NULL;
+    if (output->io_uring_ring_stats_map_fd < 0)
+        return 0;
+    while (!bpf_map_get_next_key(
+               output->io_uring_ring_stats_map_fd,
+               have_current ? &current : NULL, &next)) {
+        struct io_uring_ring_stats value;
+
+        current = next;
+        have_current = true;
+        if (bpf_map_lookup_elem(
+                output->io_uring_ring_stats_map_fd,
+                &next, &value))
+            continue;
+        if (count == capacity) {
+            size_t next_capacity = capacity ? capacity * 2 : 8;
+            void *resized = realloc(
+                items, next_capacity * sizeof(*items));
+
+            if (!resized)
+                break;
+            items = resized;
+            capacity = next_capacity;
+        }
+        items[count].ring_ctx = next;
+        items[count].value = value;
+        count++;
+    }
+    *rows = items;
+    return count;
+}
+
+static size_t read_io_uring_failure_rows(
+    const struct output_options *output,
+    struct io_uring_failure_row **rows)
+{
+    struct io_uring_failure_row *items = NULL;
+    struct io_uring_failure_key current = {0};
+    struct io_uring_failure_key next;
+    size_t capacity = 0;
+    size_t count = 0;
+    bool have_current = false;
+
+    *rows = NULL;
+    if (output->io_uring_failure_map_fd < 0)
+        return 0;
+    while (!bpf_map_get_next_key(
+               output->io_uring_failure_map_fd,
+               have_current ? &current : NULL, &next)) {
+        struct io_uring_failure_stats value;
+
+        current = next;
+        have_current = true;
+        if (bpf_map_lookup_elem(output->io_uring_failure_map_fd,
+                                &next, &value))
+            continue;
+        if (count == capacity) {
+            size_t next_capacity = capacity ? capacity * 2 : 8;
+            void *resized = realloc(
+                items, next_capacity * sizeof(*items));
+
+            if (!resized)
+                break;
+            items = resized;
+            capacity = next_capacity;
+        }
+        items[count].key = next;
+        items[count].value = value;
+        count++;
+    }
+    *rows = items;
+    return count;
+}
+
+static size_t read_io_uring_link_rows(
+    const struct output_options *output,
+    struct io_uring_link_row **rows)
+{
+    struct io_uring_link_row *items = NULL;
+    struct io_uring_link_key current = {0};
+    struct io_uring_link_key next;
+    size_t capacity = 0;
+    size_t count = 0;
+    bool have_current = false;
+
+    *rows = NULL;
+    if (output->io_uring_link_map_fd < 0)
+        return 0;
+    while (!bpf_map_get_next_key(
+               output->io_uring_link_map_fd,
+               have_current ? &current : NULL, &next)) {
+        struct io_uring_link_stats value;
+
+        current = next;
+        have_current = true;
+        if (bpf_map_lookup_elem(output->io_uring_link_map_fd,
+                                &next, &value))
+            continue;
+        if (count == capacity) {
+            size_t next_capacity = capacity ? capacity * 2 : 8;
+            void *resized = realloc(
+                items, next_capacity * sizeof(*items));
+
+            if (!resized)
+                break;
+            items = resized;
+            capacity = next_capacity;
+        }
+        items[count].key = next;
+        items[count].value = value;
+        count++;
+    }
+    *rows = items;
+    return count;
+}
+
+static void format_io_uring_setup_flags(
+    uint32_t flags, char *buffer, size_t size)
+{
+    bool first = true;
+
+    if (!size)
+        return;
+    buffer[0] = '\0';
+#define APPEND_RING_FLAG(flag, name)                                      \
+    do {                                                                 \
+        if (flags & (flag)) {                                            \
+            snprintf(buffer + strlen(buffer), size - strlen(buffer),     \
+                     "%s%s", first ? "" : "|", (name));                  \
+            first = false;                                               \
+        }                                                                \
+    } while (0)
+    APPEND_RING_FLAG(IORING_SETUP_SQPOLL, "SQPOLL");
+    APPEND_RING_FLAG(IORING_SETUP_IOPOLL, "IOPOLL");
+    APPEND_RING_FLAG(IORING_SETUP_ATTACH_WQ, "ATTACH_WQ");
+    APPEND_RING_FLAG(IORING_SETUP_DEFER_TASKRUN, "DEFER_TASKRUN");
+    APPEND_RING_FLAG(IORING_SETUP_SINGLE_ISSUER, "SINGLE_ISSUER");
+    APPEND_RING_FLAG(IORING_SETUP_COOP_TASKRUN, "COOP_TASKRUN");
+#undef APPEND_RING_FLAG
+    if (first)
+        snprintf(buffer, size, "default");
+}
+
+static void print_io_uring_diagnostic_sections(
+    const struct output_options *output, FILE *stream,
+    const struct io_uring_counters *counters)
+{
+    struct io_uring_ring_row *rings = NULL;
+    struct io_uring_failure_row *failures = NULL;
+    struct io_uring_link_row *links = NULL;
+    size_t ring_count = read_io_uring_ring_rows(output, &rings);
+    size_t failure_count =
+        read_io_uring_failure_rows(output, &failures);
+    size_t link_count = read_io_uring_link_rows(output, &links);
+    uint64_t rejected_sqe_count = 0;
+    size_t failure_limit;
+    size_t link_limit = 0;
+    size_t index;
+
+    for (index = 0; index < failure_count; index++)
+        rejected_sqe_count += failures[index].value.count;
+
+    fprintf(stream,
+            "\n[3] Application errors\n"
+            "  These are errors observed in the target application, "
+            "not callweave collection failures.\n"
+            "  CQE execution errors : %llu (%.2f%% of completions)\n"
+            "  Kernel-rejected SQEs : %llu\n"
+            "  Expected timeouts    : %llu (reported separately, not errors)\n",
+            (unsigned long long)counters->errors,
+            io_uring_error_rate(counters->errors,
+                                counters->completions),
+            (unsigned long long)rejected_sqe_count,
+            (unsigned long long)counters->expected_timeouts);
+    if (failure_count) {
+        failure_limit = failure_count < 10 ? failure_count : 10;
+        fprintf(stream,
+                "\n  Rejected SQE details "
+                "(application submitted invalid/unsupported input)\n"
+                "  %-18s %-14s %8s %18s %18s\n"
+                "  %-18s %-14s %8s %18s %18s\n",
+                "OPERATION", "KERNEL ERROR", "COUNT",
+                "RING", "SAMPLE USER_DATA",
+                "------------------", "--------------", "--------",
+                "------------------", "------------------");
+        for (index = 0; index < failure_limit; index++) {
+            const struct io_uring_failure_row *row = &failures[index];
+            int error_number = row->key.error < 0 ?
+                -row->key.error : row->key.error;
+            char operation[32];
+            char error_text[32];
+
+            snprintf(operation, sizeof(operation), "%s(%u)",
+                     io_uring_opcode_name((uint8_t)row->key.opcode),
+                     row->key.opcode);
+            snprintf(error_text, sizeof(error_text), "%s(%d)",
+                     errno_symbol(error_number), row->key.error);
+            fprintf(stream,
+                    "  %-18s %-14s %8llu 0x%016llx 0x%016llx\n"
+                    "    sample SQE: len=%u off=%llu flags=0x%x "
+                    "op_flags=0x%x buf=%u file_index=%u\n",
+                    operation, error_text,
+                    (unsigned long long)row->value.count,
+                    (unsigned long long)row->key.ring_ctx,
+                    (unsigned long long)row->value.user_data,
+                    row->value.length,
+                    (unsigned long long)row->value.offset,
+                    row->value.sqe_flags,
+                    row->value.operation_flags,
+                    row->value.buffer_index,
+                    row->value.file_index);
+        }
+        if (failure_count > failure_limit)
+            fprintf(stream, "  ... %zu additional failure groups omitted\n",
+                    failure_count - failure_limit);
+    } else {
+        fprintf(stream, "  Rejected SQE details: none observed\n");
+    }
+
+    fprintf(stream, "\n[4] Ring and queue health\n");
+    if (!ring_count)
+        fprintf(stream, "  No ring metadata was observed.\n");
+    for (index = 0; index < ring_count; index++) {
+        const struct io_uring_ring_stats *ring = &rings[index].value;
+        char flags[128];
+        char average[32];
+        char maximum[32];
+        char queue_average[32];
+        char queue_maximum[32];
+        const char *diagnosis = "healthy";
+
+        format_io_uring_setup_flags(ring->flags, flags, sizeof(flags));
+        format_interval(
+            average, sizeof(average),
+            ring->completions ?
+                ring->total_ns / ring->completions : 0);
+        format_interval(maximum, sizeof(maximum), ring->maximum_ns);
+        format_interval(
+            queue_average, sizeof(queue_average),
+            ring->io_wq ?
+                ring->io_wq_queue_total_ns / ring->io_wq : 0);
+        format_interval(queue_maximum, sizeof(queue_maximum),
+                        ring->io_wq_queue_maximum_ns);
+        if (ring->cq_overflows)
+            diagnosis = "CQ overflow / consumer too slow";
+        else if (ring->io_wq_queue_maximum_ns >
+                 ring->maximum_ns / 2 && ring->io_wq)
+            diagnosis = "io-wq queue congestion";
+        else if (ring->errors &&
+                 io_uring_error_rate(ring->errors,
+                                     ring->completions) >= 5.0)
+            diagnosis = "high application CQE error rate";
+        fprintf(stream, "  Ring %zu\n", index + 1);
+        if (ring->ring_fd >= 0)
+            fprintf(stream,
+                    "    identity : ctx=0x%016llx fd=%d owner-pid=%u\n",
+                    (unsigned long long)rings[index].ring_ctx,
+                    ring->ring_fd, ring->owner_pid);
+        else
+            fprintf(stream,
+                    "    identity : ctx=0x%016llx fd=unknown "
+                    "owner-pid=%u\n",
+                    (unsigned long long)rings[index].ring_ctx,
+                    ring->owner_pid);
+        fprintf(stream,
+                "    setup    : sq=%u cq=%u flags=%s\n"
+                "    load     : submitted=%llu completed=%llu "
+                "pending=%llu peak-pending=%llu\n"
+                "    latency  : average=%s maximum=%s\n",
+                ring->sq_entries, ring->cq_entries, flags,
+                (unsigned long long)ring->submitted,
+                (unsigned long long)ring->completions,
+                (unsigned long long)ring->pending,
+                (unsigned long long)ring->peak_pending,
+                average, maximum);
+        fprintf(stream,
+                "    path     : deferred=%llu io-wq=%llu hashed=%llu "
+                "poll-armed=%llu\n"
+                "    io-wq    : queue-average=%s queue-maximum=%s\n",
+                (unsigned long long)ring->deferred,
+                (unsigned long long)ring->io_wq,
+                (unsigned long long)ring->io_wq_hashed,
+                (unsigned long long)ring->poll_armed,
+                queue_average, queue_maximum);
+        fprintf(stream,
+                "    cq       : waits=%llu overflows=%llu\n"
+                "    app      : cqe-errors=%llu rejected-sqes=%llu "
+                "links=%llu failed-links=%llu\n"
+                "    diagnosis: %s\n",
+                (unsigned long long)ring->cq_waits,
+                (unsigned long long)ring->cq_overflows,
+                (unsigned long long)ring->errors,
+                (unsigned long long)ring->request_failures,
+                (unsigned long long)ring->links,
+                (unsigned long long)ring->failed_links,
+                diagnosis);
+    }
+
+    fprintf(stream, "\n[5] Linked request chains\n");
+    if (!link_count) {
+        fprintf(stream, "  No linked requests were observed.\n");
+    } else {
+        link_limit = link_count < 10 ? link_count : 10;
+        fprintf(stream,
+                "  Showing %zu of %zu observed edge%s. "
+                "These are application request dependencies.\n",
+                link_limit, link_count, link_count == 1 ? "" : "s");
+    }
+    for (index = 0; index < link_count && index < link_limit; index++) {
+        const struct io_uring_link_row *row = &links[index];
+
+        fprintf(stream,
+                "  [%2zu] %s user_data=0x%llx"
+                " -> %s user_data=0x%llx%s\n"
+                "       req=0x%llx -> req=0x%llx\n",
+                index + 1,
+                io_uring_opcode_name(row->value.parent_opcode),
+                (unsigned long long)row->key.parent_user_data,
+                io_uring_opcode_name(row->value.child_opcode),
+                (unsigned long long)row->key.child_user_data,
+                row->value.failures ? " [link failed/cancelled]" : "",
+                (unsigned long long)row->value.parent_request,
+                (unsigned long long)row->value.child_request);
+    }
+    if (link_count > link_limit)
+        fprintf(stream, "  ... %zu additional edges omitted\n",
+                link_count - link_limit);
+    free(rings);
+    free(failures);
+    free(links);
+}
+
+static void print_io_uring_aggregates(struct output_options *output,
+                                      FILE *stream)
+{
+    struct io_uring_aggregate_row *rows = NULL;
+    size_t count = read_io_uring_aggregates(output, &rows);
+    size_t limit = count;
+    size_t index;
+
+    fprintf(stream, "\n[6] Slowest submit groups\n");
+    if (!output->io_uring_top) {
+        fprintf(stream,
+                "  Disabled. Use --io-top N to include Top-N groups.\n");
+        free(rows);
+        return;
+    }
+    if (!count) {
+        fprintf(stream, "  No completed request groups were observed.\n");
+        free(rows);
+        return;
+    }
+    if (limit > output->io_uring_top)
+        limit = output->io_uring_top;
+    fprintf(stream,
+            "  Top %zu by maximum SQE-to-CQE latency\n",
+            limit);
+    for (index = 0; index < limit; index++) {
+        const struct io_uring_aggregate_row *row = &rows[index];
+        uint64_t stack[MAX_ASYNC_STACK_DEPTH] = {0};
+        size_t duplicate_index;
+        char operation[32];
+        char average[32];
+        char maximum[32];
+        char resource[PATH_MAX];
+
+        if (force_exit)
+            break;
+        snprintf(operation, sizeof(operation), "%s(%u)",
+                 io_uring_opcode_name((uint8_t)row->key.opcode),
+                 row->key.opcode);
+        format_interval(
+            average, sizeof(average),
+            row->value.count ?
+                row->value.total_ns / row->value.count : 0);
+        format_interval(maximum, sizeof(maximum),
+                        row->value.maximum_ns);
+        resolve_io_uring_fd_resource(
+            output, row->key.fd, resource, sizeof(resource));
+        fprintf(stream,
+                "  [%2zu] %-20s ring=0x%llx fd=%-4d count=%-8llu "
+                "errors=%-6llu avg=%-12s max=%-12s",
+                index + 1,
+                operation,
+                (unsigned long long)row->key.ring_ctx,
+                row->key.fd,
+                (unsigned long long)row->value.count,
+                (unsigned long long)row->value.errors,
+                average, maximum);
+        if (output->io_uring_min_latency_ns)
+            fprintf(stream, " slow=%-8llu",
+                    (unsigned long long)row->value.slow_count);
+        if (resource[0])
+            fprintf(stream, "\n       resource: %s", resource);
+        if (row->value.deferred_count || row->value.io_wq_count) {
+            char queue_average[32];
+            char queue_maximum[32];
+
+            format_interval(
+                queue_average, sizeof(queue_average),
+                row->value.io_wq_count ?
+                    row->value.io_wq_queue_total_ns /
+                        row->value.io_wq_count : 0);
+            format_interval(
+                queue_maximum, sizeof(queue_maximum),
+                row->value.io_wq_queue_maximum_ns);
+            fprintf(stream,
+                    "\n       phases: deferred=%llu io-wq=%llu "
+                    "io-wq-queue-avg=%s max=%s",
+                    (unsigned long long)row->value.deferred_count,
+                    (unsigned long long)row->value.io_wq_count,
+                    queue_average, queue_maximum);
+        }
+        fprintf(stream, "\n       submit stack:\n");
+        duplicate_index = index;
+        if (row->key.stack_id >= 0) {
+            size_t previous;
+
+            for (previous = 0; previous < index; previous++) {
+                if (rows[previous].key.stack_id ==
+                    row->key.stack_id) {
+                    duplicate_index = previous;
+                    break;
+                }
+            }
+        }
+        if (duplicate_index < index) {
+            fprintf(stream,
+                    "         same as group [%zu] (stack_id=%d)\n",
+                    duplicate_index + 1, row->key.stack_id);
+        } else if (row->key.stack_id < 0 ||
+            output->io_uring_stack_map_fd < 0 ||
+            bpf_map_lookup_elem(output->io_uring_stack_map_fd,
+                                &row->key.stack_id, stack)) {
+            if (row->key.stack_id < 0)
+                fprintf(stream,
+                        "         capture unavailable (stack_id=%d)\n",
+                        row->key.stack_id);
+            else
+                fprintf(stream, "         unavailable\n");
+        } else if (output->io_uring_maps) {
+            print_stack_frames(stack, sizeof(stack),
+                               output->io_uring_maps,
+                               "       ", NULL, NULL, 0);
+        } else {
+            fprintf(stream, "         submitter maps unavailable\n");
+        }
+    }
+    free(rows);
+}
+
+static bool print_io_uring_summary(struct output_options *output)
+{
+    struct io_uring_counters counters = {0};
+    struct io_uring_operation_summary summaries[256];
+    FILE *stream = output->json_output ? stderr : stdout;
+    uint32_t zero = 0;
+    size_t opcode;
+
+    if (output->io_uring_counters_map_fd < 0 ||
+        bpf_map_lookup_elem(output->io_uring_counters_map_fd,
+                            &zero, &counters))
+        return false;
+
+    collect_io_uring_operation_summaries(output, summaries);
+    if (output->json_output) {
+        fprintf(stream,
+                "\nio_uring capture stopped: accepted=%llu "
+                "completed=%llu errors=%llu rejected/unmatched=%llu "
+                "dropped=%llu; structured summary written to JSON output\n",
+                (unsigned long long)counters.submitted,
+                (unsigned long long)counters.completions,
+                (unsigned long long)counters.errors,
+                (unsigned long long)counters.unmatched,
+                (unsigned long long)counters.dropped_events);
+        return true;
+    }
+    fprintf(stream,
+            "\nio_uring summary\n"
+            "\n[1] Capture overview\n"
+            "  Accepted requests  : %llu\n"
+            "  Completion events  : %llu\n"
+            "  Finished requests  : %llu\n"
+            "  Detailed records   : %u"
+            " (after detail filters)\n"
+            "  In flight at stop  : %llu\n"
+            "  Peak in flight     : %llu\n",
+            (unsigned long long)counters.submitted,
+            (unsigned long long)counters.completions,
+            (unsigned long long)counters.finished,
+            output->emitted_events,
+            (unsigned long long)counters.pending,
+            (unsigned long long)counters.peak_pending);
+    fprintf(stream,
+            "\n[2] Operation latency and CQE results\n"
+            "  %-20s %8s %8s %9s %9s %12s %12s  %s\n",
+            "OPERATION", "CQEs", "CQE ERR", "ERR RATE",
+            "TIMEOUTS", "AVG", "MAX", "TOP CQE ERROR");
+    fprintf(stream,
+            "  %-20s %8s %8s %9s %9s %12s %12s  %s\n",
+            "--------------------", "--------", "--------",
+            "---------", "---------", "------------",
+            "------------", "--------------------");
+    for (opcode = 0; opcode < 256; opcode++) {
+        const struct io_uring_operation_summary *summary =
+            &summaries[opcode];
+        char operation[32];
+        char error_rate[32];
+        char average[32];
+        char maximum[32];
+        char top_error[64] = "-";
+
+        if (!summary->completions)
+            continue;
+        snprintf(operation, sizeof(operation), "%s(%zu)",
+                 io_uring_opcode_name((uint8_t)opcode), opcode);
+        snprintf(error_rate, sizeof(error_rate), "%.2f%%",
+                 io_uring_error_rate(summary->errors,
+                                     summary->completions));
+        format_interval(average, sizeof(average),
+                        summary->total_ns / summary->completions);
+        format_interval(maximum, sizeof(maximum),
+                        summary->maximum_ns);
+        if (summary->top_error_count) {
+            int error_number = -summary->top_error_result;
+
+            snprintf(top_error, sizeof(top_error), "%s(%d) x%llu",
+                     errno_symbol(error_number),
+                     summary->top_error_result,
+                     (unsigned long long)summary->top_error_count);
+        }
+        fprintf(stream,
+                "  %-20s %8llu %8llu %9s %9llu %12s %12s  %s\n",
+                operation,
+                (unsigned long long)summary->completions,
+                (unsigned long long)summary->errors,
+                error_rate,
+                (unsigned long long)summary->expected_timeouts,
+                average, maximum, top_error);
+        if (summary->deferred || summary->io_wq) {
+            char queue_average[32];
+            char queue_maximum[32];
+
+            format_interval(
+                queue_average, sizeof(queue_average),
+                summary->io_wq ?
+                    summary->io_wq_queue_total_ns /
+                        summary->io_wq : 0);
+            format_interval(
+                queue_maximum, sizeof(queue_maximum),
+                summary->io_wq_queue_maximum_ns);
+            fprintf(stream,
+                    "    phases: deferred=%llu io-wq=%llu "
+                    "io-wq-queue avg=%s max=%s\n",
+                    (unsigned long long)summary->deferred,
+                    (unsigned long long)summary->io_wq,
+                    queue_average, queue_maximum);
+        }
+    }
+    if (!output->json_output)
+        print_io_uring_diagnostic_sections(output, stream, &counters);
+    if (!output->json_output)
+        print_io_uring_aggregates(output, stream);
+    if (!output->json_output) {
+        fprintf(stream,
+                "\n[7] Correlation and collector health\n"
+                "  Request correlation : unmatched completions=%llu\n"
+                "  Event transport     : dropped detail events=%llu\n",
+                (unsigned long long)counters.unmatched,
+                (unsigned long long)counters.dropped_events);
+        if (output->io_uring_callback_name)
+            fprintf(stream,
+                    "  Callback correlation: matched=%llu "
+                    "unmatched=%llu dropped=%llu\n",
+                    (unsigned long long)counters.callback_matched,
+                    (unsigned long long)counters.callback_unmatched,
+                    (unsigned long long)counters.callback_dropped);
+        if (counters.unmatched ||
+            counters.callback_unmatched)
+            fprintf(stream,
+                    "  Note: kernel-rejected SQEs can increase unmatched "
+                    "counts because they never reach io_uring_submit_req; "
+                    "see [3].\n");
+        if (!counters.dropped_events &&
+            !counters.callback_dropped)
+            fprintf(stream,
+                    "  Collector status    : no ring-buffer event loss "
+                    "observed\n");
+    }
+    return true;
+}
+
+static int write_io_uring_summary_json(struct output_options *output)
+{
+    struct io_uring_counters counters = {0};
+    struct io_uring_operation_summary summaries[256];
+    struct io_uring_aggregate_row *rows = NULL;
+    struct io_uring_error_code_summary *error_codes = NULL;
+    size_t aggregate_count;
+    size_t aggregate_limit;
+    size_t aggregate_index;
+    size_t error_code_count;
+    size_t error_code_index;
+    uint32_t zero = 0;
+    size_t opcode;
+    bool first = true;
+
+    if (!output->json_stream ||
+        output->io_uring_counters_map_fd < 0 ||
+        bpf_map_lookup_elem(output->io_uring_counters_map_fd,
+                            &zero, &counters))
+        return 0;
+    collect_io_uring_operation_summaries(output, summaries);
+    if (fprintf(output->json_stream,
+                "{\"type\":\"io_uring_summary\","
+                "\"displayed\":%u,\"submitted\":%llu,"
+                "\"completions\":%llu,"
+                "\"finished\":%llu,\"pending\":%llu,"
+                "\"peak_pending\":%llu,\"unmatched\":%llu,"
+                "\"dropped_events\":%llu,\"errors\":%llu,"
+                "\"error_rate_percent\":%.6f,"
+                "\"expected_timeouts\":%llu,"
+                "\"callback_matched\":%llu,"
+                "\"callback_unmatched\":%llu,"
+                "\"callback_dropped\":%llu,"
+                "\"operations\":[",
+                output->emitted_events,
+                (unsigned long long)counters.submitted,
+                (unsigned long long)counters.completions,
+                (unsigned long long)counters.finished,
+                (unsigned long long)counters.pending,
+                (unsigned long long)counters.peak_pending,
+                (unsigned long long)counters.unmatched,
+                (unsigned long long)counters.dropped_events,
+                (unsigned long long)counters.errors,
+                io_uring_error_rate(counters.errors,
+                                    counters.completions),
+                (unsigned long long)counters.expected_timeouts,
+                (unsigned long long)counters.callback_matched,
+                (unsigned long long)counters.callback_unmatched,
+                (unsigned long long)counters.callback_dropped) < 0)
+        return -1;
+    for (opcode = 0; opcode < 256; opcode++) {
+        const struct io_uring_operation_summary *summary =
+            &summaries[opcode];
+        const char *name;
+
+        if (!summary->completions)
+            continue;
+        name = io_uring_opcode_name((uint8_t)opcode);
+        if ((!first && fputc(',', output->json_stream) == EOF) ||
+            fprintf(output->json_stream,
+                    "{\"opcode\":%zu,\"operation\":", opcode) < 0 ||
+            write_json_string(output->json_stream, name, strlen(name)) ||
+            fprintf(output->json_stream,
+                    ",\"completions\":%llu,\"errors\":%llu,"
+                    "\"error_rate_percent\":%.6f,"
+                    "\"expected_timeouts\":%llu,"
+                    "\"average_ns\":%llu,\"maximum_ns\":%llu,"
+                    "\"deferred\":%llu,\"io_wq\":%llu,"
+                    "\"io_wq_queue_average_ns\":%llu,"
+                    "\"io_wq_queue_maximum_ns\":%llu,"
+                    "\"top_error_result\":%d,"
+                    "\"top_error_count\":%llu}",
+                    (unsigned long long)summary->completions,
+                    (unsigned long long)summary->errors,
+                    io_uring_error_rate(summary->errors,
+                                        summary->completions),
+                    (unsigned long long)summary->expected_timeouts,
+                    (unsigned long long)
+                        (summary->total_ns / summary->completions),
+                    (unsigned long long)summary->maximum_ns,
+                    (unsigned long long)summary->deferred,
+                    (unsigned long long)summary->io_wq,
+                    (unsigned long long)
+                        (summary->io_wq ?
+                             summary->io_wq_queue_total_ns /
+                                 summary->io_wq : 0),
+                    (unsigned long long)
+                        summary->io_wq_queue_maximum_ns,
+                    summary->top_error_result,
+                    (unsigned long long)summary->top_error_count) < 0)
+            return -1;
+        first = false;
+    }
+    if (fputs("],\"error_codes\":[", output->json_stream) == EOF)
+        return -1;
+    error_code_count =
+        collect_io_uring_error_codes(output, &error_codes);
+    for (error_code_index = 0;
+         error_code_index < error_code_count; error_code_index++) {
+        const struct io_uring_error_code_summary *summary =
+            &error_codes[error_code_index];
+        int error_number;
+        const char *symbol;
+
+        error_number = -summary->result;
+        symbol = errno_symbol(error_number);
+        if ((error_code_index &&
+             fputc(',', output->json_stream) == EOF) ||
+            fprintf(output->json_stream,
+                    "{\"result\":%d,\"errno\":%d,\"name\":",
+                    summary->result, error_number) < 0 ||
+            write_json_string(output->json_stream, symbol,
+                              strlen(symbol)) ||
+            fputs(",\"message\":", output->json_stream) == EOF ||
+            write_json_string(output->json_stream,
+                              strerror(error_number),
+                              strlen(strerror(error_number))) ||
+            fprintf(output->json_stream, ",\"count\":%llu}",
+                    (unsigned long long)summary->count) < 0) {
+            free(error_codes);
+            return -1;
+        }
+    }
+    free(error_codes);
+    if (fputs("],\"aggregates\":[", output->json_stream) == EOF)
+        return -1;
+    aggregate_count = read_io_uring_aggregates(output, &rows);
+    aggregate_limit = aggregate_count;
+    if (aggregate_limit > output->io_uring_top)
+        aggregate_limit = output->io_uring_top;
+    for (aggregate_index = 0;
+         aggregate_index < aggregate_limit; aggregate_index++) {
+        const struct io_uring_aggregate_row *row =
+            &rows[aggregate_index];
+        const char *name =
+            io_uring_opcode_name((uint8_t)row->key.opcode);
+        char resource[PATH_MAX];
+
+        resolve_io_uring_fd_resource(
+            output, row->key.fd, resource, sizeof(resource));
+        if ((aggregate_index &&
+             fputc(',', output->json_stream) == EOF) ||
+            fprintf(output->json_stream,
+                    "{\"rank\":%zu,\"opcode\":%u,\"operation\":",
+                    aggregate_index + 1, row->key.opcode) < 0 ||
+            write_json_string(output->json_stream, name,
+                              strlen(name)) ||
+            fprintf(output->json_stream,
+                    ",\"ring_ctx\":\"0x%016llx\","
+                    "\"fd\":%d,\"stack_id\":%d,"
+                    "\"count\":%llu,\"errors\":%llu,"
+                    "\"slow_count\":%llu,\"average_ns\":%llu,"
+                    "\"maximum_ns\":%llu,\"deferred\":%llu,"
+                    "\"io_wq\":%llu,"
+                    "\"io_wq_queue_average_ns\":%llu,"
+                    "\"io_wq_queue_maximum_ns\":%llu,"
+                    "\"resource\":",
+                    (unsigned long long)row->key.ring_ctx,
+                    row->key.fd, row->key.stack_id,
+                    (unsigned long long)row->value.count,
+                    (unsigned long long)row->value.errors,
+                    (unsigned long long)row->value.slow_count,
+                    (unsigned long long)
+                        (row->value.count ?
+                             row->value.total_ns / row->value.count : 0),
+                    (unsigned long long)row->value.maximum_ns,
+                    (unsigned long long)row->value.deferred_count,
+                    (unsigned long long)row->value.io_wq_count,
+                    (unsigned long long)
+                        (row->value.io_wq_count ?
+                             row->value.io_wq_queue_total_ns /
+                                 row->value.io_wq_count : 0),
+                    (unsigned long long)
+                        row->value.io_wq_queue_maximum_ns) < 0 ||
+            write_json_string(output->json_stream, resource,
+                              strlen(resource)) ||
+            fputc('}', output->json_stream) == EOF) {
+            free(rows);
+            return -1;
+        }
+    }
+    free(rows);
+    {
+        struct io_uring_ring_row *rings = NULL;
+        size_t count = read_io_uring_ring_rows(output, &rings);
+        size_t index;
+
+        if (fputs("],\"rings\":[", output->json_stream) == EOF) {
+            free(rings);
+            return -1;
+        }
+        for (index = 0; index < count; index++) {
+            const struct io_uring_ring_stats *ring =
+                &rings[index].value;
+
+            if ((index &&
+                 fputc(',', output->json_stream) == EOF) ||
+                fprintf(
+                    output->json_stream,
+                    "{\"ring_ctx\":\"0x%016llx\",\"owner_pid\":%u,"
+                    "\"fd\":%d,\"flags\":%u,\"sq_entries\":%u,"
+                    "\"cq_entries\":%u,\"submitted\":%llu,"
+                    "\"completions\":%llu,\"pending\":%llu,"
+                    "\"peak_pending\":%llu,\"errors\":%llu,"
+                    "\"expected_timeouts\":%llu,\"average_ns\":%llu,"
+                    "\"maximum_ns\":%llu,\"deferred\":%llu,"
+                    "\"io_wq\":%llu,\"io_wq_hashed\":%llu,"
+                    "\"io_wq_queue_average_ns\":%llu,"
+                    "\"io_wq_queue_maximum_ns\":%llu,"
+                    "\"poll_armed\":%llu,\"cq_waits\":%llu,"
+                    "\"cq_overflows\":%llu,\"request_failures\":%llu,"
+                    "\"links\":%llu,\"failed_links\":%llu,"
+                    "\"registrations\":%llu,"
+                    "\"registered_files\":%u,"
+                    "\"registered_buffers\":%u}",
+                    (unsigned long long)rings[index].ring_ctx,
+                    ring->owner_pid, ring->ring_fd, ring->flags,
+                    ring->sq_entries, ring->cq_entries,
+                    (unsigned long long)ring->submitted,
+                    (unsigned long long)ring->completions,
+                    (unsigned long long)ring->pending,
+                    (unsigned long long)ring->peak_pending,
+                    (unsigned long long)ring->errors,
+                    (unsigned long long)ring->expected_timeouts,
+                    (unsigned long long)
+                        (ring->completions ?
+                             ring->total_ns / ring->completions : 0),
+                    (unsigned long long)ring->maximum_ns,
+                    (unsigned long long)ring->deferred,
+                    (unsigned long long)ring->io_wq,
+                    (unsigned long long)ring->io_wq_hashed,
+                    (unsigned long long)
+                        (ring->io_wq ?
+                             ring->io_wq_queue_total_ns /
+                                 ring->io_wq : 0),
+                    (unsigned long long)
+                        ring->io_wq_queue_maximum_ns,
+                    (unsigned long long)ring->poll_armed,
+                    (unsigned long long)ring->cq_waits,
+                    (unsigned long long)ring->cq_overflows,
+                    (unsigned long long)ring->request_failures,
+                    (unsigned long long)ring->links,
+                    (unsigned long long)ring->failed_links,
+                    (unsigned long long)ring->registrations,
+                    ring->registered_files,
+                    ring->registered_buffers) < 0) {
+                free(rings);
+                return -1;
+            }
+        }
+        free(rings);
+    }
+    {
+        struct io_uring_failure_row *failures = NULL;
+        size_t count =
+            read_io_uring_failure_rows(output, &failures);
+        size_t index;
+
+        if (fputs("],\"submission_failures\":[",
+                  output->json_stream) == EOF) {
+            free(failures);
+            return -1;
+        }
+        for (index = 0; index < count; index++) {
+            const struct io_uring_failure_row *row =
+                &failures[index];
+
+            if ((index &&
+                 fputc(',', output->json_stream) == EOF) ||
+                fprintf(
+                    output->json_stream,
+                    "{\"ring_ctx\":\"0x%016llx\",\"opcode\":%u,"
+                    "\"operation\":",
+                    (unsigned long long)row->key.ring_ctx,
+                    row->key.opcode) < 0 ||
+                write_json_string(
+                    output->json_stream,
+                    io_uring_opcode_name(
+                        (uint8_t)row->key.opcode),
+                    strlen(io_uring_opcode_name(
+                        (uint8_t)row->key.opcode))) ||
+                fprintf(
+                    output->json_stream,
+                    ",\"error\":%d,\"count\":%llu,"
+                    "\"user_data\":\"0x%016llx\",\"offset\":%llu,"
+                    "\"address\":\"0x%016llx\","
+                    "\"address3\":\"0x%016llx\",\"length\":%u,"
+                    "\"operation_flags\":%u,\"file_index\":%u,"
+                    "\"buffer_index\":%u,\"sqe_flags\":%u,"
+                    "\"ioprio\":%u}",
+                    row->key.error,
+                    (unsigned long long)row->value.count,
+                    (unsigned long long)row->value.user_data,
+                    (unsigned long long)row->value.offset,
+                    (unsigned long long)row->value.address,
+                    (unsigned long long)row->value.address3,
+                    row->value.length,
+                    row->value.operation_flags,
+                    row->value.file_index,
+                    row->value.buffer_index,
+                    row->value.sqe_flags,
+                    row->value.ioprio) < 0) {
+                free(failures);
+                return -1;
+            }
+        }
+        free(failures);
+    }
+    {
+        struct io_uring_link_row *links = NULL;
+        size_t count = read_io_uring_link_rows(output, &links);
+        size_t index;
+
+        if (fputs("],\"links\":[", output->json_stream) == EOF) {
+            free(links);
+            return -1;
+        }
+        for (index = 0; index < count; index++) {
+            const struct io_uring_link_row *row = &links[index];
+
+            if ((index &&
+                 fputc(',', output->json_stream) == EOF) ||
+                fprintf(
+                    output->json_stream,
+                    "{\"ring_ctx\":\"0x%016llx\","
+                    "\"parent_request\":\"0x%016llx\","
+                    "\"parent_user_data\":\"0x%016llx\","
+                    "\"parent_opcode\":%u,"
+                    "\"child_request\":\"0x%016llx\","
+                    "\"child_user_data\":\"0x%016llx\","
+                    "\"child_opcode\":%u,\"count\":%llu,"
+                    "\"failures\":%llu}",
+                    (unsigned long long)row->key.ring_ctx,
+                    (unsigned long long)row->value.parent_request,
+                    (unsigned long long)row->key.parent_user_data,
+                    row->value.parent_opcode,
+                    (unsigned long long)row->value.child_request,
+                    (unsigned long long)row->key.child_user_data,
+                    row->value.child_opcode,
+                    (unsigned long long)row->value.count,
+                    (unsigned long long)row->value.failures) < 0) {
+                free(links);
+                return -1;
+            }
+        }
+        free(links);
+    }
+    return fputs("]}\n", output->json_stream) == EOF ? -1 : 0;
 }
 
 static const char *futex_operation_name(uint32_t operation)
@@ -1916,6 +4227,13 @@ enum long_option_id {
     OPT_FORMAT,
     OPT_OUTPUT,
     OPT_REPORT,
+    OPT_IO_URING,
+    OPT_MIN_IO_LATENCY_US,
+    OPT_IO_ERRORS_ONLY,
+    OPT_IO_TOP,
+    OPT_IO_CALLBACK,
+    OPT_IO_CALLBACK_BINARY,
+    OPT_IO_CALLBACK_ARG,
 };
 
 static void free_async_hops(struct async_hop_config *hops, size_t count)
@@ -2024,6 +4342,19 @@ static int parse_cli_ms(const char *option, const char *value,
         return -1;
     }
     *nanoseconds = (uint64_t)milliseconds * 1000000ULL;
+    return 0;
+}
+
+static int parse_cli_us(const char *option, const char *value,
+                        uint64_t *nanoseconds)
+{
+    uint32_t microseconds;
+
+    if (parse_u32_range(value, 1, UINT32_MAX, &microseconds)) {
+        fprintf(stderr, "invalid %s value: %s\n", option, value);
+        return -1;
+    }
+    *nanoseconds = (uint64_t)microseconds * 1000ULL;
     return 0;
 }
 
@@ -2289,6 +4620,16 @@ int main(int argc, char **argv)
         {"format", required_argument, NULL, OPT_FORMAT},
         {"output", required_argument, NULL, OPT_OUTPUT},
         {"report", required_argument, NULL, OPT_REPORT},
+        {"io-uring", no_argument, NULL, OPT_IO_URING},
+        {"min-io-latency-us", required_argument, NULL,
+         OPT_MIN_IO_LATENCY_US},
+        {"io-errors-only", no_argument, NULL, OPT_IO_ERRORS_ONLY},
+        {"io-top", required_argument, NULL, OPT_IO_TOP},
+        {"io-callback", required_argument, NULL, OPT_IO_CALLBACK},
+        {"io-callback-binary", required_argument, NULL,
+         OPT_IO_CALLBACK_BINARY},
+        {"io-callback-arg", required_argument, NULL,
+         OPT_IO_CALLBACK_ARG},
         {0, 0, 0, 0},
     };
     struct bpf_uprobe_opts options = {
@@ -2304,6 +4645,14 @@ int main(int argc, char **argv)
         .wait_stack_map_fd = -1,
         .async_hop_stats_map_fd = -1,
         .async_worker_stats_map_fd = -1,
+        .io_uring_stack_map_fd = -1,
+        .io_uring_counters_map_fd = -1,
+        .io_uring_aggregate_map_fd = -1,
+        .io_uring_result_map_fd = -1,
+        .io_uring_ring_stats_map_fd = -1,
+        .io_uring_failure_map_fd = -1,
+        .io_uring_link_map_fd = -1,
+        .target_pidfd = -1,
         .diagnostic_interval_ms = 1000,
     };
     struct callweave_bpf *skeleton = NULL;
@@ -2312,6 +4661,7 @@ int main(int argc, char **argv)
     struct bpf_link *async_links[MAX_ASYNC_HOPS * 3] = {0};
     char target_path[PATH_MAX] = {0};
     char async_source_path[PATH_MAX] = {0};
+    char io_callback_path[PATH_MAX] = {0};
     const char *binary_argument = NULL;
     const char *module_name = NULL;
     const char *find_symbol_name = NULL;
@@ -2323,17 +4673,21 @@ int main(int argc, char **argv)
     const char *config_path = NULL;
     const char *output_path = NULL;
     const char *report_path = NULL;
+    const char *io_callback_name = NULL;
+    const char *io_callback_binary = NULL;
     char *configured_function = NULL;
     size_t function_offset = 0;
     uint32_t async_source_arg = 1;
     uint32_t async_target_arg = 0;
     uint32_t async_max_age_ms = 30000;
     uint32_t duration_seconds = 0;
+    uint32_t io_callback_arg = 1;
     uint64_t stop_time_ns = 0;
     size_t async_hop_count = 0;
     size_t async_link_count = 0;
     pid_t target_pid = -1;
     bool async_option_seen = false;
+    bool io_callback_option_seen = false;
     bool check_config = false;
     bool json_output = false;
     int remaining_arguments;
@@ -2554,6 +4908,44 @@ int main(int argc, char **argv)
         case OPT_REPORT:
             report_path = optarg;
             break;
+        case OPT_IO_URING:
+            output.io_uring_mode = true;
+            break;
+        case OPT_MIN_IO_LATENCY_US:
+            if (parse_cli_us("--min-io-latency-us", optarg,
+                             &output.io_uring_min_latency_ns)) {
+                error = 2;
+                goto cleanup;
+            }
+            break;
+        case OPT_IO_ERRORS_ONLY:
+            output.io_uring_errors_only = true;
+            break;
+        case OPT_IO_TOP:
+            if (parse_u32_range(optarg, 1, 1000,
+                                &output.io_uring_top)) {
+                fprintf(stderr, "invalid --io-top value: %s\n", optarg);
+                error = 2;
+                goto cleanup;
+            }
+            break;
+        case OPT_IO_CALLBACK:
+            io_callback_name = optarg;
+            io_callback_option_seen = true;
+            break;
+        case OPT_IO_CALLBACK_BINARY:
+            io_callback_binary = optarg;
+            io_callback_option_seen = true;
+            break;
+        case OPT_IO_CALLBACK_ARG:
+            io_callback_option_seen = true;
+            if (parse_u32_range(optarg, 1, 8, &io_callback_arg)) {
+                fprintf(stderr, "invalid --io-callback-arg value: %s\n",
+                        optarg);
+                error = 2;
+                goto cleanup;
+            }
+            break;
         default:
             usage(stderr, argv[0]);
             return 2;
@@ -2582,10 +4974,16 @@ int main(int argc, char **argv)
         error = 2;
         goto cleanup;
     }
-    if ((json_output || report_path) && !output.show_async) {
+    if (json_output && !output.show_async && !output.io_uring_mode) {
         fprintf(stderr,
-                "--format json and --report require async tracing via "
-                "--config, --async-hop, or --async-source\n");
+                "--format json requires async tracing or --io-uring\n");
+        error = 2;
+        goto cleanup;
+    }
+    if (report_path && !output.show_async) {
+        fprintf(stderr,
+                "--report requires async tracing via --config, "
+                "--async-hop, or --async-source\n");
         error = 2;
         goto cleanup;
     }
@@ -2611,9 +5009,10 @@ int main(int argc, char **argv)
         error = 2;
         goto cleanup;
     }
-    if ((output.min_total_ns || output.min_queue_ns ||
-         output.min_work_ns || output.max_events) &&
-        !output.show_async) {
+    if (((output.min_total_ns || output.min_queue_ns ||
+          output.min_work_ns) && !output.show_async) ||
+        (output.max_events && !output.show_async &&
+         !output.io_uring_mode)) {
         fprintf(stderr,
                 "chain filters require --config, --async-hop, or "
                 "--async-source\n");
@@ -2647,6 +5046,65 @@ int main(int argc, char **argv)
     error = validate_target_pid(target_pid);
     if (error)
         return 1;
+
+    if (!output.io_uring_mode &&
+        (output.io_uring_min_latency_ns ||
+         output.io_uring_errors_only || output.io_uring_top ||
+         io_callback_option_seen)) {
+        fprintf(stderr,
+                "io_uring filters and callback options require "
+                "--io-uring\n");
+        error = 2;
+        goto cleanup;
+    }
+    if (output.io_uring_mode) {
+        if (target_pid <= 0) {
+            fprintf(stderr, "--io-uring requires --pid\n");
+            error = 2;
+            goto cleanup;
+        }
+        if (remaining_arguments || binary_argument || module_name ||
+            find_symbol_name || offset_text || configured_function ||
+            output.show_return_value || output.show_duration ||
+            output.show_attribution || output.show_async ||
+            output.show_discovery || async_source_name ||
+            async_source_binary || async_option_seen || async_hop_count ||
+            report_path) {
+            fprintf(stderr,
+                    "--io-uring is a standalone mode; combine it only with "
+                    "--pid, its io_uring filters/callback options, "
+                    "--duration, --max-events, --format, and --output\n");
+            error = 2;
+            goto cleanup;
+        }
+        if (io_callback_option_seen &&
+            (!io_callback_name || !io_callback_name[0])) {
+            fprintf(stderr,
+                    "--io-callback-binary and --io-callback-arg require "
+                    "--io-callback FUNCTION\n");
+            error = 2;
+            goto cleanup;
+        }
+        if (io_callback_name) {
+            if (io_callback_binary) {
+                if (!realpath(io_callback_binary, io_callback_path)) {
+                    fprintf(stderr,
+                            "cannot resolve callback binary %s: %s\n",
+                            io_callback_binary, strerror(errno));
+                    error = 1;
+                    goto cleanup;
+                }
+            } else {
+                error = resolve_process_executable(
+                    target_pid, io_callback_path,
+                    sizeof(io_callback_path));
+                if (error)
+                    goto cleanup;
+            }
+            output.io_uring_callback_name = io_callback_name;
+        }
+        goto trace_target_ready;
+    }
 
     if (find_symbol_name) {
         int result;
@@ -2809,8 +5267,32 @@ int main(int argc, char **argv)
         }
     }
 
-    if (install_signal_handlers())
-        return 1;
+trace_target_ready:
+    output.target_pid = target_pid;
+#ifdef SYS_pidfd_open
+    if (target_pid > 0)
+        output.target_pidfd =
+            syscall(SYS_pidfd_open, target_pid, 0);
+#endif
+    if (output.io_uring_mode && target_pid > 0) {
+        cache_all_io_uring_fd_resources(&output);
+        output.io_uring_maps = calloc(1, sizeof(*output.io_uring_maps));
+        if (output.io_uring_maps &&
+            !read_process_maps((uint32_t)target_pid,
+                               output.io_uring_maps)) {
+            output.io_uring_maps_pid = (uint32_t)target_pid;
+        } else {
+            if (output.io_uring_maps) {
+                map_list_free(output.io_uring_maps);
+                free(output.io_uring_maps);
+                output.io_uring_maps = NULL;
+            }
+        }
+    }
+    if (install_signal_handlers()) {
+        error = -errno;
+        goto cleanup;
+    }
 
     skeleton = callweave_bpf__open();
     if (!skeleton) {
@@ -2827,6 +5309,14 @@ int main(int argc, char **argv)
     skeleton->rodata->trace_attribution = output.show_attribution;
     skeleton->rodata->trace_async = output.show_async;
     skeleton->rodata->trace_discovery = output.show_discovery;
+    skeleton->rodata->trace_io_uring = output.io_uring_mode;
+    skeleton->rodata->enable_io_uring_callback =
+        output.io_uring_callback_name != NULL;
+    skeleton->rodata->io_uring_callback_arg = io_callback_arg;
+    skeleton->rodata->io_uring_min_latency_ns =
+        output.io_uring_min_latency_ns;
+    skeleton->rodata->io_uring_errors_only =
+        output.io_uring_errors_only;
     skeleton->rodata->async_source_arg = async_source_arg;
     skeleton->rodata->async_target_arg = async_target_arg;
     skeleton->rodata->async_max_age_ns =
@@ -2835,6 +5325,67 @@ int main(int argc, char **argv)
         output.show_async ?
             (uint32_t)(async_hop_count ? async_hop_count : 1) : 0;
     skeleton->rodata->futex_syscall_nr = SYS_futex;
+    if (!output.io_uring_mode) {
+        error = bpf_program__set_autoload(
+            skeleton->progs.trace_io_uring_submit_req, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_io_uring_file_get, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_io_uring_complete, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_io_uring_create, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_io_uring_register, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_io_uring_defer, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_io_uring_queue_async_work, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_io_wq_submit_work, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_io_uring_poll_arm, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_io_uring_cqring_wait, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_io_uring_cqe_overflow, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_io_uring_req_failed, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_io_uring_link, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_io_uring_fail_link, false);
+        if (error) {
+            fprintf(stderr,
+                    "failed to disable io_uring programs: %s\n",
+                    strerror(-error));
+            goto cleanup;
+        }
+    } else {
+        error = bpf_program__set_autoload(
+            skeleton->progs.trace_function, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_function_return, false);
+        if (error) {
+            fprintf(stderr,
+                    "failed to disable function tracing programs: %s\n",
+                    strerror(-error));
+            goto cleanup;
+        }
+    }
     if (!output.show_attribution) {
         error = bpf_program__set_autoload(
             skeleton->progs.trace_sched_switch, false);
@@ -2850,6 +5401,16 @@ int main(int argc, char **argv)
         if (error) {
             fprintf(stderr,
                     "failed to disable scheduler attribution programs: %s\n",
+                    strerror(-error));
+            goto cleanup;
+        }
+    }
+    if (!output.io_uring_callback_name) {
+        error = bpf_program__set_autoload(
+            skeleton->progs.trace_io_uring_callback, false);
+        if (error) {
+            fprintf(stderr,
+                    "failed to disable io_uring callback program: %s\n",
                     strerror(-error));
             goto cleanup;
         }
@@ -2901,8 +5462,92 @@ int main(int argc, char **argv)
         bpf_map__fd(skeleton->maps.async_hop_stats);
     output.async_worker_stats_map_fd =
         bpf_map__fd(skeleton->maps.async_worker_stats);
+    output.io_uring_stack_map_fd =
+        bpf_map__fd(skeleton->maps.io_uring_stacks);
+    output.io_uring_counters_map_fd =
+        bpf_map__fd(skeleton->maps.io_uring_counters);
+    output.io_uring_aggregate_map_fd =
+        bpf_map__fd(skeleton->maps.io_uring_aggregates);
+    output.io_uring_result_map_fd =
+        bpf_map__fd(skeleton->maps.io_uring_results);
+    output.io_uring_ring_stats_map_fd =
+        bpf_map__fd(skeleton->maps.io_uring_ring_stats);
+    output.io_uring_failure_map_fd =
+        bpf_map__fd(skeleton->maps.io_uring_failures);
+    output.io_uring_link_map_fd =
+        bpf_map__fd(skeleton->maps.io_uring_links);
 
-    if (output.show_attribution) {
+    if (output.io_uring_mode) {
+        error = attach_raw_tracepoint(
+            skeleton->progs.trace_io_uring_submit_req,
+            &skeleton->links.trace_io_uring_submit_req,
+            "io_uring_submit_req");
+        if (!error)
+            error = attach_raw_tracepoint(
+                skeleton->progs.trace_io_uring_file_get,
+                &skeleton->links.trace_io_uring_file_get,
+                "io_uring_file_get");
+        if (!error)
+            error = attach_raw_tracepoint(
+                skeleton->progs.trace_io_uring_complete,
+                &skeleton->links.trace_io_uring_complete,
+                "io_uring_complete");
+        if (error)
+            goto cleanup;
+        attach_optional_raw_tracepoint(
+            skeleton->progs.trace_io_uring_create,
+            &skeleton->links.trace_io_uring_create,
+            "io_uring_create");
+        attach_optional_raw_tracepoint(
+            skeleton->progs.trace_io_uring_register,
+            &skeleton->links.trace_io_uring_register,
+            "io_uring_register");
+        attach_optional_raw_tracepoint(
+            skeleton->progs.trace_io_uring_defer,
+            &skeleton->links.trace_io_uring_defer,
+            "io_uring_defer");
+        attach_optional_raw_tracepoint(
+            skeleton->progs.trace_io_uring_queue_async_work,
+            &skeleton->links.trace_io_uring_queue_async_work,
+            "io_uring_queue_async_work");
+        attach_optional_kprobe(
+            skeleton->progs.trace_io_wq_submit_work,
+            &skeleton->links.trace_io_wq_submit_work,
+            "io_wq_submit_work");
+        attach_optional_raw_tracepoint(
+            skeleton->progs.trace_io_uring_poll_arm,
+            &skeleton->links.trace_io_uring_poll_arm,
+            "io_uring_poll_arm");
+        attach_optional_raw_tracepoint(
+            skeleton->progs.trace_io_uring_cqring_wait,
+            &skeleton->links.trace_io_uring_cqring_wait,
+            "io_uring_cqring_wait");
+        attach_optional_raw_tracepoint(
+            skeleton->progs.trace_io_uring_cqe_overflow,
+            &skeleton->links.trace_io_uring_cqe_overflow,
+            "io_uring_cqe_overflow");
+        attach_optional_raw_tracepoint(
+            skeleton->progs.trace_io_uring_req_failed,
+            &skeleton->links.trace_io_uring_req_failed,
+            "io_uring_req_failed");
+        attach_optional_raw_tracepoint(
+            skeleton->progs.trace_io_uring_link,
+            &skeleton->links.trace_io_uring_link,
+            "io_uring_link");
+        attach_optional_raw_tracepoint(
+            skeleton->progs.trace_io_uring_fail_link,
+            &skeleton->links.trace_io_uring_fail_link,
+            "io_uring_fail_link");
+        if (output.io_uring_callback_name) {
+            error = attach_named_uprobe(
+                skeleton->progs.trace_io_uring_callback,
+                &skeleton->links.trace_io_uring_callback,
+                io_callback_path, output.io_uring_callback_name,
+                0, false);
+            if (error)
+                goto cleanup;
+        }
+    } else if (output.show_attribution) {
         error = attach_raw_tracepoint(
             skeleton->progs.trace_sched_switch,
             &skeleton->links.trace_sched_switch, "sched_switch");
@@ -2996,32 +5641,50 @@ int main(int argc, char **argv)
             goto cleanup;
     }
 
-    options.func_name = offset_text ? NULL : function_name;
-    skeleton->links.trace_function = bpf_program__attach_uprobe_opts(
-        skeleton->progs.trace_function, -1, target_path,
-        function_offset, &options);
-    error = skeleton->links.trace_function ?
-            libbpf_get_error(skeleton->links.trace_function) :
-            (errno ? -errno : -EINVAL);
-    if (error) {
-        skeleton->links.trace_function = NULL;
-        if (offset_text)
-            fprintf(stderr,
-                    "failed to attach uprobe to %s+0x%zx: %s\n",
-                    target_path, function_offset, strerror(-error));
-        else
-            fprintf(stderr, "failed to attach uprobe to %s:%s: %s\n",
-                    target_path, function_name, strerror(-error));
-        goto cleanup;
+    if (!output.io_uring_mode) {
+        options.func_name = offset_text ? NULL : function_name;
+        skeleton->links.trace_function = bpf_program__attach_uprobe_opts(
+            skeleton->progs.trace_function, -1, target_path,
+            function_offset, &options);
+        error = skeleton->links.trace_function ?
+                libbpf_get_error(skeleton->links.trace_function) :
+                (errno ? -errno : -EINVAL);
+        if (error) {
+            skeleton->links.trace_function = NULL;
+            if (offset_text)
+                fprintf(stderr,
+                        "failed to attach uprobe to %s+0x%zx: %s\n",
+                        target_path, function_offset, strerror(-error));
+            else
+                fprintf(stderr, "failed to attach uprobe to %s:%s: %s\n",
+                        target_path, function_name, strerror(-error));
+            goto cleanup;
+        }
     }
 
-    ring_buffer = ring_buffer__new(bpf_map__fd(skeleton->maps.events),
-                                   handle_event, &output, NULL);
+    ring_buffer = ring_buffer__new(
+        output.io_uring_mode ?
+            bpf_map__fd(skeleton->maps.io_uring_events) :
+            bpf_map__fd(skeleton->maps.events),
+        output.io_uring_mode ? handle_io_uring_event : handle_event,
+        &output, NULL);
     if (!ring_buffer) {
         error = errno ? -errno : -ENOMEM;
         fprintf(stderr, "failed to create ring buffer: %s\n",
                 strerror(-error));
         goto cleanup;
+    }
+    if (output.io_uring_callback_name) {
+        error = ring_buffer__add(
+            ring_buffer,
+            bpf_map__fd(skeleton->maps.io_uring_callback_events),
+            handle_io_uring_callback_event, &output);
+        if (error) {
+            fprintf(stderr,
+                    "failed to add io_uring callback ring buffer: %s\n",
+                    strerror(-error));
+            goto cleanup;
+        }
     }
 
     if (json_output) {
@@ -3058,7 +5721,9 @@ int main(int argc, char **argv)
     }
 
     if (json_output) {
-        if (offset_text)
+        if (output.io_uring_mode)
+            fprintf(stderr, "Tracing io_uring");
+        else if (offset_text)
             fprintf(stderr, "Tracing %s+0x%zx", target_path,
                     function_offset);
         else
@@ -3070,11 +5735,21 @@ int main(int argc, char **argv)
         fprintf(stderr, ", JSON Lines output");
         if (output_path)
             fprintf(stderr, " to %s", output_path);
+        if (output.io_uring_min_latency_ns)
+            fprintf(stderr, ", minimum io latency %.3f us",
+                    (double)output.io_uring_min_latency_ns / 1000.0);
+        if (output.io_uring_errors_only)
+            fprintf(stderr, ", io errors only");
+        if (output.io_uring_top)
+            fprintf(stderr, ", top %u submit groups",
+                    output.io_uring_top);
         if (report_path)
             fprintf(stderr, ", HTML report %s", report_path);
         fprintf(stderr, ". Press Ctrl+C to stop.\n");
     } else {
-        if (offset_text)
+        if (output.io_uring_mode)
+            printf("Tracing io_uring");
+        else if (offset_text)
             printf("Tracing %s+0x%zx", target_path, function_offset);
         else
             printf("Tracing %s:%s", target_path, function_name);
@@ -3082,6 +5757,21 @@ int main(int argc, char **argv)
             printf(" in PID %d", target_pid);
         else
             printf(" in all processes");
+        if (output.io_uring_mode)
+            printf(", submit-to-CQE latency enabled");
+        if (output.io_uring_min_latency_ns) {
+            printf(",");
+            print_interval("min-io-latency",
+                           output.io_uring_min_latency_ns);
+        }
+        if (output.io_uring_errors_only)
+            printf(", io errors only");
+        if (output.io_uring_top)
+            printf(", top %u submit groups",
+                   output.io_uring_top);
+        if (output.io_uring_callback_name)
+            printf(", CQE -> callback %s arg%u",
+                   output.io_uring_callback_name, io_callback_arg);
         if (output.show_return_value)
             printf(", return values enabled");
         if (output.show_duration)
@@ -3141,6 +5831,13 @@ int main(int argc, char **argv)
                 break;
             continue;
         }
+        if (target_process_exited(&output)) {
+            error = 0;
+            fprintf(output.json_output ? stderr : stdout,
+                    "Target PID %d exited; stopping trace.\n",
+                    target_pid);
+            break;
+        }
         if (error < 0) {
             fprintf(stderr, "ring buffer polling failed: %s\n",
                     strerror(-error));
@@ -3157,11 +5854,27 @@ int main(int argc, char **argv)
         if (stop_time_ns && monotonic_time_ns() >= stop_time_ns)
             break;
     }
+    if (ring_buffer && output.io_uring_callback_name && !force_exit) {
+        int consume_error = ring_buffer__consume(ring_buffer);
+
+        if (consume_error < 0 && !error)
+            error = consume_error;
+    }
 
 cleanup:
+    if (output.io_uring_mode)
+        detach_io_uring_links(skeleton);
+    if (interrupt_count == 1 && !force_exit &&
+        output.io_uring_mode && output.io_uring_top)
+        fprintf(output.json_output ? stderr : stdout,
+                "Capture stopped; resolving unique top stacks. "
+                "Press Ctrl+C again to exit immediately.\n");
     if (output.show_async && output.diagnostic_last_ns &&
         output.async_hop_stats_map_fd >= 0)
         print_queue_diagnostics(&output, true);
+    if (output.io_uring_mode && output.diagnostic_last_ns &&
+        output.io_uring_counters_map_fd >= 0 && !force_exit)
+        print_io_uring_summary(&output);
     if (output.report_stream) {
         struct cw_queue_diagnostic diagnostics[MAX_ASYNC_HOPS];
         struct async_hop_stats raw[MAX_ASYNC_HOPS];
@@ -3179,15 +5892,20 @@ cleanup:
             error = -errno;
     }
     if (output.json_stream) {
-        struct cw_queue_diagnostic diagnostics[MAX_ASYNC_HOPS];
-        struct async_hop_stats raw[MAX_ASYNC_HOPS];
-        size_t diagnostic_count =
-            read_queue_diagnostics(&output, diagnostics, raw);
+        if (output.io_uring_mode && !force_exit) {
+            if (write_io_uring_summary_json(&output) && !error)
+                error = -(errno ? errno : EIO);
+        } else if (!output.io_uring_mode) {
+            struct cw_queue_diagnostic diagnostics[MAX_ASYNC_HOPS];
+            struct async_hop_stats raw[MAX_ASYNC_HOPS];
+            size_t diagnostic_count =
+                read_queue_diagnostics(&output, diagnostics, raw);
 
-        if ((cw_write_queue_diagnostics_json(
-                 output.json_stream, diagnostics, diagnostic_count) ||
-             fputc('\n', output.json_stream) == EOF) && !error)
-            error = -(errno ? errno : EIO);
+            if ((cw_write_queue_diagnostics_json(
+                     output.json_stream, diagnostics, diagnostic_count) ||
+                 fputc('\n', output.json_stream) == EOF) && !error)
+                error = -(errno ? errno : EIO);
+        }
         if (fflush(output.json_stream) && !error)
             error = -errno;
         if (output.json_stream != stdout &&
@@ -3202,6 +5920,13 @@ cleanup:
         ring_buffer__free(ring_buffer);
     if (skeleton)
         callweave_bpf__destroy(skeleton);
+    if (output.target_pidfd >= 0)
+        close(output.target_pidfd);
+    if (output.io_uring_maps) {
+        map_list_free(output.io_uring_maps);
+        free(output.io_uring_maps);
+    }
+    free(output.io_uring_resources);
     free_async_hops(async_hops, async_hop_count);
     free(configured_function);
     return error ? 1 : 0;
