@@ -87,6 +87,9 @@ static __attribute__((noinline)) void cw_epoll_finish_dispatch_batch(
 static __attribute__((noinline)) void cw_epoll_record_io(
     void *stack_context, struct pt_regs *registers,
     __u64 pid_tgid, __u32 pid, __u32 operation);
+static __attribute__((noinline)) void cw_epoll_apply_dispatch_wake(
+    const struct cw_epoll_dispatch_key *key,
+    struct cw_epoll_dispatch_item *item);
 
 static __always_inline __u32 cw_epoll_fd_generation(
     __u32 pid, __s32 fd)
@@ -1004,6 +1007,8 @@ static __attribute__((noinline)) void cw_epoll_finish_dispatch_item(
 
     if (!candidate)
         return;
+    cw_epoll_apply_dispatch_wake(
+        &dispatch_key, &candidate->item);
     consumed =
         candidate->item.flags & CW_EPOLL_DISPATCH_CONSUMED;
     dispatch_ns = consumed &&

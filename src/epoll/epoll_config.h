@@ -20,6 +20,12 @@ struct cw_epoll_config {
     __s32 pwait_syscall_nr;
     __s32 pwait2_syscall_nr;
     __s32 ctl_syscall_nr;
+    __s32 eventfd_syscall_nr;
+    __s32 eventfd2_syscall_nr;
+    __s32 timerfd_create_syscall_nr;
+    __s32 timerfd_settime_syscall_nr;
+    __s32 signalfd_syscall_nr;
+    __s32 signalfd4_syscall_nr;
     struct cw_epoll_io_syscall io_syscalls[CW_EPOLL_MAX_IO_SYSCALLS];
 };
 

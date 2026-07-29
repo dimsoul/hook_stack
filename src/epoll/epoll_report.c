@@ -606,6 +606,145 @@ static void print_resource_table(
     }
 }
 
+static void print_wake_source_table(
+    struct output_options *output,
+    const struct cw_epoll_resource_row *rows, size_t count,
+    FILE *stream)
+{
+    size_t index;
+    size_t rank = 0;
+
+    fprintf(stream, "\n[9] Wake-source attribution\n");
+    fprintf(stream,
+            "  %-6s %-5s %-5s %-9s %8s %8s %8s %12s %12s  %s\n",
+            "EPFD", "FD", "GEN", "KIND", "READY", "MATCHED",
+            "SRC OPS", "AVG LAT", "MAX LAT", "LATEST SOURCE");
+    fprintf(stream,
+            "  %-6s %-5s %-5s %-9s %8s %8s %8s %12s %12s  %s\n",
+            "------", "-----", "-----", "---------", "--------",
+            "--------", "--------", "------------", "------------",
+            "------------------------------");
+    for (index = 0; index < count; index++) {
+        const struct cw_epoll_resource_stats *stats =
+            &rows[index].value;
+        const struct cw_epoll_wake_source *wake =
+            &stats->last_wake;
+        char average[32] = "-";
+        char maximum[32] = "-";
+        char source[128] = "unavailable";
+
+        if (!stats->wake_ready || !wake->kind)
+            continue;
+        if (stats->wake_latency_samples) {
+            format_interval(
+                average, sizeof(average),
+                stats->wake_total_latency_ns /
+                    stats->wake_latency_samples);
+            format_interval(
+                maximum, sizeof(maximum),
+                stats->wake_maximum_latency_ns);
+        }
+        if (wake->action) {
+            if (wake->action ==
+                CW_EPOLL_WAKE_ACTION_SIGNAL_SEND)
+                snprintf(
+                    source, sizeof(source),
+                    "PID %u/TID %u %.*s signal=%u",
+                    wake->source_pid, wake->source_tid,
+                    (int)sizeof(wake->comm), wake->comm,
+                    wake->signal_number);
+            else
+                snprintf(
+                    source, sizeof(source),
+                    "PID %u/TID %u %.*s %s",
+                    wake->source_pid, wake->source_tid,
+                    (int)sizeof(wake->comm), wake->comm,
+                    cw_epoll_wake_action_name(wake->action));
+        }
+        fprintf(
+            stream,
+            "  %-6d %-5d %-5u %-9s %8llu %8llu %8llu "
+            "%12s %12s  %s\n",
+            rows[index].key.epoll_fd,
+            rows[index].key.fd,
+            rows[index].key.fd_generation,
+            cw_epoll_wake_kind_name(wake->kind),
+            (unsigned long long)stats->wake_ready,
+            (unsigned long long)stats->wake_attributed,
+            (unsigned long long)stats->wake_operations,
+            average, maximum, source);
+    }
+    if (!output->epoll_top)
+        return;
+    for (index = 0;
+         index < count && rank < output->epoll_top; index++) {
+        const struct cw_epoll_resource_stats *stats =
+            &rows[index].value;
+        const struct cw_epoll_wake_source *wake =
+            &stats->last_wake;
+        struct map_list source_maps = {0};
+        struct map_list *maps = output->target_maps;
+        uint64_t stack[MAX_ASYNC_STACK_DEPTH] = {0};
+        bool temporary_maps = false;
+
+        if (!stats->wake_ready || !wake->kind)
+            continue;
+        rank++;
+        fprintf(
+            stream,
+            "  [%zu] epfd=%d gen=%u fd=%d gen=%u %s "
+            "attributed=%llu/%llu\n",
+            rank,
+            rows[index].key.epoll_fd,
+            rows[index].key.epoll_generation,
+            rows[index].key.fd,
+            rows[index].key.fd_generation,
+            cw_epoll_wake_kind_name(wake->kind),
+            (unsigned long long)stats->wake_attributed,
+            (unsigned long long)stats->wake_ready);
+        if (!wake->action) {
+            fprintf(
+                stream,
+                "      source stack: unavailable "
+                "(pre-attach, external producer, or unmatched signal)\n");
+            continue;
+        }
+        fprintf(stream, "      latest source stack:\n");
+        if (wake->stack_id < 0 ||
+            output->epoll_stack_map_fd < 0 ||
+            bpf_map_lookup_elem(
+                output->epoll_stack_map_fd,
+                &wake->stack_id, stack)) {
+            fprintf(
+                stream,
+                "        unavailable (stack_id=%d)\n",
+                wake->stack_id);
+            continue;
+        }
+        if (wake->source_pid != (uint32_t)output->target_pid &&
+            wake->source_global_pid &&
+            wake->source_global_pid != output->target_maps_pid) {
+            if (!read_process_maps(
+                    wake->source_global_pid, &source_maps)) {
+                maps = &source_maps;
+                temporary_maps = true;
+            } else {
+                maps = NULL;
+            }
+        }
+        if (maps)
+            print_stack_frames(
+                stack, sizeof(stack), maps,
+                "      ", NULL, NULL, 0, output->control);
+        else
+            fprintf(stream, "        process maps unavailable\n");
+        if (temporary_maps)
+            map_list_free(&source_maps);
+        if (cw_capture_cancelled(output->control))
+            break;
+    }
+}
+
 bool cw_epoll_print_summary(struct output_options *output)
 {
     struct cw_epoll_counters counters = {0};
@@ -672,6 +811,9 @@ bool cw_epoll_print_summary(struct output_options *output)
             "  ONESHOT rearm warns : %llu\n"
             "  FD close / dup      : %llu / %llu\n"
             "  Reused registrations: %llu\n"
+            "  Wake-source ready   : %llu\n"
+            "  Wake attributed     : %llu\n"
+            "    eventfd/timerfd/signalfd: %llu / %llu / %llu\n"
             "  Dispatch records    : %llu\n"
             "  Dispatch dropped    : %llu\n",
             output->epoll_started_target ?
@@ -705,6 +847,11 @@ bool cw_epoll_print_summary(struct output_options *output)
             (unsigned long long)counters.fd_closes,
             (unsigned long long)counters.fd_duplications,
             (unsigned long long)counters.fd_reuses,
+            (unsigned long long)counters.wake_ready,
+            (unsigned long long)counters.wake_attributed,
+            (unsigned long long)counters.eventfd_ready,
+            (unsigned long long)counters.timerfd_ready,
+            (unsigned long long)counters.signalfd_ready,
             (unsigned long long)counters.dispatch_emitted,
             (unsigned long long)counters.dispatch_dropped);
     if (counters.potential_et_undrained)
@@ -724,10 +871,60 @@ bool cw_epoll_print_summary(struct output_options *output)
     print_loop_callsites(output, loops, loop_count, stream);
     print_resource_table(
         output, resources, resource_count, stream);
+    print_wake_source_table(
+        output, resources, resource_count, stream);
     free(loops);
     free(resources);
     free(instances);
     return true;
+}
+
+static int write_summary_wake_json(
+    FILE *stream, const struct cw_epoll_resource_stats *stats)
+{
+    const struct cw_epoll_wake_source *wake = &stats->last_wake;
+
+    if (!wake->kind)
+        return fputs("null", stream) == EOF ? -1 : 0;
+    if (fprintf(
+            stream,
+            "{\"kind\":\"%s\",\"action\":\"%s\","
+            "\"ready\":%llu,\"attributed\":%llu,"
+            "\"operations\":%llu,\"latency_samples\":%llu,"
+            "\"total_latency_ns\":%llu,"
+            "\"maximum_latency_ns\":%llu,"
+            "\"last_latency_ns\":%llu,"
+            "\"last_latency_valid\":%s,"
+            "\"value\":%llu,\"timer_initial_ns\":%llu,"
+            "\"timer_interval_ns\":%llu,\"timer_abstime\":%s,"
+            "\"signal_number\":%u,\"source_pid\":%u,"
+            "\"source_tid\":%u,\"source_global_pid\":%u,"
+            "\"source_global_tid\":%u,\"stack_id\":%d,\"comm\":",
+            cw_epoll_wake_kind_name(wake->kind),
+            cw_epoll_wake_action_name(wake->action),
+            (unsigned long long)stats->wake_ready,
+            (unsigned long long)stats->wake_attributed,
+            (unsigned long long)stats->wake_operations,
+            (unsigned long long)stats->wake_latency_samples,
+            (unsigned long long)stats->wake_total_latency_ns,
+            (unsigned long long)stats->wake_maximum_latency_ns,
+            (unsigned long long)wake->latency_ns,
+            wake->flags & CW_EPOLL_WAKE_LATENCY_VALID ?
+                "true" : "false",
+            (unsigned long long)wake->value,
+            (unsigned long long)wake->timer_initial_ns,
+            (unsigned long long)wake->timer_interval_ns,
+            wake->flags & CW_EPOLL_WAKE_TIMER_ABSTIME ?
+                "true" : "false",
+            wake->signal_number,
+            wake->source_pid, wake->source_tid,
+            wake->source_global_pid, wake->source_global_tid,
+            wake->stack_id) < 0 ||
+        cw_epoll_write_json_string(
+            stream, wake->comm, sizeof(wake->comm)) ||
+        fputc('}', stream) == EOF)
+        return -1;
+    return 0;
 }
 
 int cw_epoll_write_summary_json(struct output_options *output)
@@ -774,6 +971,9 @@ int cw_epoll_write_summary_json(struct output_options *output)
             "\"potential_oneshot_missing_rearm\":%llu,"
             "\"fd_closes\":%llu,\"fd_duplications\":%llu,"
             "\"fd_reuses\":%llu,"
+            "\"wake_ready\":%llu,\"wake_attributed\":%llu,"
+            "\"eventfd_ready\":%llu,\"timerfd_ready\":%llu,"
+            "\"signalfd_ready\":%llu,"
             "\"pending_at_stop\":%llu,"
             "\"observation_from_target_start\":%s,"
             "\"bootstrap_scans\":%u,\"bootstrap_epoll_fds\":%u,"
@@ -802,6 +1002,11 @@ int cw_epoll_write_summary_json(struct output_options *output)
             (unsigned long long)counters.fd_closes,
             (unsigned long long)counters.fd_duplications,
             (unsigned long long)counters.fd_reuses,
+            (unsigned long long)counters.wake_ready,
+            (unsigned long long)counters.wake_attributed,
+            (unsigned long long)counters.eventfd_ready,
+            (unsigned long long)counters.timerfd_ready,
+            (unsigned long long)counters.signalfd_ready,
             (unsigned long long)pending_at_stop,
             output->epoll_started_target ? "true" : "false",
             output->epoll_bootstrap_scans,
@@ -945,6 +1150,8 @@ int cw_epoll_write_summary_json(struct output_options *output)
                 stats->active && !reused ? "true" : "false") < 0 ||
             cw_epoll_write_json_string(
                 stream, resource, strlen(resource)) ||
+            fputs(",\"wake\":", stream) == EOF ||
+            write_summary_wake_json(stream, stats) ||
             fputc('}', stream) == EOF) {
             error = -1;
             goto done;

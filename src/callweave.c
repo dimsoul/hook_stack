@@ -203,7 +203,7 @@ static bool attach_optional_raw_tracepoint(
         return true;
     *link = NULL;
     fprintf(stderr,
-            "warning: optional io_uring tracepoint %s unavailable: %s\n",
+            "warning: optional tracepoint %s unavailable: %s\n",
             tracepoint, strerror(-error));
     return false;
 }
@@ -261,6 +261,9 @@ static void detach_epoll_links(struct callweave_bpf *skeleton)
         return;
     detach_link(&skeleton->links.trace_epoll_sys_enter);
     detach_link(&skeleton->links.trace_epoll_sys_exit);
+    detach_link(&skeleton->links.trace_epoll_wake_sys_enter);
+    detach_link(&skeleton->links.trace_epoll_wake_sys_exit);
+    detach_link(&skeleton->links.trace_epoll_signal_generate);
 }
 
 static int attach_named_uprobe(struct bpf_program *program,
@@ -827,6 +830,7 @@ int main(int argc, char **argv)
         .epoll_token_map_fd = -1,
         .epoll_fd_generation_map_fd = -1,
         .epoll_instance_stats_map_fd = -1,
+        .epoll_fd_metadata_map_fd = -1,
         .target_pidfd = -1,
         .diagnostic_interval_ms = 1000,
         .epoll_top = 5,
@@ -1643,6 +1647,12 @@ trace_target_ready:
     skeleton->rodata->cw_epoll_cfg.pwait_syscall_nr = -1;
     skeleton->rodata->cw_epoll_cfg.pwait2_syscall_nr = -1;
     skeleton->rodata->cw_epoll_cfg.ctl_syscall_nr = -1;
+    skeleton->rodata->cw_epoll_cfg.eventfd_syscall_nr = -1;
+    skeleton->rodata->cw_epoll_cfg.eventfd2_syscall_nr = -1;
+    skeleton->rodata->cw_epoll_cfg.timerfd_create_syscall_nr = -1;
+    skeleton->rodata->cw_epoll_cfg.timerfd_settime_syscall_nr = -1;
+    skeleton->rodata->cw_epoll_cfg.signalfd_syscall_nr = -1;
+    skeleton->rodata->cw_epoll_cfg.signalfd4_syscall_nr = -1;
 #ifdef SYS_epoll_wait
     skeleton->rodata->cw_epoll_cfg.wait_syscall_nr = SYS_epoll_wait;
 #endif
@@ -1654,6 +1664,26 @@ trace_target_ready:
 #endif
 #ifdef SYS_epoll_ctl
     skeleton->rodata->cw_epoll_cfg.ctl_syscall_nr = SYS_epoll_ctl;
+#endif
+#ifdef SYS_eventfd
+    skeleton->rodata->cw_epoll_cfg.eventfd_syscall_nr = SYS_eventfd;
+#endif
+#ifdef SYS_eventfd2
+    skeleton->rodata->cw_epoll_cfg.eventfd2_syscall_nr = SYS_eventfd2;
+#endif
+#ifdef SYS_timerfd_create
+    skeleton->rodata->cw_epoll_cfg.timerfd_create_syscall_nr =
+        SYS_timerfd_create;
+#endif
+#ifdef SYS_timerfd_settime
+    skeleton->rodata->cw_epoll_cfg.timerfd_settime_syscall_nr =
+        SYS_timerfd_settime;
+#endif
+#ifdef SYS_signalfd
+    skeleton->rodata->cw_epoll_cfg.signalfd_syscall_nr = SYS_signalfd;
+#endif
+#ifdef SYS_signalfd4
+    skeleton->rodata->cw_epoll_cfg.signalfd4_syscall_nr = SYS_signalfd4;
 #endif
     configure_epoll_io_syscalls(
         &skeleton->rodata->cw_epoll_cfg);
@@ -1720,6 +1750,15 @@ trace_target_ready:
         if (!error)
             error = bpf_program__set_autoload(
                 skeleton->progs.trace_epoll_sys_exit, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_epoll_wake_sys_enter, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_epoll_wake_sys_exit, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_epoll_signal_generate, false);
         if (error) {
             fprintf(stderr,
                     "failed to disable epoll programs: %s\n",
@@ -1858,6 +1897,8 @@ trace_target_ready:
         bpf_map__fd(skeleton->maps.epoll_fd_generations);
     output.epoll_instance_stats_map_fd =
         bpf_map__fd(skeleton->maps.epoll_instance_stats);
+    output.epoll_fd_metadata_map_fd =
+        bpf_map__fd(skeleton->maps.epoll_fd_metadata);
 
     if (output.io_uring_mode) {
         error = attach_raw_tracepoint(
@@ -1939,6 +1980,16 @@ trace_target_ready:
                 &skeleton->links.trace_epoll_sys_exit, "sys_exit");
         if (!error)
             error = attach_raw_tracepoint(
+                skeleton->progs.trace_epoll_wake_sys_enter,
+                &skeleton->links.trace_epoll_wake_sys_enter,
+                "sys_enter");
+        if (!error)
+            error = attach_raw_tracepoint(
+                skeleton->progs.trace_epoll_wake_sys_exit,
+                &skeleton->links.trace_epoll_wake_sys_exit,
+                "sys_exit");
+        if (!error)
+            error = attach_raw_tracepoint(
                 skeleton->progs.trace_sched_switch,
                 &skeleton->links.trace_sched_switch, "sched_switch");
         if (!error)
@@ -1947,6 +1998,10 @@ trace_target_ready:
                 &skeleton->links.trace_sched_wakeup, "sched_wakeup");
         if (error)
             goto cleanup;
+        attach_optional_raw_tracepoint(
+            skeleton->progs.trace_epoll_signal_generate,
+            &skeleton->links.trace_epoll_signal_generate,
+            "signal_generate");
         cw_epoll_seed_existing(&output);
     } else if (output.show_attribution) {
         error = attach_raw_tracepoint(

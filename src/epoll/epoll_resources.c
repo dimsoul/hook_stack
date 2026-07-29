@@ -47,6 +47,56 @@ struct seed_pass_result {
     uint32_t failures;
 };
 
+static void seed_wake_fd(
+    struct output_options *output, uint32_t pid,
+    int fd, const char *target)
+{
+    struct cw_epoll_fd_key key = {
+        .pid = pid,
+        .fd = fd,
+    };
+    struct cw_epoll_fd_metadata metadata = {
+        .clock_id = -1,
+    };
+    char path[80];
+    char line[256];
+    FILE *file;
+
+    if (output->epoll_fd_metadata_map_fd < 0)
+        return;
+    if (!strcmp(target, "anon_inode:[eventfd]")) {
+        metadata.kind = CW_EPOLL_WAKE_EVENTFD;
+    } else if (!strcmp(target, "anon_inode:[timerfd]")) {
+        metadata.kind = CW_EPOLL_WAKE_TIMERFD;
+    } else if (!strcmp(target, "anon_inode:[signalfd]")) {
+        metadata.kind = CW_EPOLL_WAKE_SIGNALFD;
+    } else {
+        return;
+    }
+    snprintf(path, sizeof(path), "/proc/%d/fdinfo/%d",
+             (int)output->target_pid, fd);
+    file = fopen(path, "r");
+    if (file) {
+        while (fgets(line, sizeof(line), file)) {
+            if (metadata.kind == CW_EPOLL_WAKE_SIGNALFD) {
+                unsigned long long mask;
+
+                if (sscanf(line, "sigmask: %llx", &mask) == 1)
+                    metadata.signal_mask = (uint64_t)mask;
+            } else if (metadata.kind == CW_EPOLL_WAKE_TIMERFD) {
+                int clock_id;
+
+                if (sscanf(line, "clockid: %d", &clock_id) == 1)
+                    metadata.clock_id = clock_id;
+            }
+        }
+        fclose(file);
+    }
+    bpf_map_update_elem(
+        output->epoll_fd_metadata_map_fd,
+        &key, &metadata, BPF_NOEXIST);
+}
+
 static int seed_registration(
     struct output_options *output, uint32_t pid,
     int epoll_fd, int fd, uint32_t events, uint64_t data,
@@ -240,6 +290,9 @@ static bool seed_existing_pass(
         if (length < 0)
             continue;
         target[length] = '\0';
+        seed_wake_fd(
+            output, (uint32_t)output->target_pid,
+            (int)fd, target);
         if (!strcmp(target, "anon_inode:[eventpoll]"))
             seed_epoll_fd(
                 output, (uint32_t)output->target_pid, (int)fd,
@@ -257,7 +310,8 @@ void cw_epoll_seed_existing(struct output_options *output)
         output->epoll_registration_map_fd < 0 ||
         output->epoll_token_map_fd < 0 ||
         output->epoll_resource_stats_map_fd < 0 ||
-        output->epoll_fd_generation_map_fd < 0)
+        output->epoll_fd_generation_map_fd < 0 ||
+        output->epoll_fd_metadata_map_fd < 0)
         return;
     output->epoll_bootstrap_scans = 0;
     output->epoll_bootstrap_fds = 0;

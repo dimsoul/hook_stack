@@ -1708,5 +1708,6 @@ int trace_sched_waking(struct bpf_raw_tracepoint_args *ctx)
 
 #include "io_uring/io_uring.bpf.progs.h"
 #include "epoll/epoll.bpf.progs.h"
+#include "epoll/epoll_wake.bpf.progs.h"
 
 char LICENSE[] SEC("license") = "GPL";

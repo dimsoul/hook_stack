@@ -70,6 +70,28 @@ struct cw_epoll_io_state {
     __u32 reserved;
 };
 
+enum cw_epoll_wake_sys_action {
+    CW_EPOLL_WAKE_SYS_NONE,
+    CW_EPOLL_WAKE_SYS_CREATE_EVENTFD,
+    CW_EPOLL_WAKE_SYS_CREATE_TIMERFD,
+    CW_EPOLL_WAKE_SYS_CREATE_SIGNALFD,
+    CW_EPOLL_WAKE_SYS_TIMERFD_SETTIME,
+    CW_EPOLL_WAKE_SYS_EVENTFD_WRITE,
+    CW_EPOLL_WAKE_SYS_CLOSE,
+    CW_EPOLL_WAKE_SYS_DUP,
+};
+
+struct cw_epoll_wake_sys_state {
+    struct cw_epoll_wake_source source;
+    __u64 signal_mask;
+    __u32 pid;
+    __u32 action;
+    __s32 fd;
+    __s32 target_fd;
+    __s32 clock_id;
+    __u32 reserved;
+};
+
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 16384);
@@ -170,5 +192,54 @@ struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 512 * 1024);
 } epoll_dispatch_events SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 32768);
+    __type(key, struct cw_epoll_fd_key);
+    __type(value, struct cw_epoll_fd_metadata);
+} epoll_fd_metadata SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 32768);
+    __type(key, struct cw_epoll_fd_key);
+    __type(value, struct cw_epoll_wake_source);
+} epoll_wake_pending SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 16384);
+    __type(key, __u64);
+    __type(value, struct cw_epoll_wake_sys_state);
+} epoll_wake_sys_states SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 4096);
+    __type(key, __u32);
+    __type(value, struct cw_epoll_wake_source);
+} epoll_signal_pending SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} epoll_target_global SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 16384);
+    __type(key, __u64);
+    __type(value, struct cw_epoll_wait_state);
+} epoll_wake_wait_states SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 32768);
+    __type(key, struct cw_epoll_dispatch_key);
+    __type(value, struct cw_epoll_wake_source);
+} epoll_dispatch_wakes SEC(".maps");
 
 #endif

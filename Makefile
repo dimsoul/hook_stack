@@ -66,6 +66,7 @@ $(BPF_OBJECT): src/callweave.bpf.c \
 		src/core/core_config.h src/async/async_config.h \
 		src/epoll/epoll_config.h src/epoll/epoll_shared.h \
 		src/epoll/epoll.bpf.maps.h src/epoll/epoll.bpf.progs.h \
+		src/epoll/epoll_wake.bpf.progs.h \
 		src/io_uring/io_uring_config.h \
 		src/io_uring/io_uring_shared.h \
 		src/io_uring/io_uring.bpf.maps.h \

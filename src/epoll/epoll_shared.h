@@ -49,6 +49,54 @@ enum cw_epoll_wait_kind {
     CW_EPOLL_PWAIT2,
 };
 
+enum cw_epoll_wake_kind {
+    CW_EPOLL_WAKE_NONE,
+    CW_EPOLL_WAKE_EVENTFD,
+    CW_EPOLL_WAKE_TIMERFD,
+    CW_EPOLL_WAKE_SIGNALFD,
+};
+
+enum cw_epoll_wake_action {
+    CW_EPOLL_WAKE_ACTION_NONE,
+    CW_EPOLL_WAKE_ACTION_EVENTFD_WRITE,
+    CW_EPOLL_WAKE_ACTION_TIMERFD_ARM,
+    CW_EPOLL_WAKE_ACTION_SIGNAL_SEND,
+};
+
+enum cw_epoll_wake_flags {
+    CW_EPOLL_WAKE_LATENCY_VALID = 1U << 0,
+    CW_EPOLL_WAKE_TIMER_ABSTIME = 1U << 1,
+    CW_EPOLL_WAKE_TIMER_DISARMED = 1U << 2,
+};
+
+struct cw_epoll_wake_source {
+    __u64 first_timestamp_ns;
+    __u64 timestamp_ns;
+    __u64 latency_ns;
+    __u64 operations;
+    __u64 value;
+    __u64 timer_initial_ns;
+    __u64 timer_interval_ns;
+    __u32 kind;
+    __u32 action;
+    __u32 flags;
+    __u32 signal_number;
+    __u32 source_pid;
+    __u32 source_tid;
+    __u32 source_global_pid;
+    __u32 source_global_tid;
+    __s32 stack_id;
+    __u32 reserved;
+    char comm[CW_EPOLL_COMM_LEN];
+};
+
+struct cw_epoll_fd_metadata {
+    __u64 signal_mask;
+    __u32 kind;
+    __s32 clock_id;
+    struct cw_epoll_wake_source timer_source;
+};
+
 struct cw_epoll_ready {
     __u64 data;
     __s32 fd;
@@ -98,6 +146,11 @@ struct cw_epoll_counters {
     __u64 fd_closes;
     __u64 fd_duplications;
     __u64 fd_reuses;
+    __u64 wake_ready;
+    __u64 wake_attributed;
+    __u64 eventfd_ready;
+    __u64 timerfd_ready;
+    __u64 signalfd_ready;
 };
 
 struct cw_epoll_loop_key {
@@ -172,6 +225,14 @@ struct cw_epoll_resource_stats {
     __u64 potential_oneshot_missing_rearm;
     __s32 dispatch_stack_id;
     __u32 reserved;
+    __u64 wake_ready;
+    __u64 wake_attributed;
+    __u64 wake_operations;
+    __u64 wake_last_source_timestamp_ns;
+    __u64 wake_latency_samples;
+    __u64 wake_total_latency_ns;
+    __u64 wake_maximum_latency_ns;
+    struct cw_epoll_wake_source last_wake;
 };
 
 struct cw_epoll_token_key {
@@ -218,6 +279,7 @@ struct cw_epoll_dispatch_item {
     __s32 last_result;
     __s32 stack_id;
     __u32 io_errors;
+    struct cw_epoll_wake_source wake;
 };
 
 struct cw_epoll_dispatch_event {

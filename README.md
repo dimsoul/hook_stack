@@ -49,8 +49,8 @@ the target application.
 - Diagnose epoll event loops by wait batch, ready-to-I/O dispatch latency,
   ready-to-next-wait scheduler attribution, FD lifetime, ONESHOT rearm,
   multi-waiter fairness, timeout/error behavior, full-batch pressure,
-  EPOLLET drain evidence, call site, and monitored socket/eventfd/timerfd
-  resources.
+  EPOLLET drain evidence, call site, monitored resources, and eventfd,
+  timerfd, and signalfd wake-source attribution.
 - Pair nested and recursive calls independently for each thread.
 - Stop cleanly on `SIGINT` or `SIGTERM`.
 
@@ -373,12 +373,13 @@ invoking user's UID, GID, and supplementary groups before `exec`. The target
 is supervised as part of the capture and is stopped when tracing ends.
 
 The tracer observes `epoll_wait`, `epoll_pwait`, and `epoll_pwait2`, successful
-`epoll_ctl` changes, and the common read/write/socket I/O syscalls performed
-after a ready return. Each detailed wait record contains the event-loop
-thread, epoll FD, wait duration, return value, ready-event flags,
-application-defined `event.data`, and the corresponding monitored FD when it
-can be recovered. A dispatch record then connects that ready FD to the first
-matching I/O operation on the same event-loop thread.
+`epoll_ctl` changes, the common read/write/socket I/O syscalls performed after
+a ready return, and the producers of eventfd, timerfd, and signalfd readiness.
+Each detailed wait record contains the event-loop thread, epoll FD, wait
+duration, return value, ready-event flags, application-defined `event.data`,
+and the corresponding monitored FD when it can be recovered. A dispatch
+record then connects that ready FD to the first matching I/O operation on the
+same event-loop thread.
 
 The final summary is computed from BPF aggregates and therefore includes
 waits omitted by the detail threshold. It reports:
@@ -399,7 +400,9 @@ waits omitted by the detail threshold. It reports:
   ready-event distribution, and EPOLLEXCLUSIVE observations;
 - interest and observed event masks;
 - socket endpoints, Unix sockets, eventfd, timerfd, pipes, and file paths when
-  `/proc/PID` exposes them.
+  `/proc/PID` exposes them;
+- eventfd writers, timerfd arms, and signalfd signal senders, including their
+  source thread, user stack, source-to-ready latency, and attribution coverage.
 
 Long waits are not treated as slow work: an event loop normally blocks in
 epoll while idle. The diagnosis instead highlights repeated full batches,
@@ -453,6 +456,9 @@ Use the report as follows:
 | I/O fails after readiness | Per-loop or per-resource I/O errors | Inspect FD close/reuse races, connection lifecycle, and the reported handler stack. |
 | One resource dominates the loop | High READY/HANDLED counts for one FD | Investigate a hot connection, starvation, unfair per-connection work, or a continuously ready FD. |
 | The responsible source code is unknown | Ready-handler call site | Follow the first `read`, `recv`, `accept`, or related I/O stack to the handler implementation. |
+| An eventfd wakes the loop unexpectedly | `eventfd` latest source and writer stack | Find the code path that wrote the counter, then inspect repeated or bursty writes. |
+| A timer callback runs late | High `timerfd` schedule-to-ready latency | Check event-loop starvation, CPU contention, or an overloaded ready queue rather than blaming `epoll_wait`. |
+| A signal-driven event appears unexpectedly | `signalfd` signal number, sender thread, and stack | Locate the `kill`, `tgkill`, or equivalent sender and verify signal routing and masking. |
 
 For example, high dispatch latency on one socket together with an EPOLLET
 warning means the socket was returned by epoll, the loop did not reach its
@@ -465,6 +471,59 @@ not automatically as an error. Pure user-space callback work that performs no
 I/O cannot yet be assigned an exact callback duration; runtime adapters for
 libuv, libevent, Boost.Asio, or application-specific loops are needed for that
 boundary.
+
+#### Wake-source attribution
+
+Wake-source attribution is enabled automatically with `--epoll`; no additional
+option is required. It extends the normal ready-to-handler path in the opposite
+direction:
+
+```text
+eventfd write / timerfd arm / signal send
+    -> monitored FD becomes ready
+    -> epoll returns it
+    -> event-loop thread performs I/O
+```
+
+For eventfd, Callweave records successful `write` calls made by the traced
+process, combines writes that occur before the next readiness return, and
+reports their count, accumulated value, latest writer, and writer stack. A
+write from another process can make the FD ready, but generic `-p PID` tracing
+does not currently capture that external writer; such a readiness is retained
+and labeled unattributed instead of being assigned to the wrong source.
+
+For timerfd, Callweave records the latest successful `timerfd_settime`, its
+initial and interval values, and the arm stack. Relative timers also report
+schedule-to-ready lateness. One periodic arm may produce many ready events, so
+`SRC OPS` counts distinct arm operations rather than expirations. Absolute
+timers keep the arm information but do not claim a comparable lateness because
+their clock domain may not match BPF monotonic time.
+
+For signalfd, Callweave reads the monitored signal mask and associates a ready
+event with the latest matching kernel `signal_generate` event for the target
+process. The report includes the signal number and sender stack when the signal
+originated in user space. Under a burst of different pending signals, this is a
+conservative latest-source association, not a reconstruction of the kernel's
+entire pending-signal queue.
+
+The `[9] Wake-source attribution` summary reports READY, MATCHED, source
+operation count, average/maximum source-to-ready latency, and the latest source
+stack for each special FD. `MATCHED / READY` is the attribution coverage; a
+low ratio usually means attachment began after a source operation, the source
+came from outside the traced process, or a kernel-originated event has no
+user-space producer stack.
+
+Current special-FD metadata is restored from `/proc/PID/fdinfo` during late
+attachment, so Callweave can still identify eventfd, timerfd, and signalfd
+resources that already exist. It cannot reconstruct producer operations or
+stacks that completed before BPF attachment.
+
+The bundled test exercises all three sources:
+
+```sh
+sudo ./callweave --epoll --duration 10 \
+  --exec ./test/trace_epoll_test -- 60
+```
 
 #### Anonymous kernel resources
 

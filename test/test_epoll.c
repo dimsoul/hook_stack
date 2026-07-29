@@ -13,6 +13,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/timerfd.h>
@@ -26,6 +27,7 @@ struct test_context {
     int epoll_fd;
     int event_fd;
     int timer_fd;
+    int signal_fd;
     int socket_fd;
     int bad_socket_fd;
     int oneshot_fd;
@@ -98,6 +100,15 @@ static void consume_counter(int fd)
         fprintf(stderr, "counter read failed: %s\n", strerror(errno));
 }
 
+static void consume_signal(int fd)
+{
+    struct signalfd_siginfo information;
+
+    if (read(fd, &information, sizeof(information)) < 0 &&
+        errno != EAGAIN)
+        fprintf(stderr, "signalfd read failed: %s\n", strerror(errno));
+}
+
 static void consume_socket(int fd)
 {
     char first[32];
@@ -166,6 +177,8 @@ static void handle_ready(
     if (fd == context->event_fd || fd == context->timer_fd ||
         fd == context->reused_fd)
         consume_counter(fd);
+    else if (fd == context->signal_fd)
+        consume_signal(fd);
     else if (fd == context->socket_fd)
         consume_socket(fd);
     else if (fd == context->bad_socket_fd) {
@@ -245,11 +258,13 @@ int main(int argc, char **argv)
     int epoll_fd = -1;
     int event_fd = -1;
     int timer_fd = -1;
+    int signal_fd = -1;
     int reused_fd = -1;
     char *end = NULL;
     pthread_t waiter_thread;
     bool waiter_started = false;
     struct test_context context;
+    sigset_t signal_mask;
 
     {
         int argument;
@@ -306,11 +321,20 @@ int main(int argc, char **argv)
     fflush(stdout);
     sleep(2);
 
+    sigemptyset(&signal_mask);
+    sigaddset(&signal_mask, SIGUSR1);
+    if (pthread_sigmask(SIG_BLOCK, &signal_mask, NULL)) {
+        fprintf(stderr, "failed to block SIGUSR1\n");
+        goto failure;
+    }
     epoll_fd = epoll_create1(EPOLL_CLOEXEC);
     event_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     timer_fd = timerfd_create(
         CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    signal_fd = signalfd(
+        -1, &signal_mask, SFD_NONBLOCK | SFD_CLOEXEC);
     if (epoll_fd < 0 || event_fd < 0 || timer_fd < 0 ||
+        signal_fd < 0 ||
         socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK |
                    SOCK_CLOEXEC, 0, sockets) ||
         socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK |
@@ -321,6 +345,7 @@ int main(int argc, char **argv)
         timerfd_settime(timer_fd, 0, &timer, NULL) ||
         add_to_epoll(epoll_fd, event_fd, EPOLLIN) ||
         add_to_epoll(epoll_fd, timer_fd, EPOLLIN) ||
+        add_to_epoll(epoll_fd, signal_fd, EPOLLIN) ||
         add_to_epoll(
             epoll_fd, sockets[0],
             EPOLLIN | EPOLLRDHUP | EPOLLET) ||
@@ -338,6 +363,7 @@ int main(int argc, char **argv)
         .epoll_fd = epoll_fd,
         .event_fd = event_fd,
         .timer_fd = timer_fd,
+        .signal_fd = signal_fd,
         .socket_fd = sockets[0],
         .bad_socket_fd = bad_sockets[0],
         .oneshot_fd = oneshot_sockets[0],
@@ -345,8 +371,8 @@ int main(int argc, char **argv)
         .bad_oneshot = demonstrate_bad_oneshot,
     };
     printf("epoll resources: epfd=%d eventfd=%d timerfd=%d "
-           "socket=%d oneshot=%d bad-et=%d reused=%d\n",
-           epoll_fd, event_fd, timer_fd, sockets[0],
+           "signalfd=%d socket=%d oneshot=%d bad-et=%d reused=%d\n",
+           epoll_fd, event_fd, timer_fd, signal_fd, sockets[0],
            oneshot_sockets[0], bad_sockets[0], context.reused_fd);
     fflush(stdout);
     if (demonstrate_multi_waiter) {
@@ -430,6 +456,11 @@ int main(int argc, char **argv)
                 goto failure;
             }
         }
+        if (iteration % 7 == 1 && kill(getpid(), SIGUSR1)) {
+            fprintf(stderr, "signal trigger failed: %s\n",
+                    strerror(errno));
+            goto failure;
+        }
         ready = wait_for_events(epoll_fd, events, iteration);
         if (ready < 0) {
             if (errno == EINTR)
@@ -465,6 +496,7 @@ int main(int argc, char **argv)
     close(sockets[1]);
     close(sockets[0]);
     close(timer_fd);
+    close(signal_fd);
     close(event_fd);
     close(epoll_fd);
     return 0;
@@ -489,6 +521,8 @@ failure:
         close(sockets[0]);
     if (timer_fd >= 0)
         close(timer_fd);
+    if (signal_fd >= 0)
+        close(signal_fd);
     if (event_fd >= 0)
         close(event_fd);
     if (epoll_fd >= 0)

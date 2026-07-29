@@ -72,6 +72,34 @@ const char *cw_epoll_io_operation_name(uint32_t operation)
     }
 }
 
+const char *cw_epoll_wake_kind_name(uint32_t kind)
+{
+    switch (kind) {
+    case CW_EPOLL_WAKE_EVENTFD:
+        return "eventfd";
+    case CW_EPOLL_WAKE_TIMERFD:
+        return "timerfd";
+    case CW_EPOLL_WAKE_SIGNALFD:
+        return "signalfd";
+    default:
+        return "none";
+    }
+}
+
+const char *cw_epoll_wake_action_name(uint32_t action)
+{
+    switch (action) {
+    case CW_EPOLL_WAKE_ACTION_EVENTFD_WRITE:
+        return "write";
+    case CW_EPOLL_WAKE_ACTION_TIMERFD_ARM:
+        return "arm";
+    case CW_EPOLL_WAKE_ACTION_SIGNAL_SEND:
+        return "signal";
+    default:
+        return "none";
+    }
+}
+
 bool cw_epoll_resource_single_read(const char *resource)
 {
     return resource &&
@@ -371,6 +399,50 @@ static uint64_t dispatch_latency(
     return event->return_to_wait_ns;
 }
 
+static int write_wake_json(
+    FILE *stream, const struct cw_epoll_wake_source *wake)
+{
+    if (!wake->kind)
+        return fputs("null", stream) == EOF ? -1 : 0;
+    if (fprintf(
+            stream,
+            "{\"kind\":\"%s\",\"action\":\"%s\","
+            "\"attributed\":%s,\"first_timestamp_ns\":%llu,"
+            "\"timestamp_ns\":%llu,\"latency_valid\":%s,"
+            "\"latency_ns\":%llu,\"operations\":%llu,"
+            "\"value\":%llu,\"timer_initial_ns\":%llu,"
+            "\"timer_interval_ns\":%llu,\"timer_abstime\":%s,"
+            "\"timer_disarmed\":%s,\"signal_number\":%u,"
+            "\"source_pid\":%u,\"source_tid\":%u,"
+            "\"source_global_pid\":%u,"
+            "\"source_global_tid\":%u,\"stack_id\":%d,\"comm\":",
+            cw_epoll_wake_kind_name(wake->kind),
+            cw_epoll_wake_action_name(wake->action),
+            wake->action ? "true" : "false",
+            (unsigned long long)wake->first_timestamp_ns,
+            (unsigned long long)wake->timestamp_ns,
+            wake->flags & CW_EPOLL_WAKE_LATENCY_VALID ?
+                "true" : "false",
+            (unsigned long long)wake->latency_ns,
+            (unsigned long long)wake->operations,
+            (unsigned long long)wake->value,
+            (unsigned long long)wake->timer_initial_ns,
+            (unsigned long long)wake->timer_interval_ns,
+            wake->flags & CW_EPOLL_WAKE_TIMER_ABSTIME ?
+                "true" : "false",
+            wake->flags & CW_EPOLL_WAKE_TIMER_DISARMED ?
+                "true" : "false",
+            wake->signal_number,
+            wake->source_pid, wake->source_tid,
+            wake->source_global_pid, wake->source_global_tid,
+            wake->stack_id) < 0 ||
+        cw_epoll_write_json_string(
+            stream, wake->comm, sizeof(wake->comm)) ||
+        fputc('}', stream) == EOF)
+        return -1;
+    return 0;
+}
+
 static int write_dispatch_json_item(
     struct output_options *output,
     const struct cw_epoll_dispatch_event *event,
@@ -484,6 +556,8 @@ static int write_dispatch_json_item(
             et_warning ? "true" : "false") < 0 ||
         cw_epoll_write_json_string(
             stream, resource, strlen(resource)) ||
+        fputs(",\"wake\":", stream) == EOF ||
+        write_wake_json(stream, &item->wake) ||
         fputs(",\"status\":", stream) == EOF ||
         cw_epoll_write_json_string(
             stream,
@@ -494,6 +568,42 @@ static int write_dispatch_json_item(
         fflush(stream))
         return -1;
     return 0;
+}
+
+static void print_wake_source(
+    const struct cw_epoll_wake_source *wake)
+{
+    if (!wake->kind)
+        return;
+    printf("  wake    : %s", cw_epoll_wake_kind_name(wake->kind));
+    if (!wake->action) {
+        printf(" source unavailable "
+               "(pre-attach, external producer, or unmatched signal)\n");
+        return;
+    }
+    printf(" %s by PID %u/TID %u (%.*s)",
+           cw_epoll_wake_action_name(wake->action),
+           wake->source_pid, wake->source_tid,
+           (int)sizeof(wake->comm), wake->comm);
+    if (wake->action == CW_EPOLL_WAKE_ACTION_EVENTFD_WRITE)
+        printf(" writes=%llu value=%llu",
+               (unsigned long long)wake->operations,
+               (unsigned long long)wake->value);
+    else if (wake->action == CW_EPOLL_WAKE_ACTION_TIMERFD_ARM) {
+        print_interval("initial", wake->timer_initial_ns);
+        print_interval("interval", wake->timer_interval_ns);
+        if (wake->flags & CW_EPOLL_WAKE_TIMER_ABSTIME)
+            printf(" absolute");
+    } else if (wake->action == CW_EPOLL_WAKE_ACTION_SIGNAL_SEND)
+        printf(" signo=%u count=%llu",
+               wake->signal_number,
+               (unsigned long long)wake->operations);
+    if (wake->flags & CW_EPOLL_WAKE_LATENCY_VALID)
+        print_interval(
+            wake->action == CW_EPOLL_WAKE_ACTION_TIMERFD_ARM ?
+                "schedule->ready" : "source->ready",
+            wake->latency_ns);
+    putchar('\n');
 }
 
 static void print_dispatch_item(
@@ -526,6 +636,7 @@ static void print_dispatch_item(
     if (resource[0])
         printf("\n  resource: %s", resource);
     putchar('\n');
+    print_wake_source(&item->wake);
     printf("  cycle   :");
     print_interval("total", event->return_to_wait_ns);
     print_interval("off-CPU", event->cycle_offcpu_ns);

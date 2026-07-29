@@ -91,6 +91,7 @@ struct output_options {
     int epoll_token_map_fd;
     int epoll_fd_generation_map_fd;
     int epoll_instance_stats_map_fd;
+    int epoll_fd_metadata_map_fd;
     uint32_t epoll_bootstrap_scans;
     uint32_t epoll_bootstrap_fds;
     uint32_t epoll_bootstrap_registrations;
