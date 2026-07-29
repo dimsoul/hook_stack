@@ -13,6 +13,8 @@
 #include <linux/types.h>
 
 #include "core/capture_control.h"
+#include "core/fd_resources.h"
+#include "epoll/epoll_shared.h"
 #include "io_uring/io_uring_shared.h"
 
 #define MAX_STACK_DEPTH 128
@@ -62,11 +64,6 @@ struct map_list {
     size_t capacity;
 };
 
-struct io_uring_fd_resource {
-    int fd;
-    char path[PATH_MAX];
-};
-
 struct output_options {
     struct cw_capture_control *control;
     bool show_return_value;
@@ -86,6 +83,20 @@ struct output_options {
     int io_uring_ring_stats_map_fd;
     int io_uring_failure_map_fd;
     int io_uring_link_map_fd;
+    int epoll_stack_map_fd;
+    int epoll_counters_map_fd;
+    int epoll_loop_stats_map_fd;
+    int epoll_resource_stats_map_fd;
+    int epoll_registration_map_fd;
+    int epoll_token_map_fd;
+    int epoll_fd_generation_map_fd;
+    int epoll_instance_stats_map_fd;
+    uint32_t epoll_bootstrap_scans;
+    uint32_t epoll_bootstrap_fds;
+    uint32_t epoll_bootstrap_registrations;
+    uint32_t epoll_bootstrap_conflicts;
+    uint32_t epoll_bootstrap_failures;
+    bool epoll_started_target;
     const char *io_uring_callback_name;
     const struct async_hop_config *async_hops;
     size_t async_hop_count;
@@ -107,14 +118,16 @@ struct output_options {
     bool io_uring_errors_only;
     uint64_t io_uring_min_latency_ns;
     uint32_t io_uring_top;
+    bool epoll_mode;
+    uint64_t epoll_min_wait_ns;
+    uint64_t epoll_min_dispatch_ns;
+    uint32_t epoll_top;
     uint32_t diagnostic_interval_ms;
     uint64_t diagnostic_last_ns;
     struct async_hop_stats diagnostic_previous[MAX_ASYNC_HOPS];
-    struct map_list *io_uring_maps;
-    struct io_uring_fd_resource *io_uring_resources;
-    size_t io_uring_resource_count;
-    size_t io_uring_resource_capacity;
-    uint32_t io_uring_maps_pid;
+    struct map_list *target_maps;
+    struct cw_fd_cache fd_resources;
+    uint32_t target_maps_pid;
     pid_t target_pid;
     int target_pidfd;
     bool target_exited;

@@ -3,6 +3,8 @@
 #include "vmlinux.h"
 #include "core/core_config.h"
 #include "async/async_config.h"
+#include "epoll/epoll_config.h"
+#include "epoll/epoll_shared.h"
 #include "io_uring/io_uring_config.h"
 #include "io_uring/io_uring_shared.h"
 #include <bpf/bpf_core_read.h>
@@ -232,6 +234,7 @@ _Static_assert(sizeof(struct stack_trace_event) == 2544,
 const volatile struct cw_target_config cw_target_cfg = {0};
 const volatile struct cw_trace_config cw_trace_cfg = {0};
 const volatile struct cw_async_config cw_async_cfg = {0};
+const volatile struct cw_epoll_config cw_epoll_cfg = {0};
 const volatile struct cw_io_uring_config cw_io_uring_cfg = {0};
 
 struct {
@@ -352,6 +355,7 @@ struct {
 } async_worker_stats SEC(".maps");
 
 #include "io_uring/io_uring.bpf.maps.h"
+#include "epoll/epoll.bpf.maps.h"
 
 static __always_inline int get_process_info(u64 *pid_tgid, u32 *global_pid,
                                             u32 *global_tid, u32 *pid,
@@ -1176,6 +1180,44 @@ static __always_inline void add_async_offcpu_interval(
     thread->wakeup_ns = 0;
 }
 
+static __always_inline void epoll_switch_out(u64 pid_tgid, u64 now)
+{
+    struct cw_epoll_dispatch_batch *batch;
+
+    if (!cw_epoll_cfg.enabled)
+        return;
+    batch = bpf_map_lookup_elem(
+        &epoll_dispatch_batches, &pid_tgid);
+    if (!batch)
+        return;
+    batch->offcpu_start_ns = now;
+    batch->wakeup_ns = 0;
+}
+
+static __always_inline void epoll_switch_in(u64 pid_tgid, u64 now)
+{
+    struct cw_epoll_dispatch_batch *batch;
+    u64 offcpu_ns;
+
+    if (!cw_epoll_cfg.enabled)
+        return;
+    batch = bpf_map_lookup_elem(
+        &epoll_dispatch_batches, &pid_tgid);
+    if (!batch || !batch->offcpu_start_ns ||
+        now <= batch->offcpu_start_ns)
+        return;
+    offcpu_ns = now - batch->offcpu_start_ns;
+    batch->offcpu_ns += offcpu_ns;
+    if (batch->wakeup_ns >= batch->offcpu_start_ns &&
+        batch->wakeup_ns <= now) {
+        batch->blocked_ns +=
+            batch->wakeup_ns - batch->offcpu_start_ns;
+        batch->runqueue_ns += now - batch->wakeup_ns;
+    }
+    batch->offcpu_start_ns = 0;
+    batch->wakeup_ns = 0;
+}
+
 static __always_inline int is_futex_wait_operation(u32 operation)
 {
     return operation == FUTEX_WAIT || operation == FUTEX_WAIT_BITSET;
@@ -1307,7 +1349,8 @@ int trace_sys_exit(struct bpf_raw_tracepoint_args *ctx)
     u64 now;
 
     (void)ctx;
-    if (!cw_trace_cfg.attribution_enabled)
+    if (!cw_trace_cfg.attribution_enabled &&
+        !cw_epoll_cfg.enabled)
         return 0;
     active = bpf_map_lookup_elem(&futex_waits, &pid_tgid);
     if (!active)
@@ -1541,29 +1584,39 @@ int trace_sched_switch(struct bpf_raw_tracepoint_args *ctx)
     u64 now;
     u64 pid_tgid;
 
-    if (!cw_trace_cfg.attribution_enabled)
+    if (!cw_trace_cfg.attribution_enabled &&
+        !cw_epoll_cfg.enabled)
         return 0;
 
     now = bpf_ktime_get_ns();
     pid_tgid = task_pid_tgid(prev);
-    thread = bpf_map_lookup_elem(&thread_states, &pid_tgid);
-    if (thread && thread->depth) {
-        thread->offcpu_start_ns = now;
-        thread->wakeup_ns = 0;
-    }
-    async_thread = bpf_map_lookup_elem(&async_target_threads, &pid_tgid);
-    if (async_thread && async_thread->depth) {
-        async_thread->offcpu_start_ns = now;
-        async_thread->wakeup_ns = 0;
+    epoll_switch_out(pid_tgid, now);
+    if (cw_trace_cfg.attribution_enabled) {
+        thread = bpf_map_lookup_elem(&thread_states, &pid_tgid);
+        if (thread && thread->depth) {
+            thread->offcpu_start_ns = now;
+            thread->wakeup_ns = 0;
+        }
+        async_thread = bpf_map_lookup_elem(
+            &async_target_threads, &pid_tgid);
+        if (async_thread && async_thread->depth) {
+            async_thread->offcpu_start_ns = now;
+            async_thread->wakeup_ns = 0;
+        }
     }
 
     pid_tgid = task_pid_tgid(next);
-    thread = bpf_map_lookup_elem(&thread_states, &pid_tgid);
-    if (thread && thread->depth)
-        add_offcpu_interval(pid_tgid, thread, now);
-    async_thread = bpf_map_lookup_elem(&async_target_threads, &pid_tgid);
-    if (async_thread && async_thread->depth)
-        add_async_offcpu_interval(pid_tgid, async_thread, now);
+    epoll_switch_in(pid_tgid, now);
+    if (cw_trace_cfg.attribution_enabled) {
+        thread = bpf_map_lookup_elem(&thread_states, &pid_tgid);
+        if (thread && thread->depth)
+            add_offcpu_interval(pid_tgid, thread, now);
+        async_thread = bpf_map_lookup_elem(
+            &async_target_threads, &pid_tgid);
+        if (async_thread && async_thread->depth)
+            add_async_offcpu_interval(
+                pid_tgid, async_thread, now);
+    }
 
     return 0;
 }
@@ -1612,18 +1665,31 @@ static __always_inline int record_task_wakeup(struct task_struct *task)
     struct async_target_thread *async_thread;
     u64 pid_tgid;
 
-    if (!cw_trace_cfg.attribution_enabled)
+    if (!cw_trace_cfg.attribution_enabled &&
+        !cw_epoll_cfg.enabled)
         return 0;
 
     pid_tgid = task_pid_tgid(task);
-    thread = bpf_map_lookup_elem(&thread_states, &pid_tgid);
-    if (thread && thread->depth && thread->offcpu_start_ns &&
-        !thread->wakeup_ns)
-        thread->wakeup_ns = bpf_ktime_get_ns();
-    async_thread = bpf_map_lookup_elem(&async_target_threads, &pid_tgid);
-    if (async_thread && async_thread->depth &&
-        async_thread->offcpu_start_ns && !async_thread->wakeup_ns)
-        async_thread->wakeup_ns = bpf_ktime_get_ns();
+    if (cw_epoll_cfg.enabled) {
+        struct cw_epoll_dispatch_batch *batch =
+            bpf_map_lookup_elem(
+                &epoll_dispatch_batches, &pid_tgid);
+
+        if (batch && batch->offcpu_start_ns &&
+            !batch->wakeup_ns)
+            batch->wakeup_ns = bpf_ktime_get_ns();
+    }
+    if (cw_trace_cfg.attribution_enabled) {
+        thread = bpf_map_lookup_elem(&thread_states, &pid_tgid);
+        if (thread && thread->depth && thread->offcpu_start_ns &&
+            !thread->wakeup_ns)
+            thread->wakeup_ns = bpf_ktime_get_ns();
+        async_thread = bpf_map_lookup_elem(
+            &async_target_threads, &pid_tgid);
+        if (async_thread && async_thread->depth &&
+            async_thread->offcpu_start_ns && !async_thread->wakeup_ns)
+            async_thread->wakeup_ns = bpf_ktime_get_ns();
+    }
     return 0;
 }
 
@@ -1641,5 +1707,6 @@ int trace_sched_waking(struct bpf_raw_tracepoint_args *ctx)
 }
 
 #include "io_uring/io_uring.bpf.progs.h"
+#include "epoll/epoll.bpf.progs.h"
 
 char LICENSE[] SEC("license") = "GPL";

@@ -1,0 +1,260 @@
+// SPDX-License-Identifier: MIT
+
+#ifndef CALLWEAVE_EPOLL_SHARED_H
+#define CALLWEAVE_EPOLL_SHARED_H
+
+#define CW_EPOLL_COMM_LEN 16
+#define CW_EPOLL_MAX_READY 16
+
+enum cw_epoll_io_operation {
+    CW_EPOLL_IO_NONE,
+    CW_EPOLL_IO_READ,
+    CW_EPOLL_IO_READV,
+    CW_EPOLL_IO_RECVFROM,
+    CW_EPOLL_IO_RECVMSG,
+    CW_EPOLL_IO_RECVMMSG,
+    CW_EPOLL_IO_WRITE,
+    CW_EPOLL_IO_WRITEV,
+    CW_EPOLL_IO_SENDTO,
+    CW_EPOLL_IO_SENDMSG,
+    CW_EPOLL_IO_SENDMMSG,
+    CW_EPOLL_IO_ACCEPT,
+    CW_EPOLL_IO_ACCEPT4,
+    CW_EPOLL_IO_CONNECT,
+    CW_EPOLL_IO_CLOSE,
+    CW_EPOLL_IO_DUP,
+    CW_EPOLL_IO_DUP2,
+    CW_EPOLL_IO_DUP3,
+    CW_EPOLL_IO_FCNTL_DUP,
+    CW_EPOLL_IO_SPLICE,
+};
+
+enum cw_epoll_dispatch_flags {
+    CW_EPOLL_DISPATCH_CONSUMED = 1U << 0,
+    CW_EPOLL_DISPATCH_EAGAIN = 1U << 1,
+    CW_EPOLL_DISPATCH_SHORT_READ = 1U << 2,
+    CW_EPOLL_DISPATCH_EOF = 1U << 3,
+    CW_EPOLL_DISPATCH_CLOSED = 1U << 4,
+    CW_EPOLL_DISPATCH_REARMED = 1U << 5,
+    CW_EPOLL_DISPATCH_ET_CANDIDATE = 1U << 6,
+    CW_EPOLL_DISPATCH_ET_UNDRAINED = 1U << 7,
+    CW_EPOLL_DISPATCH_ONESHOT_CANDIDATE = 1U << 8,
+    CW_EPOLL_DISPATCH_ONESHOT_MISSING_REARM = 1U << 9,
+    CW_EPOLL_DISPATCH_MSG_PEEK = 1U << 10,
+};
+
+enum cw_epoll_wait_kind {
+    CW_EPOLL_WAIT,
+    CW_EPOLL_PWAIT,
+    CW_EPOLL_PWAIT2,
+};
+
+struct cw_epoll_ready {
+    __u64 data;
+    __s32 fd;
+    __u32 events;
+};
+
+struct cw_epoll_event {
+    __u64 timestamp_ns;
+    __u64 start_ns;
+    __u64 wait_ns;
+    __u64 events_address;
+    __u32 pid;
+    __u32 tid;
+    __u32 global_pid;
+    __u32 global_tid;
+    __s32 epoll_fd;
+    __s32 result;
+    __s32 timeout_ms;
+    __s32 stack_id;
+    __u32 max_events;
+    __u32 captured_events;
+    __u32 unresolved_events;
+    __u32 wait_kind;
+    char comm[CW_EPOLL_COMM_LEN];
+    struct cw_epoll_ready ready[CW_EPOLL_MAX_READY];
+};
+
+struct cw_epoll_counters {
+    __u64 calls;
+    __u64 ready_returns;
+    __u64 ready_events;
+    __u64 timeouts;
+    __u64 errors;
+    __u64 interrupted;
+    __u64 saturated_batches;
+    __u64 truncated_events;
+    __u64 unresolved_events;
+    __u64 emitted;
+    __u64 dropped;
+    __u64 dispatches;
+    __u64 unconsumed;
+    __u64 dispatch_emitted;
+    __u64 dispatch_dropped;
+    __u64 io_errors;
+    __u64 potential_et_undrained;
+    __u64 potential_oneshot_missing_rearm;
+    __u64 fd_closes;
+    __u64 fd_duplications;
+    __u64 fd_reuses;
+};
+
+struct cw_epoll_loop_key {
+    __u32 global_pid;
+    __u32 global_tid;
+    __s32 epoll_fd;
+    __u32 epoll_generation;
+};
+
+struct cw_epoll_loop_stats {
+    __u64 first_ns;
+    __u64 last_ns;
+    __u64 calls;
+    __u64 ready_returns;
+    __u64 ready_events;
+    __u64 total_wait_ns;
+    __u64 maximum_wait_ns;
+    __u64 timeouts;
+    __u64 errors;
+    __u64 interrupted;
+    __u64 saturated_batches;
+    __u64 truncated_events;
+    __u64 unresolved_events;
+    __u64 maximum_batch;
+    __u64 dispatches;
+    __u64 unconsumed;
+    __u64 total_dispatch_ns;
+    __u64 maximum_dispatch_ns;
+    __u64 potential_et_undrained;
+    __u64 io_errors;
+    __u64 cycles;
+    __u64 total_cycle_ns;
+    __u64 maximum_cycle_ns;
+    __u64 cycle_offcpu_ns;
+    __u64 cycle_blocked_ns;
+    __u64 cycle_runqueue_ns;
+    __u64 potential_oneshot_missing_rearm;
+    __u32 pid;
+    __u32 tid;
+    __s32 stack_id;
+    char comm[CW_EPOLL_COMM_LEN];
+};
+
+struct cw_epoll_resource_key {
+    __u32 pid;
+    __s32 epoll_fd;
+    __u32 epoll_generation;
+    __s32 fd;
+    __u32 fd_generation;
+};
+
+struct cw_epoll_resource_stats {
+    __u64 data;
+    __u64 ready_count;
+    __u64 last_ready_ns;
+    __u32 interest_events;
+    __u32 observed_events;
+    __u32 registrations;
+    __u32 active;
+    __u64 dispatches;
+    __u64 unconsumed;
+    __u64 total_dispatch_ns;
+    __u64 maximum_dispatch_ns;
+    __u64 io_calls;
+    __u64 bytes_read;
+    __u64 bytes_written;
+    __u64 io_errors;
+    __u64 eagain;
+    __u64 potential_et_undrained;
+    __u64 oneshot_events;
+    __u64 oneshot_rearms;
+    __u64 potential_oneshot_missing_rearm;
+    __s32 dispatch_stack_id;
+    __u32 reserved;
+};
+
+struct cw_epoll_token_key {
+    __u64 data;
+    __u32 pid;
+    __s32 epoll_fd;
+    __u32 epoll_generation;
+    __u32 reserved;
+};
+
+struct cw_epoll_token_value {
+    __s32 fd;
+    __u32 fd_generation;
+    __u32 ambiguous;
+    __u32 reserved;
+};
+
+struct cw_epoll_registration {
+    __u64 data;
+    __u32 events;
+    __u32 reserved;
+};
+
+struct cw_epoll_dispatch_item {
+    __u64 data;
+    __u64 ready_ns;
+    __u64 first_io_ns;
+    __u64 last_io_ns;
+    __u64 total_io_ns;
+    __u64 bytes_read;
+    __u64 bytes_written;
+    __u64 requested_bytes;
+    __u32 ready_events;
+    __u32 interest_events;
+    __u32 io_calls;
+    __u32 read_calls;
+    __u32 write_calls;
+    __u32 flags;
+    __s32 fd;
+    __u32 epoll_generation;
+    __u32 fd_generation;
+    __s32 first_operation;
+    __s32 last_operation;
+    __s32 last_result;
+    __s32 stack_id;
+    __u32 io_errors;
+};
+
+struct cw_epoll_dispatch_event {
+    __u64 timestamp_ns;
+    __u64 return_to_wait_ns;
+    __u64 cycle_offcpu_ns;
+    __u64 cycle_blocked_ns;
+    __u64 cycle_runqueue_ns;
+    __u32 pid;
+    __u32 tid;
+    __u32 global_pid;
+    __u32 global_tid;
+    __s32 epoll_fd;
+    __u32 reserved;
+    char comm[CW_EPOLL_COMM_LEN];
+    struct cw_epoll_dispatch_item item;
+};
+
+struct cw_epoll_fd_key {
+    __u32 pid;
+    __s32 fd;
+};
+
+struct cw_epoll_instance_key {
+    __u32 pid;
+    __s32 epoll_fd;
+    __u32 epoll_generation;
+    __u32 reserved;
+};
+
+struct cw_epoll_instance_stats {
+    __u64 calls;
+    __u64 ready_returns;
+    __u64 ready_events;
+    __u64 active_waiters;
+    __u64 peak_waiters;
+    __u64 exclusive_resources;
+};
+
+#endif

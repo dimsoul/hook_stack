@@ -830,9 +830,9 @@ static void print_io_uring_aggregates(struct output_options *output,
                         row->key.stack_id);
             else
                 fprintf(stream, "         unavailable\n");
-        } else if (output->io_uring_maps) {
+        } else if (output->target_maps) {
             print_stack_frames(stack, sizeof(stack),
-                               output->io_uring_maps,
+                               output->target_maps,
                                "       ", NULL, NULL, 0,
                                output->control);
         } else {

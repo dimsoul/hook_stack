@@ -14,6 +14,5 @@ int cw_io_uring_handle_callback_event(
 void cw_io_uring_cache_resources(struct output_options *output);
 bool cw_io_uring_print_summary(struct output_options *output);
 int cw_io_uring_write_summary_json(struct output_options *output);
-void cw_io_uring_cleanup(struct output_options *output);
 
 #endif

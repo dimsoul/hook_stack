@@ -12,6 +12,8 @@
 #include <gelf.h>
 #include <dirent.h>
 #include <poll.h>
+#include <pwd.h>
+#include <grp.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -33,12 +35,14 @@
 
 #include "core/core_config.h"
 #include "async/async_config.h"
+#include "epoll/epoll_config.h"
 #include "io_uring/io_uring_config.h"
 #include "callweave.skel.h"
 #include "async/async_events.h"
 #include "async/async_output.h"
 #include "callweave_internal.h"
 #include "config.h"
+#include "epoll/epoll.h"
 #include "io_uring/io_uring.h"
 #include "report.h"
 #include "symbols.h"
@@ -91,6 +95,81 @@ static int configure_pid_namespace(struct callweave_bpf *skeleton)
     skeleton->rodata->cw_target_cfg.pidns_dev = (uint64_t)namespace_status.st_dev;
     skeleton->rodata->cw_target_cfg.pidns_ino = (uint64_t)namespace_status.st_ino;
     return 0;
+}
+
+static void add_epoll_io_syscall(
+    struct cw_epoll_config *config, int syscall_nr,
+    enum cw_epoll_io_operation operation)
+{
+    uint32_t index = config->io_syscall_count;
+
+    if (index >= CW_EPOLL_MAX_IO_SYSCALLS)
+        return;
+    config->io_syscalls[index].syscall_nr = syscall_nr;
+    config->io_syscalls[index].operation = operation;
+    config->io_syscall_count++;
+}
+
+static void configure_epoll_io_syscalls(
+    struct cw_epoll_config *config)
+{
+#ifdef SYS_read
+    add_epoll_io_syscall(config, SYS_read, CW_EPOLL_IO_READ);
+#endif
+#ifdef SYS_readv
+    add_epoll_io_syscall(config, SYS_readv, CW_EPOLL_IO_READV);
+#endif
+#ifdef SYS_recvfrom
+    add_epoll_io_syscall(config, SYS_recvfrom, CW_EPOLL_IO_RECVFROM);
+#endif
+#ifdef SYS_recvmsg
+    add_epoll_io_syscall(config, SYS_recvmsg, CW_EPOLL_IO_RECVMSG);
+#endif
+#ifdef SYS_recvmmsg
+    add_epoll_io_syscall(config, SYS_recvmmsg, CW_EPOLL_IO_RECVMMSG);
+#endif
+#ifdef SYS_write
+    add_epoll_io_syscall(config, SYS_write, CW_EPOLL_IO_WRITE);
+#endif
+#ifdef SYS_writev
+    add_epoll_io_syscall(config, SYS_writev, CW_EPOLL_IO_WRITEV);
+#endif
+#ifdef SYS_sendto
+    add_epoll_io_syscall(config, SYS_sendto, CW_EPOLL_IO_SENDTO);
+#endif
+#ifdef SYS_sendmsg
+    add_epoll_io_syscall(config, SYS_sendmsg, CW_EPOLL_IO_SENDMSG);
+#endif
+#ifdef SYS_sendmmsg
+    add_epoll_io_syscall(config, SYS_sendmmsg, CW_EPOLL_IO_SENDMMSG);
+#endif
+#ifdef SYS_accept
+    add_epoll_io_syscall(config, SYS_accept, CW_EPOLL_IO_ACCEPT);
+#endif
+#ifdef SYS_accept4
+    add_epoll_io_syscall(config, SYS_accept4, CW_EPOLL_IO_ACCEPT4);
+#endif
+#ifdef SYS_connect
+    add_epoll_io_syscall(config, SYS_connect, CW_EPOLL_IO_CONNECT);
+#endif
+#ifdef SYS_close
+    add_epoll_io_syscall(config, SYS_close, CW_EPOLL_IO_CLOSE);
+#endif
+#ifdef SYS_dup
+    add_epoll_io_syscall(config, SYS_dup, CW_EPOLL_IO_DUP);
+#endif
+#ifdef SYS_dup2
+    add_epoll_io_syscall(config, SYS_dup2, CW_EPOLL_IO_DUP2);
+#endif
+#ifdef SYS_dup3
+    add_epoll_io_syscall(config, SYS_dup3, CW_EPOLL_IO_DUP3);
+#endif
+#ifdef SYS_fcntl
+    add_epoll_io_syscall(config, SYS_fcntl, CW_EPOLL_IO_FCNTL_DUP);
+#endif
+#ifdef SYS_splice
+    add_epoll_io_syscall(config, SYS_splice, CW_EPOLL_IO_SPLICE);
+#endif
 }
 
 static int attach_raw_tracepoint(struct bpf_program *program,
@@ -176,6 +255,14 @@ static void detach_io_uring_links(struct callweave_bpf *skeleton)
     detach_link(&skeleton->links.trace_io_uring_callback);
 }
 
+static void detach_epoll_links(struct callweave_bpf *skeleton)
+{
+    if (!skeleton)
+        return;
+    detach_link(&skeleton->links.trace_epoll_sys_enter);
+    detach_link(&skeleton->links.trace_epoll_sys_exit);
+}
+
 static int attach_named_uprobe(struct bpf_program *program,
                                struct bpf_link **link,
                                const char *path, const char *function,
@@ -213,6 +300,8 @@ static void usage(FILE *stream, const char *program)
             "  %s -p PID --discover-async FUNCTION\n"
             "  %s -p PID --config PATH\n"
             "  %s -p PID --io-uring\n"
+            "  %s -p PID --epoll\n"
+            "  %s --epoll --exec PROGRAM -- [ARGS...]\n"
             "  %s --check-config PATH\n"
             "\n"
             "Options:\n"
@@ -267,12 +356,24 @@ static void usage(FILE *stream, const char *program)
             "(default /proc/PID/exe)\n"
             "      --io-callback-arg N     callback argument containing "
             "user_data, 1-8 (default 1)\n"
+            "      --epoll               trace epoll waits, dispatch, and "
+            "resources\n"
+            "      --exec PROGRAM         launch PROGRAM after epoll tracing "
+            "is ready;\n"
+            "                             put its arguments after `--`\n"
+            "      --min-epoll-wait-us US only emit waits at least US\n"
+            "      --min-epoll-dispatch-us US\n"
+            "                             only emit ready-to-I/O dispatches "
+            "at least US\n"
+            "      --epoll-top N          show N busiest event-loop "
+            "call sites (default 5)\n"
             "  -h, --help                show this help\n"
             "\n"
             "When -p is used without --binary or --module, /proc/PID/exe is used.\n"
-            "Without -p, an explicit BINARY is required.\n",
+            "Without -p, an explicit BINARY is required except for "
+            "--epoll --exec.\n",
             program, program, program, program, program, program, program,
-            program);
+            program, program, program);
 }
 
 static int parse_pid(const char *text, pid_t *pid)
@@ -339,6 +440,171 @@ static int validate_target_pid(pid_t pid)
             "verify it with `ps -p %d` while the target is still running\n",
             (int)pid, strerror(saved_error), (int)pid);
     return -saved_error;
+}
+
+struct launched_target {
+    pid_t pid;
+    int exec_status_fd;
+    bool resumed;
+};
+
+static int parse_identity(const char *text, unsigned long *identity)
+{
+    char *end = NULL;
+    unsigned long value;
+
+    if (!text || !text[0])
+        return -1;
+    errno = 0;
+    value = strtoul(text, &end, 10);
+    if (errno || !end || *end)
+        return -1;
+    *identity = value;
+    return 0;
+}
+
+static int restore_sudo_identity(void)
+{
+    const char *uid_text = getenv("SUDO_UID");
+    const char *gid_text = getenv("SUDO_GID");
+    unsigned long uid_value;
+    unsigned long gid_value;
+    struct passwd *account;
+    uid_t uid;
+    gid_t gid;
+
+    if (geteuid() || !uid_text || !gid_text)
+        return 0;
+    if (parse_identity(uid_text, &uid_value) ||
+        parse_identity(gid_text, &gid_value) ||
+        (uid_t)uid_value != uid_value ||
+        (gid_t)gid_value != gid_value)
+        return -EINVAL;
+    uid = (uid_t)uid_value;
+    gid = (gid_t)gid_value;
+    account = getpwuid(uid);
+    if (account) {
+        if (initgroups(account->pw_name, gid))
+            return -errno;
+    } else if (setgroups(0, NULL)) {
+        return -errno;
+    }
+    if (setgid(gid) || setuid(uid))
+        return -errno;
+    return 0;
+}
+
+static int launch_target_suspended(
+    const char *path, char *const child_argv[],
+    struct launched_target *target)
+{
+    int status_pipe[2] = {-1, -1};
+    int status;
+    pid_t pid;
+
+    if (pipe2(status_pipe, O_CLOEXEC))
+        return -errno;
+    pid = fork();
+    if (pid < 0) {
+        int error = -errno;
+
+        close(status_pipe[0]);
+        close(status_pipe[1]);
+        return error;
+    }
+    if (!pid) {
+        int child_error;
+        ssize_t written;
+
+        close(status_pipe[0]);
+        if (raise(SIGSTOP))
+            _exit(127);
+        child_error = restore_sudo_identity();
+        if (!child_error) {
+            execvp(path, child_argv);
+            child_error = -errno;
+        }
+        child_error = -child_error;
+        written = write(status_pipe[1], &child_error,
+                        sizeof(child_error));
+        (void)written;
+        _exit(127);
+    }
+    close(status_pipe[1]);
+    do {
+        status = 0;
+        if (waitpid(pid, &status, WUNTRACED) >= 0)
+            break;
+    } while (errno == EINTR);
+    if (!WIFSTOPPED(status)) {
+        close(status_pipe[0]);
+        (void)waitpid(pid, NULL, WNOHANG);
+        return -ECHILD;
+    }
+    target->pid = pid;
+    target->exec_status_fd = status_pipe[0];
+    target->resumed = false;
+    return 0;
+}
+
+static int resume_launched_target(struct launched_target *target)
+{
+    int child_error = 0;
+    ssize_t length;
+
+    if (!target || target->pid <= 0 || target->exec_status_fd < 0)
+        return -EINVAL;
+    if (kill(target->pid, SIGCONT))
+        return -errno;
+    target->resumed = true;
+    do {
+        length = read(target->exec_status_fd, &child_error,
+                      sizeof(child_error));
+    } while (length < 0 && errno == EINTR);
+    close(target->exec_status_fd);
+    target->exec_status_fd = -1;
+    if (!length)
+        return 0;
+    if (length == (ssize_t)sizeof(child_error) && child_error > 0)
+        return -child_error;
+    return length < 0 ? -errno : -EIO;
+}
+
+static void stop_launched_target(struct launched_target *target)
+{
+    struct timespec pause = {
+        .tv_nsec = 25000000,
+    };
+    unsigned attempt;
+    pid_t result;
+
+    if (!target)
+        return;
+    if (target->exec_status_fd >= 0) {
+        close(target->exec_status_fd);
+        target->exec_status_fd = -1;
+    }
+    if (target->pid <= 0)
+        return;
+    result = waitpid(target->pid, NULL, WNOHANG);
+    if (result == target->pid) {
+        target->pid = -1;
+        return;
+    }
+    kill(target->pid, target->resumed ? SIGTERM : SIGKILL);
+    for (attempt = 0; attempt < 20; attempt++) {
+        result = waitpid(target->pid, NULL, WNOHANG);
+        if (result == target->pid)
+            break;
+        nanosleep(&pause, NULL);
+    }
+    if (result != target->pid) {
+        kill(target->pid, SIGKILL);
+        do {
+            result = waitpid(target->pid, NULL, 0);
+        } while (result < 0 && errno == EINTR);
+    }
+    target->pid = -1;
 }
 
 static uint64_t timespec_nanoseconds(const struct timespec *time)
@@ -469,6 +735,11 @@ enum long_option_id {
     OPT_IO_CALLBACK,
     OPT_IO_CALLBACK_BINARY,
     OPT_IO_CALLBACK_ARG,
+    OPT_EPOLL,
+    OPT_MIN_EPOLL_WAIT_US,
+    OPT_MIN_EPOLL_DISPATCH_US,
+    OPT_EPOLL_TOP,
+    OPT_EXEC,
 };
 
 int main(int argc, char **argv)
@@ -516,6 +787,13 @@ int main(int argc, char **argv)
          OPT_IO_CALLBACK_BINARY},
         {"io-callback-arg", required_argument, NULL,
          OPT_IO_CALLBACK_ARG},
+        {"epoll", no_argument, NULL, OPT_EPOLL},
+        {"min-epoll-wait-us", required_argument, NULL,
+         OPT_MIN_EPOLL_WAIT_US},
+        {"min-epoll-dispatch-us", required_argument, NULL,
+         OPT_MIN_EPOLL_DISPATCH_US},
+        {"epoll-top", required_argument, NULL, OPT_EPOLL_TOP},
+        {"exec", required_argument, NULL, OPT_EXEC},
         {0, 0, 0, 0},
     };
     struct bpf_uprobe_opts options = {
@@ -541,8 +819,17 @@ int main(int argc, char **argv)
         .io_uring_ring_stats_map_fd = -1,
         .io_uring_failure_map_fd = -1,
         .io_uring_link_map_fd = -1,
+        .epoll_stack_map_fd = -1,
+        .epoll_counters_map_fd = -1,
+        .epoll_loop_stats_map_fd = -1,
+        .epoll_resource_stats_map_fd = -1,
+        .epoll_registration_map_fd = -1,
+        .epoll_token_map_fd = -1,
+        .epoll_fd_generation_map_fd = -1,
+        .epoll_instance_stats_map_fd = -1,
         .target_pidfd = -1,
         .diagnostic_interval_ms = 1000,
+        .epoll_top = 5,
     };
     struct callweave_bpf *skeleton = NULL;
     struct ring_buffer *ring_buffer = NULL;
@@ -564,6 +851,7 @@ int main(int argc, char **argv)
     const char *report_path = NULL;
     const char *io_callback_name = NULL;
     const char *io_callback_binary = NULL;
+    const char *exec_path = NULL;
     char *configured_function = NULL;
     size_t function_offset = 0;
     uint32_t async_source_arg = 1;
@@ -575,8 +863,14 @@ int main(int argc, char **argv)
     size_t async_hop_count = 0;
     size_t async_link_count = 0;
     pid_t target_pid = -1;
+    struct launched_target launched = {
+        .pid = -1,
+        .exec_status_fd = -1,
+    };
+    char **exec_argv = NULL;
     bool async_option_seen = false;
     bool io_callback_option_seen = false;
+    bool epoll_top_option_seen = false;
     bool check_config = false;
     bool json_output = false;
     bool finalize_outputs = true;
@@ -588,7 +882,9 @@ int main(int argc, char **argv)
     for (argument_index = 1; argument_index < argc; argument_index++) {
         const char *argument = argv[argument_index];
 
-        if (!strcmp(argument, "--config")) {
+        if (!strcmp(argument, "--")) {
+            break;
+        } else if (!strcmp(argument, "--config")) {
             if (++argument_index >= argc || config_path) {
                 fprintf(stderr,
                         "--config requires one path and may appear once\n");
@@ -836,6 +1132,41 @@ int main(int argc, char **argv)
                 goto cleanup;
             }
             break;
+        case OPT_EPOLL:
+            output.epoll_mode = true;
+            break;
+        case OPT_MIN_EPOLL_WAIT_US:
+            if (parse_cli_us("--min-epoll-wait-us", optarg,
+                             &output.epoll_min_wait_ns)) {
+                error = 2;
+                goto cleanup;
+            }
+            break;
+        case OPT_MIN_EPOLL_DISPATCH_US:
+            if (parse_cli_us("--min-epoll-dispatch-us", optarg,
+                             &output.epoll_min_dispatch_ns)) {
+                error = 2;
+                goto cleanup;
+            }
+            break;
+        case OPT_EPOLL_TOP:
+            epoll_top_option_seen = true;
+            if (parse_u32_range(optarg, 1, 1000,
+                                &output.epoll_top)) {
+                fprintf(stderr, "invalid --epoll-top value: %s\n",
+                        optarg);
+                error = 2;
+                goto cleanup;
+            }
+            break;
+        case OPT_EXEC:
+            if (exec_path) {
+                fprintf(stderr, "--exec may appear only once\n");
+                error = 2;
+                goto cleanup;
+            }
+            exec_path = optarg;
+            break;
         default:
             usage(stderr, argv[0]);
             return 2;
@@ -864,9 +1195,11 @@ int main(int argc, char **argv)
         error = 2;
         goto cleanup;
     }
-    if (json_output && !output.show_async && !output.io_uring_mode) {
+    if (json_output && !output.show_async && !output.io_uring_mode &&
+        !output.epoll_mode) {
         fprintf(stderr,
-                "--format json requires async tracing or --io-uring\n");
+                "--format json requires async tracing, --io-uring, "
+                "or --epoll\n");
         error = 2;
         goto cleanup;
     }
@@ -902,7 +1235,7 @@ int main(int argc, char **argv)
     if (((output.min_total_ns || output.min_queue_ns ||
           output.min_work_ns) && !output.show_async) ||
         (output.max_events && !output.show_async &&
-         !output.io_uring_mode)) {
+         !output.io_uring_mode && !output.epoll_mode)) {
         fprintf(stderr,
                 "chain filters require --config, --async-hop, or "
                 "--async-source\n");
@@ -933,9 +1266,29 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    error = validate_target_pid(target_pid);
-    if (error)
-        return 1;
+    if (exec_path) {
+        if (!exec_path[0]) {
+            fprintf(stderr, "--exec PROGRAM must not be empty\n");
+            error = 2;
+            goto cleanup;
+        }
+        if (!output.epoll_mode) {
+            fprintf(stderr,
+                    "--exec is currently supported with standalone "
+                    "--epoll mode\n");
+            error = 2;
+            goto cleanup;
+        }
+        if (target_pid > 0) {
+            fprintf(stderr, "--exec and --pid are mutually exclusive\n");
+            error = 2;
+            goto cleanup;
+        }
+    } else {
+        error = validate_target_pid(target_pid);
+        if (error)
+            return 1;
+    }
 
     if (!output.io_uring_mode &&
         (output.io_uring_min_latency_ns ||
@@ -944,6 +1297,22 @@ int main(int argc, char **argv)
         fprintf(stderr,
                 "io_uring filters and callback options require "
                 "--io-uring\n");
+        error = 2;
+        goto cleanup;
+    }
+    if (!output.epoll_mode &&
+        (output.epoll_min_wait_ns ||
+         output.epoll_min_dispatch_ns ||
+         epoll_top_option_seen)) {
+        fprintf(stderr,
+                "epoll filters require --epoll\n");
+        error = 2;
+        goto cleanup;
+    }
+    if (output.epoll_mode && output.io_uring_mode) {
+        fprintf(stderr,
+                "--epoll and --io-uring are mutually exclusive "
+                "standalone modes\n");
         error = 2;
         goto cleanup;
     }
@@ -992,6 +1361,60 @@ int main(int argc, char **argv)
                     goto cleanup;
             }
             output.io_uring_callback_name = io_callback_name;
+        }
+        goto trace_target_ready;
+    }
+    if (output.epoll_mode) {
+        if (target_pid <= 0 && !exec_path) {
+            fprintf(stderr, "--epoll requires --pid or --exec\n");
+            error = 2;
+            goto cleanup;
+        }
+        if ((!exec_path && remaining_arguments) ||
+            binary_argument || module_name ||
+            find_symbol_name || offset_text || configured_function ||
+            output.show_return_value || output.show_duration ||
+            output.show_attribution || output.show_async ||
+            output.show_discovery || async_source_name ||
+            async_source_binary || async_option_seen || async_hop_count ||
+            report_path || io_callback_option_seen ||
+            output.io_uring_min_latency_ns ||
+            output.io_uring_errors_only || output.io_uring_top) {
+            fprintf(stderr,
+                    "--epoll is a standalone mode; combine it only with "
+                    "--pid or --exec, --min-epoll-wait-us, "
+                    "--min-epoll-dispatch-us, --epoll-top, "
+                    "--duration, --max-events, --format, and --output\n");
+            error = 2;
+            goto cleanup;
+        }
+        if (exec_path) {
+            size_t index;
+
+            exec_argv = calloc(
+                (size_t)remaining_arguments + 2,
+                sizeof(*exec_argv));
+            if (!exec_argv) {
+                error = -ENOMEM;
+                goto cleanup;
+            }
+            exec_argv[0] = (char *)exec_path;
+            for (index = 0;
+                 index < (size_t)remaining_arguments; index++)
+                exec_argv[index + 1] = argv[optind + index];
+            error = launch_target_suspended(
+                exec_path, exec_argv, &launched);
+            if (error) {
+                fprintf(stderr, "cannot prepare target %s: %s\n",
+                        exec_path, strerror(-error));
+                goto cleanup;
+            }
+            target_pid = launched.pid;
+            output.epoll_started_target = true;
+            remaining_arguments = 0;
+            error = validate_target_pid(target_pid);
+            if (error)
+                goto cleanup;
         }
         goto trace_target_ready;
     }
@@ -1164,18 +1587,19 @@ trace_target_ready:
         output.target_pidfd =
             syscall(SYS_pidfd_open, target_pid, 0);
 #endif
-    if (output.io_uring_mode && target_pid > 0) {
-        cw_io_uring_cache_resources(&output);
-        output.io_uring_maps = calloc(1, sizeof(*output.io_uring_maps));
-        if (output.io_uring_maps &&
+    if ((output.io_uring_mode || output.epoll_mode) &&
+        target_pid > 0 && !output.epoll_started_target) {
+        cw_fd_cache_all(&output.fd_resources, target_pid);
+        output.target_maps = calloc(1, sizeof(*output.target_maps));
+        if (output.target_maps &&
             !read_process_maps((uint32_t)target_pid,
-                               output.io_uring_maps)) {
-            output.io_uring_maps_pid = (uint32_t)target_pid;
+                               output.target_maps)) {
+            output.target_maps_pid = (uint32_t)target_pid;
         } else {
-            if (output.io_uring_maps) {
-                map_list_free(output.io_uring_maps);
-                free(output.io_uring_maps);
-                output.io_uring_maps = NULL;
+            if (output.target_maps) {
+                map_list_free(output.target_maps);
+                free(output.target_maps);
+                output.target_maps = NULL;
             }
         }
     }
@@ -1210,6 +1634,29 @@ trace_target_ready:
         output.io_uring_min_latency_ns;
     skeleton->rodata->cw_io_uring_cfg.errors_only =
         output.io_uring_errors_only;
+    skeleton->rodata->cw_epoll_cfg.enabled = output.epoll_mode;
+    skeleton->rodata->cw_epoll_cfg.min_wait_ns =
+        output.epoll_min_wait_ns;
+    skeleton->rodata->cw_epoll_cfg.min_dispatch_ns =
+        output.epoll_min_dispatch_ns;
+    skeleton->rodata->cw_epoll_cfg.wait_syscall_nr = -1;
+    skeleton->rodata->cw_epoll_cfg.pwait_syscall_nr = -1;
+    skeleton->rodata->cw_epoll_cfg.pwait2_syscall_nr = -1;
+    skeleton->rodata->cw_epoll_cfg.ctl_syscall_nr = -1;
+#ifdef SYS_epoll_wait
+    skeleton->rodata->cw_epoll_cfg.wait_syscall_nr = SYS_epoll_wait;
+#endif
+#ifdef SYS_epoll_pwait
+    skeleton->rodata->cw_epoll_cfg.pwait_syscall_nr = SYS_epoll_pwait;
+#endif
+#ifdef SYS_epoll_pwait2
+    skeleton->rodata->cw_epoll_cfg.pwait2_syscall_nr = SYS_epoll_pwait2;
+#endif
+#ifdef SYS_epoll_ctl
+    skeleton->rodata->cw_epoll_cfg.ctl_syscall_nr = SYS_epoll_ctl;
+#endif
+    configure_epoll_io_syscalls(
+        &skeleton->rodata->cw_epoll_cfg);
     skeleton->rodata->cw_async_cfg.source_arg = async_source_arg;
     skeleton->rodata->cw_async_cfg.target_arg = async_target_arg;
     skeleton->rodata->cw_async_cfg.max_age_ns =
@@ -1266,7 +1713,21 @@ trace_target_ready:
                     strerror(-error));
             goto cleanup;
         }
-    } else {
+    }
+    if (!output.epoll_mode) {
+        error = bpf_program__set_autoload(
+            skeleton->progs.trace_epoll_sys_enter, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_epoll_sys_exit, false);
+        if (error) {
+            fprintf(stderr,
+                    "failed to disable epoll programs: %s\n",
+                    strerror(-error));
+            goto cleanup;
+        }
+    }
+    if (output.io_uring_mode || output.epoll_mode) {
         error = bpf_program__set_autoload(
             skeleton->progs.trace_function, false);
         if (!error)
@@ -1279,7 +1740,7 @@ trace_target_ready:
             goto cleanup;
         }
     }
-    if (!output.show_attribution) {
+    if (!output.show_attribution && !output.epoll_mode) {
         error = bpf_program__set_autoload(
             skeleton->progs.trace_sched_switch, false);
         if (!error)
@@ -1294,6 +1755,18 @@ trace_target_ready:
         if (error) {
             fprintf(stderr,
                     "failed to disable scheduler attribution programs: %s\n",
+                    strerror(-error));
+            goto cleanup;
+        }
+    } else if (output.epoll_mode) {
+        error = bpf_program__set_autoload(
+            skeleton->progs.trace_sys_enter, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_sys_exit, false);
+        if (error) {
+            fprintf(stderr,
+                    "failed to disable function wait attribution programs: %s\n",
                     strerror(-error));
             goto cleanup;
         }
@@ -1369,6 +1842,22 @@ trace_target_ready:
         bpf_map__fd(skeleton->maps.io_uring_failures);
     output.io_uring_link_map_fd =
         bpf_map__fd(skeleton->maps.io_uring_links);
+    output.epoll_stack_map_fd =
+        bpf_map__fd(skeleton->maps.epoll_stacks);
+    output.epoll_counters_map_fd =
+        bpf_map__fd(skeleton->maps.epoll_counters);
+    output.epoll_loop_stats_map_fd =
+        bpf_map__fd(skeleton->maps.epoll_loop_stats);
+    output.epoll_resource_stats_map_fd =
+        bpf_map__fd(skeleton->maps.epoll_resource_stats);
+    output.epoll_registration_map_fd =
+        bpf_map__fd(skeleton->maps.epoll_registrations);
+    output.epoll_token_map_fd =
+        bpf_map__fd(skeleton->maps.epoll_tokens);
+    output.epoll_fd_generation_map_fd =
+        bpf_map__fd(skeleton->maps.epoll_fd_generations);
+    output.epoll_instance_stats_map_fd =
+        bpf_map__fd(skeleton->maps.epoll_instance_stats);
 
     if (output.io_uring_mode) {
         error = attach_raw_tracepoint(
@@ -1440,6 +1929,25 @@ trace_target_ready:
             if (error)
                 goto cleanup;
         }
+    } else if (output.epoll_mode) {
+        error = attach_raw_tracepoint(
+            skeleton->progs.trace_epoll_sys_enter,
+            &skeleton->links.trace_epoll_sys_enter, "sys_enter");
+        if (!error)
+            error = attach_raw_tracepoint(
+                skeleton->progs.trace_epoll_sys_exit,
+                &skeleton->links.trace_epoll_sys_exit, "sys_exit");
+        if (!error)
+            error = attach_raw_tracepoint(
+                skeleton->progs.trace_sched_switch,
+                &skeleton->links.trace_sched_switch, "sched_switch");
+        if (!error)
+            error = attach_raw_tracepoint(
+                skeleton->progs.trace_sched_wakeup,
+                &skeleton->links.trace_sched_wakeup, "sched_wakeup");
+        if (error)
+            goto cleanup;
+        cw_epoll_seed_existing(&output);
     } else if (output.show_attribution) {
         error = attach_raw_tracepoint(
             skeleton->progs.trace_sched_switch,
@@ -1534,7 +2042,7 @@ trace_target_ready:
             goto cleanup;
     }
 
-    if (!output.io_uring_mode) {
+    if (!output.io_uring_mode && !output.epoll_mode) {
         options.func_name = offset_text ? NULL : function_name;
         skeleton->links.trace_function = bpf_program__attach_uprobe_opts(
             skeleton->progs.trace_function, -1, target_path,
@@ -1555,12 +2063,25 @@ trace_target_ready:
         }
     }
 
-    ring_buffer = ring_buffer__new(
-        output.io_uring_mode ?
-            bpf_map__fd(skeleton->maps.io_uring_events) :
-            bpf_map__fd(skeleton->maps.events),
-        output.io_uring_mode ? cw_io_uring_handle_event : handle_event,
-        &output, NULL);
+    {
+        int event_map_fd;
+        ring_buffer_sample_fn event_handler;
+
+        if (output.io_uring_mode) {
+            event_map_fd =
+                bpf_map__fd(skeleton->maps.io_uring_events);
+            event_handler = cw_io_uring_handle_event;
+        } else if (output.epoll_mode) {
+            event_map_fd =
+                bpf_map__fd(skeleton->maps.epoll_events);
+            event_handler = cw_epoll_handle_event;
+        } else {
+            event_map_fd = bpf_map__fd(skeleton->maps.events);
+            event_handler = handle_event;
+        }
+        ring_buffer = ring_buffer__new(
+            event_map_fd, event_handler, &output, NULL);
+    }
     if (!ring_buffer) {
         error = errno ? -errno : -ENOMEM;
         fprintf(stderr, "failed to create ring buffer: %s\n",
@@ -1575,6 +2096,18 @@ trace_target_ready:
         if (error) {
             fprintf(stderr,
                     "failed to add io_uring callback ring buffer: %s\n",
+                    strerror(-error));
+            goto cleanup;
+        }
+    }
+    if (output.epoll_mode) {
+        error = ring_buffer__add(
+            ring_buffer,
+            bpf_map__fd(skeleton->maps.epoll_dispatch_events),
+            cw_epoll_handle_dispatch_event, &output);
+        if (error) {
+            fprintf(stderr,
+                    "failed to add epoll dispatch ring buffer: %s\n",
                     strerror(-error));
             goto cleanup;
         }
@@ -1616,6 +2149,8 @@ trace_target_ready:
     if (json_output) {
         if (output.io_uring_mode)
             fprintf(stderr, "Tracing io_uring");
+        else if (output.epoll_mode)
+            fprintf(stderr, "Tracing epoll");
         else if (offset_text)
             fprintf(stderr, "Tracing %s+0x%zx", target_path,
                     function_offset);
@@ -1636,12 +2171,32 @@ trace_target_ready:
         if (output.io_uring_top)
             fprintf(stderr, ", top %u submit groups",
                     output.io_uring_top);
+        if (output.epoll_min_wait_ns)
+            fprintf(stderr, ", minimum epoll wait %.3f us",
+                    (double)output.epoll_min_wait_ns / 1000.0);
+        if (output.epoll_min_dispatch_ns)
+            fprintf(stderr, ", minimum epoll dispatch %.3f us",
+                    (double)output.epoll_min_dispatch_ns / 1000.0);
+        if (output.epoll_mode)
+            fprintf(stderr, ", top %u event loops",
+                    output.epoll_top);
+        if (output.epoll_started_target)
+            fprintf(stderr, ", target launched after tracer readiness");
+        else if (output.epoll_mode)
+            fprintf(stderr,
+                    ", bootstrapped %u registration%s from %u epoll FD%s",
+                    output.epoll_bootstrap_registrations,
+                    output.epoll_bootstrap_registrations == 1 ? "" : "s",
+                    output.epoll_bootstrap_fds,
+                    output.epoll_bootstrap_fds == 1 ? "" : "s");
         if (report_path)
             fprintf(stderr, ", HTML report %s", report_path);
         fprintf(stderr, ". Press Ctrl+C to stop.\n");
     } else {
         if (output.io_uring_mode)
             printf("Tracing io_uring");
+        else if (output.epoll_mode)
+            printf("Tracing epoll");
         else if (offset_text)
             printf("Tracing %s+0x%zx", target_path, function_offset);
         else
@@ -1652,6 +2207,8 @@ trace_target_ready:
             printf(" in all processes");
         if (output.io_uring_mode)
             printf(", submit-to-CQE latency enabled");
+        if (output.epoll_mode)
+            printf(", wait-batch and FD resource diagnostics enabled");
         if (output.io_uring_min_latency_ns) {
             printf(",");
             print_interval("min-io-latency",
@@ -1665,6 +2222,26 @@ trace_target_ready:
         if (output.io_uring_callback_name)
             printf(", CQE -> callback %s arg%u",
                    output.io_uring_callback_name, io_callback_arg);
+        if (output.epoll_min_wait_ns) {
+            printf(",");
+            print_interval("min-epoll-wait",
+                           output.epoll_min_wait_ns);
+        }
+        if (output.epoll_min_dispatch_ns) {
+            printf(",");
+            print_interval("min-epoll-dispatch",
+                           output.epoll_min_dispatch_ns);
+        }
+        if (output.epoll_mode)
+            printf(", top %u event loops", output.epoll_top);
+        if (output.epoll_started_target)
+            printf(", target launched after tracer readiness");
+        else if (output.epoll_mode)
+            printf(", bootstrapped %u registration%s from %u epoll FD%s",
+                   output.epoll_bootstrap_registrations,
+                   output.epoll_bootstrap_registrations == 1 ? "" : "s",
+                   output.epoll_bootstrap_fds,
+                   output.epoll_bootstrap_fds == 1 ? "" : "s");
         if (output.show_return_value)
             printf(", return values enabled");
         if (output.show_duration)
@@ -1712,6 +2289,36 @@ trace_target_ready:
         printf(". Press Ctrl+C to stop.\n");
     }
 
+    if (launched.pid > 0) {
+        fflush(output.json_output ? stderr : stdout);
+        error = resume_launched_target(&launched);
+        if (error) {
+            fprintf(stderr, "cannot execute target %s: %s\n",
+                    exec_path, strerror(-error));
+            goto cleanup;
+        }
+        /*
+         * BPF links and ring buffers are live before SIGCONT. Give the
+         * dynamic loader a brief opportunity to establish mappings used for
+         * later user-stack symbolization; tracing is already active here.
+         */
+        usleep(10000);
+        cw_fd_cache_all(&output.fd_resources, target_pid);
+        output.target_maps = calloc(
+            1, sizeof(*output.target_maps));
+        if (output.target_maps &&
+            !read_process_maps((uint32_t)target_pid,
+                               output.target_maps)) {
+            output.target_maps_pid = (uint32_t)target_pid;
+        } else {
+            if (output.target_maps) {
+                map_list_free(output.target_maps);
+                free(output.target_maps);
+                output.target_maps = NULL;
+            }
+        }
+    }
+
     if (duration_seconds)
         stop_time_ns = monotonic_time_ns() +
                        (uint64_t)duration_seconds * 1000000000ULL;
@@ -1756,6 +2363,16 @@ trace_target_ready:
             if (now - output.diagnostic_last_ns >=
                 (uint64_t)output.diagnostic_interval_ms * 1000000ULL)
                 print_queue_diagnostics(&output, false);
+        } else if (output.epoll_mode &&
+                   output.diagnostic_interval_ms) {
+            uint64_t now = monotonic_time_ns();
+
+            if (now - output.diagnostic_last_ns >=
+                (uint64_t)output.diagnostic_interval_ms * 1000000ULL) {
+                cw_fd_cache_all(
+                    &output.fd_resources, output.target_pid);
+                output.diagnostic_last_ns = now;
+            }
         }
         if (stop_time_ns && monotonic_time_ns() >= stop_time_ns) {
             cw_capture_request_stop(&control, CW_STOP_DURATION);
@@ -1772,11 +2389,15 @@ trace_target_ready:
 
 cleanup:
     cw_capture_drain_signals(&control);
+    stop_launched_target(&launched);
     finalize_outputs = cw_capture_should_finalize(&control);
     if (output.io_uring_mode)
         detach_io_uring_links(skeleton);
+    if (output.epoll_mode)
+        detach_epoll_links(skeleton);
     if (cw_capture_stopped_by_signal(&control) &&
-        output.io_uring_mode && output.io_uring_top)
+        ((output.io_uring_mode && output.io_uring_top) ||
+         (output.epoll_mode && output.epoll_top)))
         fprintf(output.json_output ? stderr : stdout,
                 "Capture stopped; resolving unique top stacks. "
                 "Press Ctrl+C again to exit immediately.\n");
@@ -1788,6 +2409,9 @@ cleanup:
         output.diagnostic_last_ns &&
         output.io_uring_counters_map_fd >= 0)
         cw_io_uring_print_summary(&output);
+    if (finalize_outputs && output.epoll_mode &&
+        output.epoll_counters_map_fd >= 0)
+        cw_epoll_print_summary(&output);
     finalize_outputs = !cw_capture_cancelled(&control);
     if (output.report_stream) {
         if (finalize_outputs) {
@@ -1811,6 +2435,9 @@ cleanup:
         finalize_outputs = !cw_capture_cancelled(&control);
         if (output.io_uring_mode && finalize_outputs) {
             if (cw_io_uring_write_summary_json(&output) && !error)
+                error = -(errno ? errno : EIO);
+        } else if (output.epoll_mode && finalize_outputs) {
+            if (cw_epoll_write_summary_json(&output) && !error)
                 error = -(errno ? errno : EIO);
         } else if (!output.io_uring_mode && finalize_outputs) {
             struct cw_queue_diagnostic diagnostics[MAX_ASYNC_HOPS];
@@ -1840,8 +2467,13 @@ cleanup:
     if (output.target_pidfd >= 0)
         close(output.target_pidfd);
     cw_capture_control_destroy(&control);
-    cw_io_uring_cleanup(&output);
+    if (output.target_maps) {
+        map_list_free(output.target_maps);
+        free(output.target_maps);
+    }
+    cw_fd_cache_destroy(&output.fd_resources);
     free_async_hops(async_hops, async_hop_count);
     free(configured_function);
+    free(exec_argv);
     return error ? 1 : 0;
 }

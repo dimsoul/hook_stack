@@ -1,0 +1,602 @@
+// SPDX-License-Identifier: MIT
+
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+#include <sys/epoll.h>
+
+#include "callweave_internal.h"
+#include "core/fd_resources.h"
+#include "epoll/epoll.h"
+#include "epoll/epoll_internal.h"
+
+const char *cw_epoll_wait_kind_name(uint32_t kind)
+{
+    switch (kind) {
+    case CW_EPOLL_WAIT:
+        return "epoll_wait";
+    case CW_EPOLL_PWAIT:
+        return "epoll_pwait";
+    case CW_EPOLL_PWAIT2:
+        return "epoll_pwait2";
+    default:
+        return "epoll_wait";
+    }
+}
+
+const char *cw_epoll_io_operation_name(uint32_t operation)
+{
+    switch (operation) {
+    case CW_EPOLL_IO_READ:
+        return "read";
+    case CW_EPOLL_IO_READV:
+        return "readv";
+    case CW_EPOLL_IO_RECVFROM:
+        return "recvfrom";
+    case CW_EPOLL_IO_RECVMSG:
+        return "recvmsg";
+    case CW_EPOLL_IO_RECVMMSG:
+        return "recvmmsg";
+    case CW_EPOLL_IO_WRITE:
+        return "write";
+    case CW_EPOLL_IO_WRITEV:
+        return "writev";
+    case CW_EPOLL_IO_SENDTO:
+        return "sendto";
+    case CW_EPOLL_IO_SENDMSG:
+        return "sendmsg";
+    case CW_EPOLL_IO_SENDMMSG:
+        return "sendmmsg";
+    case CW_EPOLL_IO_ACCEPT:
+        return "accept";
+    case CW_EPOLL_IO_ACCEPT4:
+        return "accept4";
+    case CW_EPOLL_IO_CONNECT:
+        return "connect";
+    case CW_EPOLL_IO_CLOSE:
+        return "close";
+    case CW_EPOLL_IO_DUP:
+        return "dup";
+    case CW_EPOLL_IO_DUP2:
+        return "dup2";
+    case CW_EPOLL_IO_DUP3:
+        return "dup3";
+    case CW_EPOLL_IO_FCNTL_DUP:
+        return "fcntl-dup";
+    case CW_EPOLL_IO_SPLICE:
+        return "splice";
+    default:
+        return "none";
+    }
+}
+
+bool cw_epoll_resource_single_read(const char *resource)
+{
+    return resource &&
+        (strstr(resource, "anon_inode:[eventfd]") ||
+         strstr(resource, "anon_inode:[timerfd]") ||
+         strstr(resource, "anon_inode:[signalfd]"));
+}
+
+static void append_event_name(
+    char *buffer, size_t size, const char *name)
+{
+    size_t length = strlen(buffer);
+
+    if (length && length + 1 < size) {
+        buffer[length++] = '|';
+        buffer[length] = '\0';
+    }
+    if (length < size)
+        snprintf(buffer + length, size - length, "%s", name);
+}
+
+void cw_epoll_format_events(uint32_t events, char *buffer, size_t size)
+{
+    struct event_name {
+        uint32_t flag;
+        const char *name;
+    };
+    static const struct event_name names[] = {
+        {EPOLLIN, "IN"},
+        {EPOLLPRI, "PRI"},
+        {EPOLLOUT, "OUT"},
+        {EPOLLERR, "ERR"},
+        {EPOLLHUP, "HUP"},
+#ifdef EPOLLRDHUP
+        {EPOLLRDHUP, "RDHUP"},
+#endif
+        {EPOLLET, "ET"},
+        {EPOLLONESHOT, "ONESHOT"},
+#ifdef EPOLLWAKEUP
+        {EPOLLWAKEUP, "WAKEUP"},
+#endif
+#ifdef EPOLLEXCLUSIVE
+        {EPOLLEXCLUSIVE, "EXCLUSIVE"},
+#endif
+    };
+    uint32_t known = 0;
+    size_t index;
+
+    if (!buffer || !size)
+        return;
+    buffer[0] = '\0';
+    for (index = 0; index < sizeof(names) / sizeof(names[0]); index++) {
+        if (events & names[index].flag) {
+            append_event_name(buffer, size, names[index].name);
+            known |= names[index].flag;
+        }
+    }
+    if (events & ~known) {
+        char unknown[24];
+
+        snprintf(unknown, sizeof(unknown), "0x%x", events & ~known);
+        append_event_name(buffer, size, unknown);
+    }
+    if (!buffer[0])
+        snprintf(buffer, size, "0");
+}
+
+int cw_epoll_write_json_string(
+    FILE *stream, const char *text, size_t size)
+{
+    size_t index;
+
+    if (fputc('"', stream) == EOF)
+        return -1;
+    for (index = 0; index < size && text[index]; index++) {
+        unsigned char character = (unsigned char)text[index];
+
+        if (character == '"' || character == '\\') {
+            if (fputc('\\', stream) == EOF ||
+                fputc(character, stream) == EOF)
+                return -1;
+        } else if (character == '\n') {
+            if (fputs("\\n", stream) == EOF)
+                return -1;
+        } else if (character == '\r') {
+            if (fputs("\\r", stream) == EOF)
+                return -1;
+        } else if (character == '\t') {
+            if (fputs("\\t", stream) == EOF)
+                return -1;
+        } else if (character < 0x20) {
+            if (fprintf(stream, "\\u%04x", character) < 0)
+                return -1;
+        } else if (fputc(character, stream) == EOF) {
+            return -1;
+        }
+    }
+    return fputc('"', stream) == EOF ? -1 : 0;
+}
+
+static int write_ready_json(
+    FILE *stream, struct output_options *output,
+    const struct cw_epoll_event *event)
+{
+    uint32_t index;
+
+    if (fputs(",\"ready\":[", stream) == EOF)
+        return -1;
+    for (index = 0; index < event->captured_events; index++) {
+        const struct cw_epoll_ready *ready = &event->ready[index];
+        char flags[128];
+        char resource[PATH_MAX];
+
+        cw_epoll_format_events(
+            ready->events, flags, sizeof(flags));
+        cw_fd_resolve(&output->fd_resources, output->target_pid,
+                      ready->fd, resource, sizeof(resource));
+        if (index && fputc(',', stream) == EOF)
+            return -1;
+        if (fprintf(stream,
+                    "{\"fd\":%d,\"data\":\"0x%016llx\","
+                    "\"events\":%u,\"flags\":",
+                    ready->fd, (unsigned long long)ready->data,
+                    ready->events) < 0 ||
+            cw_epoll_write_json_string(
+                stream, flags, strlen(flags)) ||
+            fputs(",\"resource\":", stream) == EOF ||
+            cw_epoll_write_json_string(
+                stream, resource, strlen(resource)) ||
+            fputc('}', stream) == EOF)
+            return -1;
+    }
+    return fputc(']', stream) == EOF ? -1 : 0;
+}
+
+static int write_epoll_json(
+    struct output_options *output,
+    const struct cw_epoll_event *event)
+{
+    FILE *stream = output->json_stream;
+    uint64_t realtime_ns =
+        event_realtime_nanoseconds(event->timestamp_ns);
+
+    if (!stream)
+        return 0;
+    if (fprintf(
+            stream,
+            "{\"type\":\"epoll_wait\",\"timestamp_ns\":%llu,"
+            "\"pid\":%u,\"tid\":%u,\"global_pid\":%u,"
+            "\"global_tid\":%u,\"comm\":",
+            (unsigned long long)realtime_ns,
+            event->pid, event->tid, event->global_pid,
+            event->global_tid) < 0 ||
+        cw_epoll_write_json_string(
+            stream, event->comm, sizeof(event->comm)) ||
+        fputs(",\"syscall\":", stream) == EOF ||
+        cw_epoll_write_json_string(
+            stream, cw_epoll_wait_kind_name(event->wait_kind),
+            strlen(cw_epoll_wait_kind_name(event->wait_kind))) ||
+        fprintf(
+            stream,
+            ",\"epoll_fd\":%d,\"result\":%d,\"timeout_ms\":%d,"
+            "\"max_events\":%u,\"wait_ns\":%llu,"
+            "\"captured_events\":%u,\"unresolved_events\":%u",
+            event->epoll_fd, event->result, event->timeout_ms,
+            event->max_events,
+            (unsigned long long)event->wait_ns,
+            event->captured_events, event->unresolved_events) < 0 ||
+        write_ready_json(stream, output, event) ||
+        fputs("}\n", stream) == EOF ||
+        fflush(stream))
+        return -1;
+    return 0;
+}
+
+static void print_epoll_event(
+    struct output_options *output,
+    const struct cw_epoll_event *event)
+{
+    uint32_t index;
+
+    print_event_time(event->timestamp_ns);
+    printf("EPOLL %s PID %u/TID %u (%.*s) epfd=%d result=%d",
+           cw_epoll_wait_kind_name(event->wait_kind),
+           event->pid, event->tid,
+           (int)sizeof(event->comm), event->comm,
+           event->epoll_fd, event->result);
+    print_interval("wait", event->wait_ns);
+    if (event->timeout_ms == -2)
+        printf(" timeout=timespec");
+    else
+        printf(" timeout=%d ms", event->timeout_ms);
+    if (event->result < 0 && event->result >= -4095)
+        printf(" error=%s", strerror(-event->result));
+    putchar('\n');
+
+    for (index = 0; index < event->captured_events; index++) {
+        const struct cw_epoll_ready *ready = &event->ready[index];
+        char flags[128];
+        char resource[PATH_MAX];
+
+        cw_epoll_format_events(
+            ready->events, flags, sizeof(flags));
+        cw_fd_resolve(&output->fd_resources, output->target_pid,
+                      ready->fd, resource, sizeof(resource));
+        printf("  ready[%u]: fd=", index);
+        if (ready->fd >= 0)
+            printf("%d", ready->fd);
+        else
+            printf("unresolved");
+        printf(" events=%s data=0x%016llx",
+               flags, (unsigned long long)ready->data);
+        if (resource[0])
+            printf("\n             resource: %s", resource);
+        putchar('\n');
+    }
+    if (event->result > (int32_t)event->captured_events)
+        printf("  ... %u additional ready events not copied\n",
+               (uint32_t)event->result - event->captured_events);
+    if (event->unresolved_events)
+        printf("  note: %u event.data value%s could not be mapped "
+               "back to an FD\n",
+               event->unresolved_events,
+               event->unresolved_events == 1 ? "" : "s");
+    putchar('\n');
+}
+
+int cw_epoll_handle_event(void *context, void *data, size_t data_size)
+{
+    struct output_options *output = context;
+    const struct cw_epoll_event *event = data;
+    uint32_t index;
+
+    if (data_size < sizeof(*event) ||
+        !cw_capture_running(output->control))
+        return 0;
+    for (index = 0; index < event->captured_events; index++)
+        cw_fd_cache_one(
+            &output->fd_resources, output->target_pid,
+            event->ready[index].fd);
+
+    if (output->json_output) {
+        if (write_epoll_json(output, event)) {
+            fprintf(stderr, "failed to write epoll JSON output: %s\n",
+                    strerror(errno ? errno : EIO));
+            output->export_failed = true;
+            cw_capture_request_stop(
+                output->control, CW_STOP_OUTPUT_ERROR);
+            return 0;
+        }
+    } else {
+        print_epoll_event(output, event);
+    }
+
+    output->emitted_events++;
+    if (output->max_events &&
+        output->emitted_events >= output->max_events)
+        cw_capture_request_stop(
+            output->control, CW_STOP_MAX_EVENTS);
+    return 0;
+}
+
+static const char *dispatch_status(
+    const struct cw_epoll_dispatch_item *item,
+    bool single_read_resource)
+{
+    if (!(item->flags & CW_EPOLL_DISPATCH_CONSUMED))
+        return "not handled on the event-loop thread";
+    if (item->flags & CW_EPOLL_DISPATCH_ONESHOT_MISSING_REARM)
+        return "possible missing EPOLLONESHOT rearm";
+    if (item->flags & CW_EPOLL_DISPATCH_MSG_PEEK)
+        return "MSG_PEEK observed; data may remain queued";
+    if (item->flags & CW_EPOLL_DISPATCH_EAGAIN)
+        return "drained to EAGAIN";
+    if (item->flags & CW_EPOLL_DISPATCH_EOF)
+        return "EOF observed";
+    if (item->flags & CW_EPOLL_DISPATCH_CLOSED)
+        return "FD closed";
+    if (item->flags & CW_EPOLL_DISPATCH_REARMED)
+        return "registration rearmed";
+    if (item->flags & CW_EPOLL_DISPATCH_SHORT_READ)
+        return "short read";
+    if ((item->flags & CW_EPOLL_DISPATCH_ET_UNDRAINED) &&
+        single_read_resource)
+        return "single-read counter FD handled";
+    if (item->flags & CW_EPOLL_DISPATCH_ET_UNDRAINED)
+        return "possible incomplete EPOLLET drain";
+    return "handled";
+}
+
+static uint64_t dispatch_latency(
+    const struct cw_epoll_dispatch_event *event,
+    const struct cw_epoll_dispatch_item *item)
+{
+    if (item->first_io_ns > item->ready_ns)
+        return item->first_io_ns - item->ready_ns;
+    return event->return_to_wait_ns;
+}
+
+static int write_dispatch_json_item(
+    struct output_options *output,
+    const struct cw_epoll_dispatch_event *event,
+    const struct cw_epoll_dispatch_item *item)
+{
+    FILE *stream = output->json_stream;
+    uint64_t realtime_ns =
+        event_realtime_nanoseconds(item->ready_ns);
+    char ready_flags[128];
+    char interest_flags[128];
+    char resource[PATH_MAX];
+    bool single_read_resource;
+    bool et_warning;
+
+    if (!stream)
+        return 0;
+    cw_epoll_format_events(
+        item->ready_events, ready_flags, sizeof(ready_flags));
+    cw_epoll_format_events(
+        item->interest_events, interest_flags,
+        sizeof(interest_flags));
+    cw_fd_resolve(
+        &output->fd_resources, output->target_pid,
+        item->fd, resource, sizeof(resource));
+    single_read_resource = cw_epoll_resource_single_read(resource);
+    et_warning =
+        (item->flags & CW_EPOLL_DISPATCH_ET_UNDRAINED) &&
+        !single_read_resource;
+    if (fprintf(
+            stream,
+            "{\"type\":\"epoll_dispatch\","
+            "\"timestamp_ns\":%llu,\"pid\":%u,\"tid\":%u,"
+            "\"global_pid\":%u,\"global_tid\":%u,"
+            "\"epoll_fd\":%d,\"fd\":%d,"
+            "\"epoll_generation\":%u,\"fd_generation\":%u,"
+            "\"data\":\"0x%016llx\",\"ready_events\":%u,"
+            "\"ready_flags\":",
+            (unsigned long long)realtime_ns,
+            event->pid, event->tid,
+            event->global_pid, event->global_tid,
+            event->epoll_fd, item->fd,
+            item->epoll_generation, item->fd_generation,
+            (unsigned long long)item->data,
+            item->ready_events) < 0 ||
+        cw_epoll_write_json_string(
+            stream, ready_flags, strlen(ready_flags)) ||
+        fputs(",\"interest_flags\":", stream) == EOF ||
+        cw_epoll_write_json_string(
+            stream, interest_flags, strlen(interest_flags)) ||
+        fprintf(
+            stream,
+            ",\"consumed\":%s,\"dispatch_ns\":%llu,"
+            "\"return_to_wait_ns\":%llu,"
+            "\"cycle_offcpu_ns\":%llu,"
+            "\"cycle_blocked_ns\":%llu,"
+            "\"cycle_runqueue_ns\":%llu,"
+            "\"io_calls\":%u,"
+            "\"read_calls\":%u,\"write_calls\":%u,"
+            "\"bytes_read\":%llu,\"bytes_written\":%llu,"
+            "\"requested_bytes\":%llu,"
+            "\"io_errors\":%u,\"first_operation\":",
+            item->flags & CW_EPOLL_DISPATCH_CONSUMED ?
+                "true" : "false",
+            (unsigned long long)dispatch_latency(event, item),
+            (unsigned long long)event->return_to_wait_ns,
+            (unsigned long long)event->cycle_offcpu_ns,
+            (unsigned long long)event->cycle_blocked_ns,
+            (unsigned long long)event->cycle_runqueue_ns,
+            item->io_calls, item->read_calls, item->write_calls,
+            (unsigned long long)item->bytes_read,
+            (unsigned long long)item->bytes_written,
+            (unsigned long long)item->requested_bytes,
+            item->io_errors) < 0 ||
+        cw_epoll_write_json_string(
+            stream,
+            cw_epoll_io_operation_name(item->first_operation),
+            strlen(cw_epoll_io_operation_name(
+                item->first_operation))) ||
+        fputs(",\"last_operation\":", stream) == EOF ||
+        cw_epoll_write_json_string(
+            stream,
+            cw_epoll_io_operation_name(item->last_operation),
+            strlen(cw_epoll_io_operation_name(
+                item->last_operation))) ||
+        fprintf(
+            stream,
+            ",\"last_result\":%d,\"eagain\":%s,"
+            "\"short_read\":%s,\"eof\":%s,\"closed\":%s,"
+            "\"rearmed\":%s,\"potential_et_undrained\":%s,"
+            "\"potential_oneshot_missing_rearm\":%s,"
+            "\"msg_peek\":%s,"
+            "\"et_warning\":%s,\"resource\":",
+            item->last_result,
+            item->flags & CW_EPOLL_DISPATCH_EAGAIN ?
+                "true" : "false",
+            item->flags & CW_EPOLL_DISPATCH_SHORT_READ ?
+                "true" : "false",
+            item->flags & CW_EPOLL_DISPATCH_EOF ?
+                "true" : "false",
+            item->flags & CW_EPOLL_DISPATCH_CLOSED ?
+                "true" : "false",
+            item->flags & CW_EPOLL_DISPATCH_REARMED ?
+                "true" : "false",
+            item->flags & CW_EPOLL_DISPATCH_ET_UNDRAINED ?
+                "true" : "false",
+            item->flags &
+                CW_EPOLL_DISPATCH_ONESHOT_MISSING_REARM ?
+                "true" : "false",
+            item->flags & CW_EPOLL_DISPATCH_MSG_PEEK ?
+                "true" : "false",
+            et_warning ? "true" : "false") < 0 ||
+        cw_epoll_write_json_string(
+            stream, resource, strlen(resource)) ||
+        fputs(",\"status\":", stream) == EOF ||
+        cw_epoll_write_json_string(
+            stream,
+            dispatch_status(item, single_read_resource),
+            strlen(dispatch_status(
+                item, single_read_resource))) ||
+        fputs("}\n", stream) == EOF ||
+        fflush(stream))
+        return -1;
+    return 0;
+}
+
+static void print_dispatch_item(
+    struct output_options *output,
+    const struct cw_epoll_dispatch_event *event,
+    const struct cw_epoll_dispatch_item *item)
+{
+    char ready_flags[128];
+    char interest_flags[128];
+    char resource[PATH_MAX];
+    bool single_read_resource;
+
+    cw_epoll_format_events(
+        item->ready_events, ready_flags, sizeof(ready_flags));
+    cw_epoll_format_events(
+        item->interest_events, interest_flags,
+        sizeof(interest_flags));
+    cw_fd_resolve(
+        &output->fd_resources, output->target_pid,
+        item->fd, resource, sizeof(resource));
+    single_read_resource = cw_epoll_resource_single_read(resource);
+
+    print_event_time(item->ready_ns);
+    printf("EPOLL DISPATCH PID %u/TID %u (%.*s) epfd=%d fd=%d\n",
+           event->pid, event->tid,
+           (int)sizeof(event->comm), event->comm,
+           event->epoll_fd, item->fd);
+    printf("  ready   : %s (interest=%s)",
+           ready_flags, interest_flags);
+    if (resource[0])
+        printf("\n  resource: %s", resource);
+    putchar('\n');
+    printf("  cycle   :");
+    print_interval("total", event->return_to_wait_ns);
+    print_interval("off-CPU", event->cycle_offcpu_ns);
+    print_interval("blocked", event->cycle_blocked_ns);
+    print_interval("run queue", event->cycle_runqueue_ns);
+    print_interval(
+        "preempt/unknown",
+        event->cycle_offcpu_ns >
+            event->cycle_blocked_ns + event->cycle_runqueue_ns ?
+            event->cycle_offcpu_ns -
+                event->cycle_blocked_ns -
+                event->cycle_runqueue_ns : 0);
+    putchar('\n');
+    if (item->flags & CW_EPOLL_DISPATCH_CONSUMED) {
+        printf("  dispatch: %s",
+               cw_epoll_io_operation_name(item->first_operation));
+        print_interval(
+            "ready->I/O", dispatch_latency(event, item));
+        print_interval("I/O time", item->total_io_ns);
+        printf("\n  I/O     : calls=%u read=%u/%llu B "
+               "write=%u/%llu B errors=%u last=%s(%d)\n",
+               item->io_calls,
+               item->read_calls,
+               (unsigned long long)item->bytes_read,
+               item->write_calls,
+               (unsigned long long)item->bytes_written,
+               item->io_errors,
+               cw_epoll_io_operation_name(item->last_operation),
+               item->last_result);
+        if (item->requested_bytes ||
+            (item->flags & CW_EPOLL_DISPATCH_MSG_PEEK))
+            printf("  evidence: requested=%llu%s\n",
+                   (unsigned long long)item->requested_bytes,
+                   item->flags & CW_EPOLL_DISPATCH_MSG_PEEK ?
+                       " MSG_PEEK" : "");
+    } else {
+        printf("  dispatch: no matching I/O before next epoll wait");
+        print_interval(
+            "window", dispatch_latency(event, item));
+        putchar('\n');
+    }
+    printf("  status  : %s\n\n",
+           dispatch_status(item, single_read_resource));
+}
+
+int cw_epoll_handle_dispatch_event(
+    void *context, void *data, size_t data_size)
+{
+    struct output_options *output = context;
+    const struct cw_epoll_dispatch_event *event = data;
+    const struct cw_epoll_dispatch_item *item;
+
+    if (data_size < sizeof(*event) ||
+        !cw_capture_running(output->control))
+        return 0;
+    item = &event->item;
+    cw_fd_cache_one(
+        &output->fd_resources, output->target_pid, item->fd);
+    if (output->json_output) {
+        if (write_dispatch_json_item(output, event, item)) {
+            fprintf(
+                stderr,
+                "failed to write epoll dispatch JSON: %s\n",
+                strerror(errno ? errno : EIO));
+            output->export_failed = true;
+            cw_capture_request_stop(
+                output->control, CW_STOP_OUTPUT_ERROR);
+            return 0;
+        }
+    } else {
+        print_dispatch_item(output, event, item);
+    }
+    return 0;
+}

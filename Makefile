@@ -45,16 +45,17 @@ THREAD_POOL_TEST_BINARY := test/trace_thread_pool_test
 COMPLEX_ASYNC_TEST_BINARY := test/trace_complex_async_test
 LOCK_TEST_BINARY := test/trace_lock_test
 IO_URING_TEST_BINARY := test/trace_io_uring_test
+EPOLL_TEST_BINARY := test/trace_epoll_test
 BPF_OBJECT := src/callweave.bpf.o
 VMLINUX_HEADER := src/vmlinux.h
 SKELETON_HEADER := src/callweave.skel.h
 
 .DELETE_ON_ERROR:
-.PHONY: all clean test-program demo-async demo-io-uring
+.PHONY: all clean test-program demo-async demo-io-uring demo-epoll
 
 all: $(BINARY) $(TEST_BINARY) $(ASYNC_TEST_BINARY) \
 	$(THREAD_POOL_TEST_BINARY) $(COMPLEX_ASYNC_TEST_BINARY) \
-	$(LOCK_TEST_BINARY) $(IO_URING_TEST_BINARY)
+	$(LOCK_TEST_BINARY) $(IO_URING_TEST_BINARY) $(EPOLL_TEST_BINARY)
 
 $(VMLINUX_HEADER):
 	@test -r /sys/kernel/btf/vmlinux || \
@@ -63,6 +64,8 @@ $(VMLINUX_HEADER):
 
 $(BPF_OBJECT): src/callweave.bpf.c \
 		src/core/core_config.h src/async/async_config.h \
+		src/epoll/epoll_config.h src/epoll/epoll_shared.h \
+		src/epoll/epoll.bpf.maps.h src/epoll/epoll.bpf.progs.h \
 		src/io_uring/io_uring_config.h \
 		src/io_uring/io_uring_shared.h \
 		src/io_uring/io_uring.bpf.maps.h \
@@ -74,7 +77,10 @@ $(SKELETON_HEADER): $(BPF_OBJECT)
 	$(BPFTOOL) gen skeleton $< > $@
 
 $(BINARY): src/callweave.c src/core/capture_control.c \
+		src/core/fd_resources.c \
 		src/async/async_output.c src/config.c \
+		src/epoll/epoll.c src/epoll/epoll_report.c \
+		src/epoll/epoll_resources.c \
 		src/symbols.c src/io_uring/io_uring.c \
 		src/io_uring/io_uring_report.c \
 		src/io_uring/io_uring_resources.c \
@@ -84,13 +90,19 @@ $(BINARY): src/callweave.c src/core/capture_control.c \
 		src/async/async_config.h src/async/async_events.h \
 		src/async/async_output.h \
 		src/core/capture_control.h src/core/core_config.h \
+		src/core/fd_resources.h \
+		src/epoll/epoll.h src/epoll/epoll_internal.h \
+		src/epoll/epoll_config.h src/epoll/epoll_shared.h \
 		src/io_uring/io_uring_config.h \
 		src/callweave_internal.h \
 		src/config.h src/symbols.h \
 		src/report.c src/report.h $(SKELETON_HEADER)
 	$(CC) $(CFLAGS) $(LIBBPF_CFLAGS) $(LIBELF_CFLAGS) -Isrc \
 		src/callweave.c src/core/capture_control.c \
+		src/core/fd_resources.c \
 		src/async/async_output.c src/config.c \
+		src/epoll/epoll.c src/epoll/epoll_report.c \
+		src/epoll/epoll_resources.c \
 		src/symbols.c src/io_uring/io_uring.c \
 		src/io_uring/io_uring_report.c \
 		src/io_uring/io_uring_resources.c src/report.c -o $@ \
@@ -120,9 +132,13 @@ $(IO_URING_TEST_BINARY): test/test_io_uring.c
 	$(CC) -std=gnu11 -O0 -g -Wall -Wextra -fno-omit-frame-pointer \
 		-fno-inline -rdynamic $< -o $@
 
+$(EPOLL_TEST_BINARY): test/test_epoll.c
+	$(CC) -std=gnu11 -O0 -g -Wall -Wextra -fno-omit-frame-pointer \
+		-fno-inline -rdynamic $< -o $@ -pthread
+
 test-program: $(TEST_BINARY) $(ASYNC_TEST_BINARY) \
 	$(THREAD_POOL_TEST_BINARY) $(COMPLEX_ASYNC_TEST_BINARY) \
-	$(LOCK_TEST_BINARY) $(IO_URING_TEST_BINARY)
+	$(LOCK_TEST_BINARY) $(IO_URING_TEST_BINARY) $(EPOLL_TEST_BINARY)
 
 demo-async: all
 	bash test/run_async_demo.sh
@@ -130,9 +146,13 @@ demo-async: all
 demo-io-uring: all
 	bash test/run_io_uring_demo.sh
 
+demo-epoll: all
+	bash test/run_epoll_demo.sh
+
 clean:
 	rm -f $(BINARY) $(TEST_BINARY) $(ASYNC_TEST_BINARY) \
 		$(THREAD_POOL_TEST_BINARY) $(COMPLEX_ASYNC_TEST_BINARY) \
-		$(LOCK_TEST_BINARY) $(IO_URING_TEST_BINARY) $(BPF_OBJECT) \
+		$(LOCK_TEST_BINARY) $(IO_URING_TEST_BINARY) \
+		$(EPOLL_TEST_BINARY) $(BPF_OBJECT) \
 		$(VMLINUX_HEADER) \
 		$(SKELETON_HEADER)
