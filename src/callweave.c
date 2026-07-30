@@ -264,6 +264,9 @@ static void detach_epoll_links(struct callweave_bpf *skeleton)
     detach_link(&skeleton->links.trace_epoll_wake_sys_enter);
     detach_link(&skeleton->links.trace_epoll_wake_sys_exit);
     detach_link(&skeleton->links.trace_epoll_signal_generate);
+    detach_link(&skeleton->links.trace_epoll_process_exec);
+    detach_link(&skeleton->links.trace_epoll_callback_entry);
+    detach_link(&skeleton->links.trace_epoll_callback_return);
 }
 
 static int attach_named_uprobe(struct bpf_program *program,
@@ -286,7 +289,7 @@ static int attach_named_uprobe(struct bpf_program *program,
         return 0;
 
     *link = NULL;
-    fprintf(stderr, "failed to attach async %suprobe to %s:%s: %s\n",
+    fprintf(stderr, "failed to attach %suprobe to %s:%s: %s\n",
             return_probe ? "return " : "", path, function,
             strerror(-error));
     return error;
@@ -361,6 +364,17 @@ static void usage(FILE *stream, const char *program)
             "user_data, 1-8 (default 1)\n"
             "      --epoll               trace epoll waits, dispatch, and "
             "resources\n"
+            "      --epoll-callback FUNC correlate ready FD to callback "
+            "execution\n"
+            "      --epoll-callback-binary PATH\n"
+            "                             ELF containing the callback "
+            "(default target executable)\n"
+            "      --epoll-callback-fd-arg N\n"
+            "                             callback argument containing the "
+            "FD, 1-8 (default 1)\n"
+            "      --min-epoll-callback-us US\n"
+            "                             only emit callbacks lasting at "
+            "least US\n"
             "      --exec PROGRAM         launch PROGRAM after epoll tracing "
             "is ready;\n"
             "                             put its arguments after `--`\n"
@@ -739,6 +753,10 @@ enum long_option_id {
     OPT_IO_CALLBACK_BINARY,
     OPT_IO_CALLBACK_ARG,
     OPT_EPOLL,
+    OPT_EPOLL_CALLBACK,
+    OPT_EPOLL_CALLBACK_BINARY,
+    OPT_EPOLL_CALLBACK_FD_ARG,
+    OPT_MIN_EPOLL_CALLBACK_US,
     OPT_MIN_EPOLL_WAIT_US,
     OPT_MIN_EPOLL_DISPATCH_US,
     OPT_EPOLL_TOP,
@@ -791,6 +809,14 @@ int main(int argc, char **argv)
         {"io-callback-arg", required_argument, NULL,
          OPT_IO_CALLBACK_ARG},
         {"epoll", no_argument, NULL, OPT_EPOLL},
+        {"epoll-callback", required_argument, NULL,
+         OPT_EPOLL_CALLBACK},
+        {"epoll-callback-binary", required_argument, NULL,
+         OPT_EPOLL_CALLBACK_BINARY},
+        {"epoll-callback-fd-arg", required_argument, NULL,
+         OPT_EPOLL_CALLBACK_FD_ARG},
+        {"min-epoll-callback-us", required_argument, NULL,
+         OPT_MIN_EPOLL_CALLBACK_US},
         {"min-epoll-wait-us", required_argument, NULL,
          OPT_MIN_EPOLL_WAIT_US},
         {"min-epoll-dispatch-us", required_argument, NULL,
@@ -842,6 +868,7 @@ int main(int argc, char **argv)
     char target_path[PATH_MAX] = {0};
     char async_source_path[PATH_MAX] = {0};
     char io_callback_path[PATH_MAX] = {0};
+    char epoll_callback_path[PATH_MAX] = {0};
     const char *binary_argument = NULL;
     const char *module_name = NULL;
     const char *find_symbol_name = NULL;
@@ -855,6 +882,8 @@ int main(int argc, char **argv)
     const char *report_path = NULL;
     const char *io_callback_name = NULL;
     const char *io_callback_binary = NULL;
+    const char *epoll_callback_name = NULL;
+    const char *epoll_callback_binary = NULL;
     const char *exec_path = NULL;
     char *configured_function = NULL;
     size_t function_offset = 0;
@@ -863,6 +892,7 @@ int main(int argc, char **argv)
     uint32_t async_max_age_ms = 30000;
     uint32_t duration_seconds = 0;
     uint32_t io_callback_arg = 1;
+    uint32_t epoll_callback_fd_arg = 1;
     uint64_t stop_time_ns = 0;
     size_t async_hop_count = 0;
     size_t async_link_count = 0;
@@ -874,6 +904,7 @@ int main(int argc, char **argv)
     char **exec_argv = NULL;
     bool async_option_seen = false;
     bool io_callback_option_seen = false;
+    bool epoll_callback_option_seen = false;
     bool epoll_top_option_seen = false;
     bool check_config = false;
     bool json_output = false;
@@ -1139,6 +1170,35 @@ int main(int argc, char **argv)
         case OPT_EPOLL:
             output.epoll_mode = true;
             break;
+        case OPT_EPOLL_CALLBACK:
+            epoll_callback_name = optarg;
+            epoll_callback_option_seen = true;
+            break;
+        case OPT_EPOLL_CALLBACK_BINARY:
+            epoll_callback_binary = optarg;
+            epoll_callback_option_seen = true;
+            break;
+        case OPT_EPOLL_CALLBACK_FD_ARG:
+            epoll_callback_option_seen = true;
+            if (parse_u32_range(
+                    optarg, 1, 8, &epoll_callback_fd_arg)) {
+                fprintf(
+                    stderr,
+                    "invalid --epoll-callback-fd-arg value: %s\n",
+                    optarg);
+                error = 2;
+                goto cleanup;
+            }
+            break;
+        case OPT_MIN_EPOLL_CALLBACK_US:
+            epoll_callback_option_seen = true;
+            if (parse_cli_us(
+                    "--min-epoll-callback-us", optarg,
+                    &output.epoll_min_callback_ns)) {
+                error = 2;
+                goto cleanup;
+            }
+            break;
         case OPT_MIN_EPOLL_WAIT_US:
             if (parse_cli_us("--min-epoll-wait-us", optarg,
                              &output.epoll_min_wait_ns)) {
@@ -1307,9 +1367,10 @@ int main(int argc, char **argv)
     if (!output.epoll_mode &&
         (output.epoll_min_wait_ns ||
          output.epoll_min_dispatch_ns ||
-         epoll_top_option_seen)) {
+         epoll_top_option_seen ||
+         epoll_callback_option_seen)) {
         fprintf(stderr,
-                "epoll filters require --epoll\n");
+                "epoll filters and callback options require --epoll\n");
         error = 2;
         goto cleanup;
     }
@@ -1388,7 +1449,19 @@ int main(int argc, char **argv)
                     "--epoll is a standalone mode; combine it only with "
                     "--pid or --exec, --min-epoll-wait-us, "
                     "--min-epoll-dispatch-us, --epoll-top, "
+                    "--epoll-callback options, "
                     "--duration, --max-events, --format, and --output\n");
+            error = 2;
+            goto cleanup;
+        }
+        if (epoll_callback_option_seen &&
+            (!epoll_callback_name || !epoll_callback_name[0])) {
+            fprintf(
+                stderr,
+                "--epoll-callback-binary, "
+                "--epoll-callback-fd-arg, and "
+                "--min-epoll-callback-us require "
+                "--epoll-callback FUNCTION\n");
             error = 2;
             goto cleanup;
         }
@@ -1419,6 +1492,37 @@ int main(int argc, char **argv)
             error = validate_target_pid(target_pid);
             if (error)
                 goto cleanup;
+        }
+        if (epoll_callback_name) {
+            if (epoll_callback_binary) {
+                if (!realpath(
+                        epoll_callback_binary,
+                        epoll_callback_path)) {
+                    fprintf(
+                        stderr,
+                        "cannot resolve epoll callback binary %s: %s\n",
+                        epoll_callback_binary, strerror(errno));
+                    error = 1;
+                    goto cleanup;
+                }
+            } else if (exec_path) {
+                if (!realpath(exec_path, epoll_callback_path)) {
+                    fprintf(
+                        stderr,
+                        "cannot resolve epoll target %s: %s\n",
+                        exec_path, strerror(errno));
+                    error = 1;
+                    goto cleanup;
+                }
+            } else {
+                error = resolve_process_executable(
+                    target_pid, epoll_callback_path,
+                    sizeof(epoll_callback_path));
+                if (error)
+                    goto cleanup;
+            }
+            output.epoll_callback_name =
+                epoll_callback_name;
         }
         goto trace_target_ready;
     }
@@ -1639,10 +1743,18 @@ trace_target_ready:
     skeleton->rodata->cw_io_uring_cfg.errors_only =
         output.io_uring_errors_only;
     skeleton->rodata->cw_epoll_cfg.enabled = output.epoll_mode;
+    skeleton->rodata->cw_epoll_cfg.callback_enabled =
+        output.epoll_callback_name != NULL;
+    skeleton->rodata->cw_epoll_cfg.callback_fd_arg =
+        epoll_callback_fd_arg;
+    skeleton->rodata->cw_epoll_cfg.defer_until_exec =
+        output.epoll_started_target;
     skeleton->rodata->cw_epoll_cfg.min_wait_ns =
         output.epoll_min_wait_ns;
     skeleton->rodata->cw_epoll_cfg.min_dispatch_ns =
         output.epoll_min_dispatch_ns;
+    skeleton->rodata->cw_epoll_cfg.min_callback_ns =
+        output.epoll_min_callback_ns;
     skeleton->rodata->cw_epoll_cfg.wait_syscall_nr = -1;
     skeleton->rodata->cw_epoll_cfg.pwait_syscall_nr = -1;
     skeleton->rodata->cw_epoll_cfg.pwait2_syscall_nr = -1;
@@ -1759,10 +1871,44 @@ trace_target_ready:
         if (!error)
             error = bpf_program__set_autoload(
                 skeleton->progs.trace_epoll_signal_generate, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_epoll_process_exec, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_epoll_callback_entry, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_epoll_callback_return, false);
         if (error) {
             fprintf(stderr,
                     "failed to disable epoll programs: %s\n",
                     strerror(-error));
+            goto cleanup;
+        }
+    }
+    if (output.epoll_mode && !output.epoll_started_target) {
+        error = bpf_program__set_autoload(
+            skeleton->progs.trace_epoll_process_exec, false);
+        if (error) {
+            fprintf(
+                stderr,
+                "failed to disable epoll exec gate program: %s\n",
+                strerror(-error));
+            goto cleanup;
+        }
+    }
+    if (!output.epoll_callback_name) {
+        error = bpf_program__set_autoload(
+            skeleton->progs.trace_epoll_callback_entry, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_epoll_callback_return, false);
+        if (error) {
+            fprintf(
+                stderr,
+                "failed to disable epoll callback programs: %s\n",
+                strerror(-error));
             goto cleanup;
         }
     }
@@ -1996,13 +2142,31 @@ trace_target_ready:
             error = attach_raw_tracepoint(
                 skeleton->progs.trace_sched_wakeup,
                 &skeleton->links.trace_sched_wakeup, "sched_wakeup");
+        if (!error && output.epoll_started_target)
+            error = attach_raw_tracepoint(
+                skeleton->progs.trace_epoll_process_exec,
+                &skeleton->links.trace_epoll_process_exec,
+                "sched_process_exec");
+        if (!error && output.epoll_callback_name)
+            error = attach_named_uprobe(
+                skeleton->progs.trace_epoll_callback_entry,
+                &skeleton->links.trace_epoll_callback_entry,
+                epoll_callback_path, output.epoll_callback_name,
+                0, false);
+        if (!error && output.epoll_callback_name)
+            error = attach_named_uprobe(
+                skeleton->progs.trace_epoll_callback_return,
+                &skeleton->links.trace_epoll_callback_return,
+                epoll_callback_path, output.epoll_callback_name,
+                0, true);
         if (error)
             goto cleanup;
         attach_optional_raw_tracepoint(
             skeleton->progs.trace_epoll_signal_generate,
             &skeleton->links.trace_epoll_signal_generate,
             "signal_generate");
-        cw_epoll_seed_existing(&output);
+        if (!output.epoll_started_target)
+            cw_epoll_seed_existing(&output);
     } else if (output.show_attribution) {
         error = attach_raw_tracepoint(
             skeleton->progs.trace_sched_switch,
@@ -2166,6 +2330,20 @@ trace_target_ready:
                     strerror(-error));
             goto cleanup;
         }
+        if (output.epoll_callback_name) {
+            error = ring_buffer__add(
+                ring_buffer,
+                bpf_map__fd(
+                    skeleton->maps.epoll_callback_events),
+                cw_epoll_handle_callback_event, &output);
+            if (error) {
+                fprintf(
+                    stderr,
+                    "failed to add epoll callback ring buffer: %s\n",
+                    strerror(-error));
+                goto cleanup;
+            }
+        }
     }
 
     if (json_output) {
@@ -2232,6 +2410,14 @@ trace_target_ready:
         if (output.epoll_min_dispatch_ns)
             fprintf(stderr, ", minimum epoll dispatch %.3f us",
                     (double)output.epoll_min_dispatch_ns / 1000.0);
+        if (output.epoll_callback_name)
+            fprintf(
+                stderr, ", callback %s fd-arg%u",
+                output.epoll_callback_name,
+                epoll_callback_fd_arg);
+        if (output.epoll_min_callback_ns)
+            fprintf(stderr, ", minimum callback %.3f us",
+                    (double)output.epoll_min_callback_ns / 1000.0);
         if (output.epoll_mode)
             fprintf(stderr, ", top %u event loops",
                     output.epoll_top);
@@ -2286,6 +2472,17 @@ trace_target_ready:
             printf(",");
             print_interval("min-epoll-dispatch",
                            output.epoll_min_dispatch_ns);
+        }
+        if (output.epoll_callback_name)
+            printf(
+                ", callback %s fd-arg%u",
+                output.epoll_callback_name,
+                epoll_callback_fd_arg);
+        if (output.epoll_min_callback_ns) {
+            printf(",");
+            print_interval(
+                "min-epoll-callback",
+                output.epoll_min_callback_ns);
         }
         if (output.epoll_mode)
             printf(", top %u event loops", output.epoll_top);
@@ -2434,7 +2631,9 @@ trace_target_ready:
             break;
         }
     }
-    if (ring_buffer && output.io_uring_callback_name &&
+    if (ring_buffer &&
+        (output.io_uring_callback_name ||
+         output.epoll_callback_name) &&
         cw_capture_should_finalize(&control)) {
         int consume_error = ring_buffer__consume(ring_buffer);
 

@@ -7,6 +7,8 @@
 
 #include <sys/epoll.h>
 
+#include <bpf/bpf.h>
+
 #include "callweave_internal.h"
 #include "core/fd_resources.h"
 #include "epoll/epoll.h"
@@ -708,6 +710,163 @@ int cw_epoll_handle_dispatch_event(
         }
     } else {
         print_dispatch_item(output, event, item);
+    }
+    return 0;
+}
+
+static int write_callback_json(
+    struct output_options *output,
+    const struct cw_epoll_callback_event *event)
+{
+    FILE *stream = output->json_stream;
+    uint64_t realtime_ns =
+        event_realtime_nanoseconds(event->start_ns);
+    uint64_t oncpu_ns =
+        event->duration_ns > event->offcpu_ns ?
+            event->duration_ns - event->offcpu_ns : 0;
+    uint64_t unknown_ns =
+        event->offcpu_ns >
+            event->blocked_ns + event->runqueue_ns ?
+            event->offcpu_ns -
+                event->blocked_ns - event->runqueue_ns : 0;
+    char ready_flags[128];
+    char resource[PATH_MAX];
+
+    if (!stream)
+        return 0;
+    cw_epoll_format_events(
+        event->ready_events, ready_flags, sizeof(ready_flags));
+    cw_fd_resolve(
+        &output->fd_resources, output->target_pid,
+        event->fd, resource, sizeof(resource));
+    if (fprintf(
+            stream,
+            "{\"type\":\"epoll_callback\","
+            "\"timestamp_ns\":%llu,\"pid\":%u,\"tid\":%u,"
+            "\"global_pid\":%u,\"global_tid\":%u,"
+            "\"epoll_fd\":%d,\"fd\":%d,"
+            "\"epoll_generation\":%u,\"fd_generation\":%u,"
+            "\"data\":\"0x%016llx\",\"ready_events\":%u,"
+            "\"ready_flags\":",
+            (unsigned long long)realtime_ns,
+            event->pid, event->tid,
+            event->global_pid, event->global_tid,
+            event->epoll_fd, event->fd,
+            event->epoll_generation, event->fd_generation,
+            (unsigned long long)event->data,
+            event->ready_events) < 0 ||
+        cw_epoll_write_json_string(
+            stream, ready_flags, strlen(ready_flags)) ||
+        fputs(",\"callback\":", stream) == EOF ||
+        cw_epoll_write_json_string(
+            stream, output->epoll_callback_name,
+            strlen(output->epoll_callback_name)) ||
+        fprintf(
+            stream,
+            ",\"ready_to_callback_ns\":%llu,"
+            "\"duration_ns\":%llu,\"oncpu_ns\":%llu,"
+            "\"offcpu_ns\":%llu,\"blocked_ns\":%llu,"
+            "\"runqueue_ns\":%llu,\"preempt_unknown_ns\":%llu,"
+            "\"stack_id\":%d,\"resource\":",
+            (unsigned long long)event->delay_ns,
+            (unsigned long long)event->duration_ns,
+            (unsigned long long)oncpu_ns,
+            (unsigned long long)event->offcpu_ns,
+            (unsigned long long)event->blocked_ns,
+            (unsigned long long)event->runqueue_ns,
+            (unsigned long long)unknown_ns,
+            event->stack_id) < 0 ||
+        cw_epoll_write_json_string(
+            stream, resource, strlen(resource)) ||
+        fputs(",\"wake\":", stream) == EOF ||
+        write_wake_json(stream, &event->wake) ||
+        fputs("}\n", stream) == EOF ||
+        fflush(stream))
+        return -1;
+    return 0;
+}
+
+static void print_callback_event(
+    struct output_options *output,
+    const struct cw_epoll_callback_event *event)
+{
+    uint64_t stack[MAX_ASYNC_STACK_DEPTH] = {0};
+    uint64_t oncpu_ns =
+        event->duration_ns > event->offcpu_ns ?
+            event->duration_ns - event->offcpu_ns : 0;
+    uint64_t unknown_ns =
+        event->offcpu_ns >
+            event->blocked_ns + event->runqueue_ns ?
+            event->offcpu_ns -
+                event->blocked_ns - event->runqueue_ns : 0;
+    char ready_flags[128];
+    char resource[PATH_MAX];
+
+    cw_epoll_format_events(
+        event->ready_events, ready_flags, sizeof(ready_flags));
+    cw_fd_resolve(
+        &output->fd_resources, output->target_pid,
+        event->fd, resource, sizeof(resource));
+    print_event_time(event->start_ns);
+    printf(
+        "EPOLL CALLBACK %s PID %u/TID %u (%.*s) "
+        "epfd=%d fd=%d events=%s\n",
+        output->epoll_callback_name,
+        event->pid, event->tid,
+        (int)sizeof(event->comm), event->comm,
+        event->epoll_fd, event->fd, ready_flags);
+    if (resource[0])
+        printf("  resource: %s\n", resource);
+    print_wake_source(&event->wake);
+    printf("  timing  :");
+    print_interval("ready->callback", event->delay_ns);
+    print_interval("callback", event->duration_ns);
+    print_interval("on-CPU", oncpu_ns);
+    print_interval("off-CPU", event->offcpu_ns);
+    print_interval("blocked", event->blocked_ns);
+    print_interval("run queue", event->runqueue_ns);
+    print_interval("preempt/unknown", unknown_ns);
+    printf("\n  callback stack:\n");
+    if (event->stack_id < 0 ||
+        output->epoll_stack_map_fd < 0 ||
+        bpf_map_lookup_elem(
+            output->epoll_stack_map_fd,
+            &event->stack_id, stack)) {
+        printf("    unavailable (stack_id=%d)\n\n",
+               event->stack_id);
+    } else if (output->target_maps) {
+        print_stack_frames(
+            stack, sizeof(stack), output->target_maps,
+            "  ", NULL, NULL, 0, output->control);
+        putchar('\n');
+    } else {
+        printf("    process maps unavailable\n\n");
+    }
+}
+
+int cw_epoll_handle_callback_event(
+    void *context, void *data, size_t data_size)
+{
+    struct output_options *output = context;
+    const struct cw_epoll_callback_event *event = data;
+
+    if (data_size < sizeof(*event) ||
+        !cw_capture_running(output->control))
+        return 0;
+    cw_fd_cache_one(
+        &output->fd_resources, output->target_pid, event->fd);
+    if (output->json_output) {
+        if (write_callback_json(output, event)) {
+            fprintf(
+                stderr,
+                "failed to write epoll callback JSON: %s\n",
+                strerror(errno ? errno : EIO));
+            output->export_failed = true;
+            cw_capture_request_stop(
+                output->control, CW_STOP_OUTPUT_ERROR);
+        }
+    } else {
+        print_callback_event(output, event);
     }
     return 0;
 }

@@ -5,6 +5,7 @@
 
 #define CW_EPOLL_COMM_LEN 16
 #define CW_EPOLL_MAX_READY 16
+#define CW_EPOLL_MAX_CALLBACK_DEPTH 8
 
 enum cw_epoll_io_operation {
     CW_EPOLL_IO_NONE,
@@ -151,6 +152,12 @@ struct cw_epoll_counters {
     __u64 eventfd_ready;
     __u64 timerfd_ready;
     __u64 signalfd_ready;
+    __u64 callback_matched;
+    __u64 callback_unmatched;
+    __u64 callback_completed;
+    __u64 callback_overflow;
+    __u64 callback_emitted;
+    __u64 callback_dropped;
 };
 
 struct cw_epoll_loop_key {
@@ -233,6 +240,17 @@ struct cw_epoll_resource_stats {
     __u64 wake_total_latency_ns;
     __u64 wake_maximum_latency_ns;
     struct cw_epoll_wake_source last_wake;
+    __u64 callback_matched;
+    __u64 callback_completed;
+    __u64 callback_total_delay_ns;
+    __u64 callback_maximum_delay_ns;
+    __u64 callback_total_duration_ns;
+    __u64 callback_maximum_duration_ns;
+    __u64 callback_offcpu_ns;
+    __u64 callback_blocked_ns;
+    __u64 callback_runqueue_ns;
+    __s32 callback_stack_id;
+    __u32 callback_reserved;
 };
 
 struct cw_epoll_token_key {
@@ -296,6 +314,30 @@ struct cw_epoll_dispatch_event {
     __u32 reserved;
     char comm[CW_EPOLL_COMM_LEN];
     struct cw_epoll_dispatch_item item;
+};
+
+struct cw_epoll_callback_event {
+    __u64 timestamp_ns;
+    __u64 ready_ns;
+    __u64 start_ns;
+    __u64 delay_ns;
+    __u64 duration_ns;
+    __u64 offcpu_ns;
+    __u64 blocked_ns;
+    __u64 runqueue_ns;
+    __u64 data;
+    __u32 pid;
+    __u32 tid;
+    __u32 global_pid;
+    __u32 global_tid;
+    __s32 epoll_fd;
+    __s32 fd;
+    __u32 epoll_generation;
+    __u32 fd_generation;
+    __u32 ready_events;
+    __s32 stack_id;
+    char comm[CW_EPOLL_COMM_LEN];
+    struct cw_epoll_wake_source wake;
 };
 
 struct cw_epoll_fd_key {

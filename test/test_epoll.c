@@ -33,6 +33,7 @@ struct test_context {
     int oneshot_fd;
     int reused_fd;
     bool bad_oneshot;
+    bool slow_callback;
     unsigned long long bad_et_ready;
     unsigned long long oneshot_ready;
 };
@@ -168,18 +169,21 @@ static void consume_oneshot(struct test_context *context)
         fprintf(stderr, "ONESHOT rearm failed: %s\n", strerror(errno));
 }
 
-static void handle_ready(
-    struct test_context *context,
+__attribute__((noinline))
+void epoll_test_callback(
+    int fd, struct test_context *context,
     const struct epoll_event *event)
 {
-    int fd = (int)(uint32_t)event->data.u64;
+    (void)event;
 
     if (fd == context->event_fd || fd == context->timer_fd ||
         fd == context->reused_fd)
         consume_counter(fd);
-    else if (fd == context->signal_fd)
+    else if (fd == context->signal_fd) {
         consume_signal(fd);
-    else if (fd == context->socket_fd)
+        if (context->slow_callback)
+            usleep(2000);
+    } else if (fd == context->socket_fd)
         consume_socket(fd);
     else if (fd == context->bad_socket_fd) {
         __atomic_fetch_add(
@@ -206,8 +210,11 @@ static void *second_waiter(void *argument)
                 continue;
             break;
         }
-        for (index = 0; index < ready; index++)
-            handle_ready(context, &events[index]);
+        for (index = 0; index < ready; index++) {
+            int fd = (int)(uint32_t)events[index].data.u64;
+
+            epoll_test_callback(fd, context, &events[index]);
+        }
     }
     return NULL;
 }
@@ -243,6 +250,7 @@ int main(int argc, char **argv)
     bool demonstrate_bad_oneshot = false;
     bool demonstrate_multi_waiter = false;
     bool demonstrate_fd_reuse = false;
+    bool demonstrate_slow_callback = false;
     struct itimerspec timer = {
         .it_interval = {
             .tv_nsec = 150000000,
@@ -286,11 +294,15 @@ int main(int argc, char **argv)
                 demonstrate_fd_reuse = true;
                 continue;
             }
+            if (!strcmp(argv[argument], "--slow-callback")) {
+                demonstrate_slow_callback = true;
+                continue;
+            }
             if (iteration_limit) {
                 fprintf(stderr,
                         "usage: %s [ITERATIONS] [--bad-et] "
                         "[--bad-oneshot] [--multi-waiter] "
-                        "[--fd-reuse]\n",
+                        "[--fd-reuse] [--slow-callback]\n",
                         argv[0]);
                 return 2;
             }
@@ -317,6 +329,8 @@ int main(int argc, char **argv)
         printf("; intentionally missing EPOLLONESHOT rearm enabled");
     if (demonstrate_multi_waiter)
         printf("; two waiters enabled");
+    if (demonstrate_slow_callback)
+        printf("; intentionally blocked callback enabled");
     putchar('\n');
     fflush(stdout);
     sleep(2);
@@ -369,6 +383,7 @@ int main(int argc, char **argv)
         .oneshot_fd = oneshot_sockets[0],
         .reused_fd = -1,
         .bad_oneshot = demonstrate_bad_oneshot,
+        .slow_callback = demonstrate_slow_callback,
     };
     printf("epoll resources: epfd=%d eventfd=%d timerfd=%d "
            "signalfd=%d socket=%d oneshot=%d bad-et=%d reused=%d\n",
@@ -469,7 +484,9 @@ int main(int argc, char **argv)
             goto failure;
         }
         for (index = 0; index < ready; index++) {
-            handle_ready(&context, &events[index]);
+            int fd = (int)(uint32_t)events[index].data.u64;
+
+            epoll_test_callback(fd, &context, &events[index]);
         }
         iteration++;
         usleep(50000);

@@ -1184,7 +1184,7 @@ static __always_inline void epoll_switch_out(u64 pid_tgid, u64 now)
 {
     struct cw_epoll_dispatch_batch *batch;
 
-    if (!cw_epoll_cfg.enabled)
+    if (!cw_epoll_capture_active())
         return;
     batch = bpf_map_lookup_elem(
         &epoll_dispatch_batches, &pid_tgid);
@@ -1199,7 +1199,7 @@ static __always_inline void epoll_switch_in(u64 pid_tgid, u64 now)
     struct cw_epoll_dispatch_batch *batch;
     u64 offcpu_ns;
 
-    if (!cw_epoll_cfg.enabled)
+    if (!cw_epoll_capture_active())
         return;
     batch = bpf_map_lookup_elem(
         &epoll_dispatch_batches, &pid_tgid);
@@ -1216,6 +1216,73 @@ static __always_inline void epoll_switch_in(u64 pid_tgid, u64 now)
     }
     batch->offcpu_start_ns = 0;
     batch->wakeup_ns = 0;
+}
+
+static __always_inline void epoll_callback_switch_out(
+    u64 pid_tgid, u64 now)
+{
+    struct cw_epoll_callback_thread *thread;
+
+    if (!cw_epoll_cfg.callback_enabled ||
+        !cw_epoll_capture_active())
+        return;
+    thread = bpf_map_lookup_elem(
+        &epoll_callback_threads, &pid_tgid);
+    if (!thread || !thread->depth)
+        return;
+    thread->offcpu_start_ns = now;
+    thread->wakeup_ns = 0;
+}
+
+static __always_inline void epoll_callback_switch_in(
+    u64 pid_tgid, u64 now)
+{
+    struct cw_epoll_callback_thread *thread;
+    struct cw_epoll_callback_key key = {
+        .pid_tgid = pid_tgid,
+    };
+    u64 offcpu_ns;
+    u64 blocked_ns = 0;
+    u64 runqueue_ns = 0;
+    u32 depth;
+    int i;
+
+    if (!cw_epoll_cfg.callback_enabled ||
+        !cw_epoll_capture_active())
+        return;
+    thread = bpf_map_lookup_elem(
+        &epoll_callback_threads, &pid_tgid);
+    if (!thread || !thread->depth ||
+        !thread->offcpu_start_ns ||
+        now <= thread->offcpu_start_ns)
+        return;
+    offcpu_ns = now - thread->offcpu_start_ns;
+    if (thread->wakeup_ns >= thread->offcpu_start_ns &&
+        thread->wakeup_ns <= now) {
+        blocked_ns =
+            thread->wakeup_ns - thread->offcpu_start_ns;
+        runqueue_ns = now - thread->wakeup_ns;
+    }
+    depth = thread->depth;
+    if (depth > CW_EPOLL_MAX_CALLBACK_DEPTH)
+        depth = CW_EPOLL_MAX_CALLBACK_DEPTH;
+#pragma unroll
+    for (i = 0; i < CW_EPOLL_MAX_CALLBACK_DEPTH; i++) {
+        struct cw_epoll_callback_frame *frame;
+
+        if ((__u32)i >= depth)
+            break;
+        key.depth = i;
+        frame = bpf_map_lookup_elem(
+            &epoll_callback_frames, &key);
+        if (!frame || !frame->matched)
+            continue;
+        frame->event.offcpu_ns += offcpu_ns;
+        frame->event.blocked_ns += blocked_ns;
+        frame->event.runqueue_ns += runqueue_ns;
+    }
+    thread->offcpu_start_ns = 0;
+    thread->wakeup_ns = 0;
 }
 
 static __always_inline int is_futex_wait_operation(u32 operation)
@@ -1350,7 +1417,7 @@ int trace_sys_exit(struct bpf_raw_tracepoint_args *ctx)
 
     (void)ctx;
     if (!cw_trace_cfg.attribution_enabled &&
-        !cw_epoll_cfg.enabled)
+        !cw_epoll_capture_active())
         return 0;
     active = bpf_map_lookup_elem(&futex_waits, &pid_tgid);
     if (!active)
@@ -1585,12 +1652,13 @@ int trace_sched_switch(struct bpf_raw_tracepoint_args *ctx)
     u64 pid_tgid;
 
     if (!cw_trace_cfg.attribution_enabled &&
-        !cw_epoll_cfg.enabled)
+        !cw_epoll_capture_active())
         return 0;
 
     now = bpf_ktime_get_ns();
     pid_tgid = task_pid_tgid(prev);
     epoll_switch_out(pid_tgid, now);
+    epoll_callback_switch_out(pid_tgid, now);
     if (cw_trace_cfg.attribution_enabled) {
         thread = bpf_map_lookup_elem(&thread_states, &pid_tgid);
         if (thread && thread->depth) {
@@ -1607,6 +1675,7 @@ int trace_sched_switch(struct bpf_raw_tracepoint_args *ctx)
 
     pid_tgid = task_pid_tgid(next);
     epoll_switch_in(pid_tgid, now);
+    epoll_callback_switch_in(pid_tgid, now);
     if (cw_trace_cfg.attribution_enabled) {
         thread = bpf_map_lookup_elem(&thread_states, &pid_tgid);
         if (thread && thread->depth)
@@ -1666,18 +1735,26 @@ static __always_inline int record_task_wakeup(struct task_struct *task)
     u64 pid_tgid;
 
     if (!cw_trace_cfg.attribution_enabled &&
-        !cw_epoll_cfg.enabled)
+        !cw_epoll_capture_active())
         return 0;
 
     pid_tgid = task_pid_tgid(task);
-    if (cw_epoll_cfg.enabled) {
+    if (cw_epoll_capture_active()) {
         struct cw_epoll_dispatch_batch *batch =
             bpf_map_lookup_elem(
                 &epoll_dispatch_batches, &pid_tgid);
+        struct cw_epoll_callback_thread *callback_thread =
+            bpf_map_lookup_elem(
+                &epoll_callback_threads, &pid_tgid);
 
         if (batch && batch->offcpu_start_ns &&
             !batch->wakeup_ns)
             batch->wakeup_ns = bpf_ktime_get_ns();
+        if (callback_thread &&
+            callback_thread->offcpu_start_ns &&
+            !callback_thread->wakeup_ns)
+            callback_thread->wakeup_ns =
+                bpf_ktime_get_ns();
     }
     if (cw_trace_cfg.attribution_enabled) {
         thread = bpf_map_lookup_elem(&thread_states, &pid_tgid);
@@ -1709,5 +1786,6 @@ int trace_sched_waking(struct bpf_raw_tracepoint_args *ctx)
 #include "io_uring/io_uring.bpf.progs.h"
 #include "epoll/epoll.bpf.progs.h"
 #include "epoll/epoll_wake.bpf.progs.h"
+#include "epoll/epoll_callback.bpf.progs.h"
 
 char LICENSE[] SEC("license") = "GPL";

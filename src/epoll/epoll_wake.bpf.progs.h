@@ -336,7 +336,7 @@ int trace_epoll_wake_sys_enter(struct bpf_raw_tracepoint_args *ctx)
     struct cw_epoll_process_identity identity;
     bool wait_syscall;
 
-    if (!cw_epoll_cfg.enabled)
+    if (!cw_epoll_capture_active())
         return 0;
     io_operation = cw_epoll_io_operation(syscall_nr);
     wait_syscall =
@@ -384,7 +384,7 @@ int trace_epoll_wake_sys_exit(struct bpf_raw_tracepoint_args *ctx)
     struct cw_epoll_wake_sys_state *state =
         bpf_map_lookup_elem(&epoll_wake_sys_states, &pid_tgid);
 
-    if (!cw_epoll_cfg.enabled)
+    if (!cw_epoll_capture_active())
         return 0;
     if (wait) {
         cw_epoll_finish_wake_wait(
@@ -422,7 +422,7 @@ int trace_epoll_signal_generate(struct bpf_raw_tracepoint_args *ctx)
     struct cw_epoll_wake_source combined;
     struct cw_epoll_wake_source *existing;
 
-    if (!cw_epoll_cfg.enabled || !target ||
+    if (!cw_epoll_capture_active() || !target ||
         !signal_number || signal_number > 64)
         return 0;
     configured_target =

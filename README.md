@@ -51,6 +51,9 @@ the target application.
   multi-waiter fairness, timeout/error behavior, full-batch pressure,
   EPOLLET drain evidence, call site, monitored resources, and eventfd,
   timerfd, and signalfd wake-source attribution.
+- Correlate an epoll-ready FD with a selected user callback and report
+  ready-to-callback delay, callback duration, scheduler-state attribution,
+  slowest call sites, and nested callback execution.
 - Pair nested and recursive calls independently for each thread.
 - Stop cleanly on `SIGINT` or `SIGTERM`.
 
@@ -370,7 +373,9 @@ sudo ./callweave --epoll --exec ./server -- --port 8080
 `--exec PROGRAM` treats arguments after `--` as target arguments. When
 Callweave itself was started through `sudo`, the target is returned to the
 invoking user's UID, GID, and supplementary groups before `exec`. The target
-is supervised as part of the capture and is stopped when tracing ends.
+is supervised as part of the capture and is stopped when tracing ends. An
+exec gate starts epoll accounting at the target's successful `exec`, excluding
+the suspended Callweave child-launcher's own file descriptors and epoll calls.
 
 The tracer observes `epoll_wait`, `epoll_pwait`, and `epoll_pwait2`, successful
 `epoll_ctl` changes, the common read/write/socket I/O syscalls performed after
@@ -402,7 +407,9 @@ waits omitted by the detail threshold. It reports:
 - socket endpoints, Unix sockets, eventfd, timerfd, pipes, and file paths when
   `/proc/PID` exposes them;
 - eventfd writers, timerfd arms, and signalfd signal senders, including their
-  source thread, user stack, source-to-ready latency, and attribution coverage.
+  source thread, user stack, source-to-ready latency, and attribution coverage;
+- when configured, callback matches, ready-to-callback delay, execution time,
+  on-CPU/blocked/run-queue attribution, and slowest callback stacks.
 
 Long waits are not treated as slow work: an event loop normally blocks in
 epoll while idle. The diagnosis instead highlights repeated full batches,
@@ -459,6 +466,8 @@ Use the report as follows:
 | An eventfd wakes the loop unexpectedly | `eventfd` latest source and writer stack | Find the code path that wrote the counter, then inspect repeated or bursty writes. |
 | A timer callback runs late | High `timerfd` schedule-to-ready latency | Check event-loop starvation, CPU contention, or an overloaded ready queue rather than blaming `epoll_wait`. |
 | A signal-driven event appears unexpectedly | `signalfd` signal number, sender thread, and stack | Locate the `kill`, `tgkill`, or equivalent sender and verify signal routing and masking. |
+| The event loop is slow but I/O is fast | High callback execution time in section `[10]` | Inspect the slowest callback stack and its on-CPU/blocked/run-queue split. |
+| A callback starts long after epoll returned its FD | High `AVG/MAX R->CB` | Check earlier callbacks in the same ready batch, event-loop starvation, or unfair per-event work. |
 
 For example, high dispatch latency on one socket together with an EPOLLET
 warning means the socket was returned by epoll, the loop did not reach its
@@ -467,10 +476,73 @@ was drained. The handler stack identifies where to begin reviewing the code.
 
 The generic tracer associates readiness with I/O on the same event-loop
 thread. A worker-thread handoff is therefore reported as unhandled/handoff,
-not automatically as an error. Pure user-space callback work that performs no
-I/O cannot yet be assigned an exact callback duration; runtime adapters for
-libuv, libevent, Boost.Asio, or application-specific loops are needed for that
-boundary.
+not automatically as an error. If the application callback is known and
+receives the ready FD directly, the optional callback probe below provides an
+exact user-space boundary. Runtime adapters are still needed when libuv,
+libevent, Boost.Asio, or an application loop passes an opaque wrapper rather
+than the raw FD.
+
+#### Callback execution attribution
+
+Use `--epoll-callback` when a known function handles one ready FD and one of
+its first eight integer arguments contains that FD:
+
+```sh
+sudo ./callweave -p PID --epoll \
+  --epoll-callback handle_ready_fd \
+  --epoll-callback-fd-arg 1
+```
+
+The callback is assumed to be in `/proc/PID/exe`. Select a shared library or
+another ELF explicitly when needed:
+
+```sh
+sudo ./callweave -p PID --epoll \
+  --epoll-callback dispatch_connection \
+  --epoll-callback-binary /opt/app/lib/libloop.so \
+  --epoll-callback-fd-arg 2
+```
+
+At callback entry, Callweave reads the configured argument and matches
+`thread + FD` against the unresolved resources in the current epoll batch.
+The return probe then measures:
+
+```text
+FD ready -> callback entry -> callback return
+             |                 |
+             + ready delay     + execution and scheduler breakdown
+```
+
+Text output includes individual `EPOLL CALLBACK` records and a final
+`[10] Callback execution` table. The table ranks resources by maximum callback
+duration and reports average/maximum ready-to-callback delay, average/maximum
+work time, and average on-CPU, blocked, and run-queue time. The callback record
+also carries the eventfd/timerfd/signalfd wake source when one is available.
+
+Limit high-volume detail while retaining all BPF aggregates:
+
+```sh
+sudo ./callweave -p PID --epoll \
+  --epoll-callback handle_ready_fd \
+  --epoll-callback-fd-arg 1 \
+  --min-epoll-callback-us 500
+```
+
+The implementation pairs nested and recursive invocations independently per
+thread, up to eight active callback levels. `Callback match/done` in the
+summary exposes callbacks that entered but did not return normally during the
+capture. A wrong FD argument increases `unmatched`; a late attachment can also
+leave the first callback unmatched when its corresponding ready return
+occurred before tracing. Callweave does not scan or guess callback arguments
+because unrelated small integers can equal an active FD.
+
+This generic mode requires the callback to execute on the epoll waiter thread
+and receive the raw FD. A callback that receives `epoll_event.data.ptr`, a
+framework handle, or another wrapper cannot be mapped safely from value
+equality alone; that is the boundary for a future runtime-specific adapter.
+The existing `Unhandled/handoff` counter remains specifically a
+ready-to-I/O measurement, so a callback that intentionally performs no I/O can
+be callback-matched while still appearing unconsumed in that separate metric.
 
 #### Wake-source attribution
 
@@ -564,18 +636,18 @@ sudo ./callweave -p PID --epoll \
   --epoll-top 10
 ```
 
-JSON Lines output contains `epoll_wait` and `epoll_dispatch` records followed
-by one `epoll_summary` record:
+JSON Lines output contains `epoll_wait`, `epoll_dispatch`, and, when enabled,
+`epoll_callback` records followed by one `epoll_summary` record:
 
 ```sh
 sudo ./callweave -p PID --epoll --format json \
   --output /tmp/callweave-epoll.jsonl
 ```
 
-Generic mode associates readiness with subsequent syscalls on the same
-event-loop thread. Measuring the exact callback entry still requires a runtime
-adapter that knows how libuv, libevent, Boost.Asio, or an application loop maps
-the ready FD to a callback.
+Without `--epoll-callback`, generic mode associates readiness only with
+subsequent syscalls on the same event-loop thread. Use the callback option for
+a known raw-FD callback, or a runtime adapter when the event loop exposes only
+opaque framework objects.
 
 For edge-triggered registrations, Callweave reports a
 `possible incomplete EPOLLET drain` when it observes a read after readiness but
@@ -1095,6 +1167,9 @@ The other focused scenarios can be combined:
 # Exercise close/dup descriptor-generation tracking.
 ./test/trace_epoll_test --fd-reuse
 
+# Make the signalfd callback block for about 2 ms.
+./test/trace_epoll_test --slow-callback
+
 # Run every intentionally difficult scenario through the demo helper.
 sudo ./test/run_epoll_demo.sh \
   --bad-et --bad-oneshot --multi-waiter --fd-reuse
@@ -1112,13 +1187,18 @@ through the fdinfo seed path, and `Bootstrap state` should report recovered
 registrations. To verify capture from the first operation instead:
 
 ```sh
-sudo ./callweave --epoll --duration 8 \
-  --exec ./test/trace_epoll_test -- 100
+sudo ./callweave --epoll \
+  --epoll-callback epoll_test_callback \
+  --epoll-callback-fd-arg 1 \
+  --min-epoll-callback-us 500 \
+  --duration 8 \
+  --exec ./test/trace_epoll_test -- 100 --slow-callback
 ```
 
 The final summary should report `Observation scope: complete from target
-start` and zero bootstrapped registrations because the target was still
-stopped when the initial snapshots were taken.
+start`, exactly the target's epoll calls, callback matches for every resolved
+ready FD, and zero bootstrapped registrations. The signalfd callback sleeps
+briefly on purpose so its blocked time is visible in callback attribution.
 
 The example also passes a task pointer from the main thread through a small
 queue to a worker thread. Use it to test asynchronous stitching:

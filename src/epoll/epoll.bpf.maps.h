@@ -70,6 +70,25 @@ struct cw_epoll_io_state {
     __u32 reserved;
 };
 
+struct cw_epoll_callback_key {
+    __u64 pid_tgid;
+    __u32 depth;
+    __u32 reserved;
+};
+
+struct cw_epoll_callback_frame {
+    struct cw_epoll_callback_event event;
+    __u32 matched;
+    __u32 reserved;
+};
+
+struct cw_epoll_callback_thread {
+    __u32 depth;
+    __u32 reserved;
+    __u64 offcpu_start_ns;
+    __u64 wakeup_ns;
+};
+
 enum cw_epoll_wake_sys_action {
     CW_EPOLL_WAKE_SYS_NONE,
     CW_EPOLL_WAKE_SYS_CREATE_EVENTFD,
@@ -126,6 +145,13 @@ struct {
     __type(key, struct cw_epoll_resource_key);
     __type(value, struct cw_epoll_resource_stats);
 } epoll_resource_stats SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct cw_epoll_resource_stats);
+} epoll_resource_scratch SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -241,5 +267,44 @@ struct {
     __type(key, struct cw_epoll_dispatch_key);
     __type(value, struct cw_epoll_wake_source);
 } epoll_dispatch_wakes SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 16384);
+    __type(key, __u64);
+    __type(value, struct cw_epoll_callback_thread);
+} epoll_callback_threads SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 32768);
+    __type(key, struct cw_epoll_callback_key);
+    __type(value, struct cw_epoll_callback_frame);
+} epoll_callback_frames SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 512 * 1024);
+} epoll_callback_events SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} epoll_exec_gate SEC(".maps");
+
+static __always_inline bool cw_epoll_capture_active(void)
+{
+    __u32 zero = 0;
+    __u32 *active;
+
+    if (!cw_epoll_cfg.enabled)
+        return false;
+    if (!cw_epoll_cfg.defer_until_exec)
+        return true;
+    active = bpf_map_lookup_elem(&epoll_exec_gate, &zero);
+    return active && *active;
+}
 
 #endif

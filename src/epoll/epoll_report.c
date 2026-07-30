@@ -57,6 +57,26 @@ static int compare_resource_rows(const void *left, const void *right)
     return 0;
 }
 
+static int compare_callback_rows(const void *left, const void *right)
+{
+    const struct cw_epoll_resource_row *a = left;
+    const struct cw_epoll_resource_row *b = right;
+
+    if (a->value.callback_maximum_duration_ns <
+        b->value.callback_maximum_duration_ns)
+        return 1;
+    if (a->value.callback_maximum_duration_ns >
+        b->value.callback_maximum_duration_ns)
+        return -1;
+    if (a->value.callback_completed <
+        b->value.callback_completed)
+        return 1;
+    if (a->value.callback_completed >
+        b->value.callback_completed)
+        return -1;
+    return 0;
+}
+
 static size_t read_loop_rows(
     const struct output_options *output,
     struct cw_epoll_loop_row **rows)
@@ -745,6 +765,177 @@ static void print_wake_source_table(
     }
 }
 
+static void print_callback_table(
+    struct output_options *output,
+    const struct cw_epoll_resource_row *rows, size_t count,
+    FILE *stream)
+{
+    struct cw_epoll_resource_row *callbacks;
+    size_t callback_count = 0;
+    size_t index;
+    size_t rank = 0;
+
+    if (!output->epoll_callback_name)
+        return;
+    fprintf(
+        stream, "\n[10] Callback execution: %s\n",
+        output->epoll_callback_name);
+    callbacks = calloc(count ? count : 1, sizeof(*callbacks));
+    if (!callbacks) {
+        fprintf(stream, "  Cannot allocate callback summary rows.\n");
+        return;
+    }
+    for (index = 0; index < count; index++) {
+        if (!rows[index].value.callback_matched)
+            continue;
+        callbacks[callback_count++] = rows[index];
+    }
+    if (!callback_count) {
+        fprintf(
+            stream,
+            "  No callback invocation matched a ready FD. "
+            "Verify --epoll-callback-fd-arg.\n");
+        free(callbacks);
+        return;
+    }
+    qsort(
+        callbacks, callback_count, sizeof(*callbacks),
+        compare_callback_rows);
+    fprintf(
+        stream,
+        "  %-6s %-5s %-5s %8s %12s %12s %12s %12s "
+        "%12s %12s %12s\n",
+        "EPFD", "FD", "GEN", "CALLS", "AVG R->CB",
+        "MAX R->CB", "AVG WORK", "MAX WORK",
+        "AVG ONCPU", "AVG BLOCK", "AVG RUNQ");
+    fprintf(
+        stream,
+        "  %-6s %-5s %-5s %8s %12s %12s %12s %12s "
+        "%12s %12s %12s\n",
+        "------", "-----", "-----", "--------",
+        "------------", "------------", "------------",
+        "------------", "------------", "------------",
+        "------------");
+    for (index = 0; index < callback_count; index++) {
+        const struct cw_epoll_resource_stats *stats =
+            &callbacks[index].value;
+        uint64_t completed = stats->callback_completed;
+        uint64_t oncpu =
+            stats->callback_total_duration_ns >
+                stats->callback_offcpu_ns ?
+                stats->callback_total_duration_ns -
+                    stats->callback_offcpu_ns : 0;
+        char average_delay[32];
+        char maximum_delay[32];
+        char average_duration[32];
+        char maximum_duration[32];
+        char average_oncpu[32];
+        char average_blocked[32];
+        char average_runqueue[32];
+
+        format_interval(
+            average_delay, sizeof(average_delay),
+            stats->callback_matched ?
+                stats->callback_total_delay_ns /
+                    stats->callback_matched : 0);
+        format_interval(
+            maximum_delay, sizeof(maximum_delay),
+            stats->callback_maximum_delay_ns);
+        format_interval(
+            average_duration, sizeof(average_duration),
+            completed ?
+                stats->callback_total_duration_ns /
+                    completed : 0);
+        format_interval(
+            maximum_duration, sizeof(maximum_duration),
+            stats->callback_maximum_duration_ns);
+        format_interval(
+            average_oncpu, sizeof(average_oncpu),
+            completed ? oncpu / completed : 0);
+        format_interval(
+            average_blocked, sizeof(average_blocked),
+            completed ?
+                stats->callback_blocked_ns / completed : 0);
+        format_interval(
+            average_runqueue, sizeof(average_runqueue),
+            completed ?
+                stats->callback_runqueue_ns / completed : 0);
+        fprintf(
+            stream,
+            "  %-6d %-5d %-5u %8llu %12s %12s %12s %12s "
+            "%12s %12s %12s\n",
+            callbacks[index].key.epoll_fd,
+            callbacks[index].key.fd,
+            callbacks[index].key.fd_generation,
+            (unsigned long long)completed,
+            average_delay, maximum_delay,
+            average_duration, maximum_duration,
+            average_oncpu, average_blocked,
+            average_runqueue);
+    }
+    if (!output->epoll_top)
+        goto done;
+    fprintf(
+        stream,
+        "\n  Slowest callback call sites "
+        "(by maximum execution time)\n");
+    for (index = 0;
+         index < callback_count && rank < output->epoll_top;
+         index++) {
+        const struct cw_epoll_resource_stats *stats =
+            &callbacks[index].value;
+        uint64_t stack[MAX_ASYNC_STACK_DEPTH] = {0};
+        char maximum[32];
+        char resource[PATH_MAX];
+
+        if (!stats->callback_completed)
+            continue;
+        rank++;
+        format_interval(
+            maximum, sizeof(maximum),
+            stats->callback_maximum_duration_ns);
+        cw_fd_resolve(
+            &output->fd_resources, output->target_pid,
+            callbacks[index].key.fd,
+            resource, sizeof(resource));
+        fprintf(
+            stream,
+            "  [%zu] epfd=%d gen=%u fd=%d gen=%u "
+            "callbacks=%llu max=%s\n"
+            "      resource: %s\n"
+            "      slowest callback stack:\n",
+            rank,
+            callbacks[index].key.epoll_fd,
+            callbacks[index].key.epoll_generation,
+            callbacks[index].key.fd,
+            callbacks[index].key.fd_generation,
+            (unsigned long long)stats->callback_completed,
+            maximum,
+            resource[0] ? resource : "(unavailable)");
+        if (stats->callback_stack_id < 0 ||
+            output->epoll_stack_map_fd < 0 ||
+            bpf_map_lookup_elem(
+                output->epoll_stack_map_fd,
+                &stats->callback_stack_id, stack)) {
+            fprintf(
+                stream,
+                "        unavailable (stack_id=%d)\n",
+                stats->callback_stack_id);
+        } else if (output->target_maps) {
+            print_stack_frames(
+                stack, sizeof(stack), output->target_maps,
+                "      ", NULL, NULL, 0, output->control);
+        } else {
+            fprintf(stream, "        process maps unavailable\n");
+        }
+        if (cw_capture_cancelled(output->control))
+            break;
+    }
+
+done:
+    free(callbacks);
+}
+
 bool cw_epoll_print_summary(struct output_options *output)
 {
     struct cw_epoll_counters counters = {0};
@@ -814,6 +1005,10 @@ bool cw_epoll_print_summary(struct output_options *output)
             "  Wake-source ready   : %llu\n"
             "  Wake attributed     : %llu\n"
             "    eventfd/timerfd/signalfd: %llu / %llu / %llu\n"
+            "  Callback match/done : %llu / %llu\n"
+            "    unmatched/overflow: %llu / %llu\n"
+            "  Callback records    : %llu\n"
+            "  Callback dropped    : %llu\n"
             "  Dispatch records    : %llu\n"
             "  Dispatch dropped    : %llu\n",
             output->epoll_started_target ?
@@ -852,6 +1047,12 @@ bool cw_epoll_print_summary(struct output_options *output)
             (unsigned long long)counters.eventfd_ready,
             (unsigned long long)counters.timerfd_ready,
             (unsigned long long)counters.signalfd_ready,
+            (unsigned long long)counters.callback_matched,
+            (unsigned long long)counters.callback_completed,
+            (unsigned long long)counters.callback_unmatched,
+            (unsigned long long)counters.callback_overflow,
+            (unsigned long long)counters.callback_emitted,
+            (unsigned long long)counters.callback_dropped,
             (unsigned long long)counters.dispatch_emitted,
             (unsigned long long)counters.dispatch_dropped);
     if (counters.potential_et_undrained)
@@ -872,6 +1073,8 @@ bool cw_epoll_print_summary(struct output_options *output)
     print_resource_table(
         output, resources, resource_count, stream);
     print_wake_source_table(
+        output, resources, resource_count, stream);
+    print_callback_table(
         output, resources, resource_count, stream);
     free(loops);
     free(resources);
@@ -927,6 +1130,37 @@ static int write_summary_wake_json(
     return 0;
 }
 
+static int write_summary_callback_json(
+    FILE *stream, const struct cw_epoll_resource_stats *stats)
+{
+    if (!stats->callback_matched)
+        return fputs("null", stream) == EOF ? -1 : 0;
+    return fprintf(
+               stream,
+               "{\"matched\":%llu,\"completed\":%llu,"
+               "\"total_ready_to_callback_ns\":%llu,"
+               "\"maximum_ready_to_callback_ns\":%llu,"
+               "\"total_duration_ns\":%llu,"
+               "\"maximum_duration_ns\":%llu,"
+               "\"offcpu_ns\":%llu,\"blocked_ns\":%llu,"
+               "\"runqueue_ns\":%llu,\"stack_id\":%d}",
+               (unsigned long long)stats->callback_matched,
+               (unsigned long long)stats->callback_completed,
+               (unsigned long long)
+                   stats->callback_total_delay_ns,
+               (unsigned long long)
+                   stats->callback_maximum_delay_ns,
+               (unsigned long long)
+                   stats->callback_total_duration_ns,
+               (unsigned long long)
+                   stats->callback_maximum_duration_ns,
+               (unsigned long long)stats->callback_offcpu_ns,
+               (unsigned long long)stats->callback_blocked_ns,
+               (unsigned long long)stats->callback_runqueue_ns,
+               stats->callback_stack_id) < 0 ?
+        -1 : 0;
+}
+
 int cw_epoll_write_summary_json(struct output_options *output)
 {
     struct cw_epoll_counters counters = {0};
@@ -974,6 +1208,12 @@ int cw_epoll_write_summary_json(struct output_options *output)
             "\"wake_ready\":%llu,\"wake_attributed\":%llu,"
             "\"eventfd_ready\":%llu,\"timerfd_ready\":%llu,"
             "\"signalfd_ready\":%llu,"
+            "\"callback_matched\":%llu,"
+            "\"callback_unmatched\":%llu,"
+            "\"callback_completed\":%llu,"
+            "\"callback_overflow\":%llu,"
+            "\"callback_emitted\":%llu,"
+            "\"callback_dropped\":%llu,"
             "\"pending_at_stop\":%llu,"
             "\"observation_from_target_start\":%s,"
             "\"bootstrap_scans\":%u,\"bootstrap_epoll_fds\":%u,"
@@ -1007,6 +1247,12 @@ int cw_epoll_write_summary_json(struct output_options *output)
             (unsigned long long)counters.eventfd_ready,
             (unsigned long long)counters.timerfd_ready,
             (unsigned long long)counters.signalfd_ready,
+            (unsigned long long)counters.callback_matched,
+            (unsigned long long)counters.callback_unmatched,
+            (unsigned long long)counters.callback_completed,
+            (unsigned long long)counters.callback_overflow,
+            (unsigned long long)counters.callback_emitted,
+            (unsigned long long)counters.callback_dropped,
             (unsigned long long)pending_at_stop,
             output->epoll_started_target ? "true" : "false",
             output->epoll_bootstrap_scans,
@@ -1152,6 +1398,8 @@ int cw_epoll_write_summary_json(struct output_options *output)
                 stream, resource, strlen(resource)) ||
             fputs(",\"wake\":", stream) == EOF ||
             write_summary_wake_json(stream, stats) ||
+            fputs(",\"callback\":", stream) == EOF ||
+            write_summary_callback_json(stream, stats) ||
             fputc('}', stream) == EOF) {
             error = -1;
             goto done;

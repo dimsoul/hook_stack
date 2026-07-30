@@ -235,7 +235,7 @@ int trace_epoll_sys_enter(struct bpf_raw_tracepoint_args *ctx)
     __s32 pidns_error;
     bool wait_syscall;
 
-    if (!cw_epoll_cfg.enabled)
+    if (!cw_epoll_capture_active())
         return 0;
     wait_syscall =
         cw_is_epoll_wait_syscall(syscall_nr, &wait_kind);
@@ -286,10 +286,9 @@ static __attribute__((noinline)) void cw_epoll_apply_ctl(
         .fd_generation = state->fd_generation,
     };
     struct cw_epoll_token_value *existing_token;
-    struct cw_epoll_resource_stats initial_stats = {
-        .dispatch_stack_id = -1,
-    };
+    struct cw_epoll_resource_stats *initial_stats;
     struct cw_epoll_resource_stats *stats;
+    __u32 zero = 0;
     bool was_oneshot = false;
 
     old_registration =
@@ -315,8 +314,17 @@ static __attribute__((noinline)) void cw_epoll_apply_ctl(
     }
     stats = bpf_map_lookup_elem(&epoll_resource_stats, &resource_key);
     if (!stats) {
-        bpf_map_update_elem(&epoll_resource_stats, &resource_key,
-                            &initial_stats, BPF_NOEXIST);
+        initial_stats = bpf_map_lookup_elem(
+            &epoll_resource_scratch, &zero);
+        if (initial_stats) {
+            __builtin_memset(
+                initial_stats, 0, sizeof(*initial_stats));
+            initial_stats->dispatch_stack_id = -1;
+            initial_stats->callback_stack_id = -1;
+            bpf_map_update_elem(
+                &epoll_resource_stats, &resource_key,
+                initial_stats, BPF_NOEXIST);
+        }
         stats = bpf_map_lookup_elem(&epoll_resource_stats, &resource_key);
     }
     if (state->operation == CW_EPOLL_CTL_DEL) {
@@ -342,7 +350,6 @@ static __attribute__((noinline)) void cw_epoll_apply_ctl(
     }
     if (state->operation == CW_EPOLL_CTL_ADD &&
         state->fd_generation > 1) {
-        __u32 zero = 0;
         struct cw_epoll_counters *counters =
             bpf_map_lookup_elem(&epoll_counters, &zero);
 
@@ -1228,7 +1235,7 @@ int trace_epoll_sys_exit(struct bpf_raw_tracepoint_args *ctx)
     struct cw_epoll_io_state *active_io;
     __s64 result = (__s64)ctx->args[1];
 
-    if (!cw_epoll_cfg.enabled)
+    if (!cw_epoll_capture_active())
         return 0;
     active_ctl = bpf_map_lookup_elem(&epoll_ctl_states, &pid_tgid);
     if (active_ctl) {

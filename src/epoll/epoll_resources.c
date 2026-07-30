@@ -136,6 +136,7 @@ static int seed_registration(
         .registrations = 1,
         .active = 1,
         .dispatch_stack_id = -1,
+        .callback_stack_id = -1,
     };
 
     *conflict = false;

@@ -14,7 +14,11 @@ struct cw_epoll_io_syscall {
 struct cw_epoll_config {
     __u64 min_wait_ns;
     __u64 min_dispatch_ns;
+    __u64 min_callback_ns;
     __u32 enabled;
+    __u32 callback_enabled;
+    __u32 callback_fd_arg;
+    __u32 defer_until_exec;
     __u32 io_syscall_count;
     __s32 wait_syscall_nr;
     __s32 pwait_syscall_nr;

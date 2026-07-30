@@ -98,6 +98,7 @@ struct output_options {
     uint32_t epoll_bootstrap_conflicts;
     uint32_t epoll_bootstrap_failures;
     bool epoll_started_target;
+    const char *epoll_callback_name;
     const char *io_uring_callback_name;
     const struct async_hop_config *async_hops;
     size_t async_hop_count;
@@ -122,6 +123,7 @@ struct output_options {
     bool epoll_mode;
     uint64_t epoll_min_wait_ns;
     uint64_t epoll_min_dispatch_ns;
+    uint64_t epoll_min_callback_ns;
     uint32_t epoll_top;
     uint32_t diagnostic_interval_ms;
     uint64_t diagnostic_last_ns;
