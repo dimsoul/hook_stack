@@ -64,6 +64,13 @@ struct map_list {
     size_t capacity;
 };
 
+enum cw_epoll_output_mode {
+    CW_EPOLL_OUTPUT_SUMMARY = 0,
+    CW_EPOLL_OUTPUT_LIVE,
+    CW_EPOLL_OUTPUT_VERBOSE,
+    CW_EPOLL_OUTPUT_CUSTOM,
+};
+
 struct output_options {
     struct cw_capture_control *control;
     bool show_return_value;
@@ -100,6 +107,7 @@ struct output_options {
     bool epoll_started_target;
     bool libuv_mode;
     int libuv_counters_map_fd;
+    uint64_t libuv_fallback_tokens;
     const char *epoll_callback_name;
     uint32_t epoll_callback_key_arg;
     uint32_t epoll_callback_match;
@@ -125,6 +133,7 @@ struct output_options {
     uint64_t io_uring_min_latency_ns;
     uint32_t io_uring_top;
     bool epoll_mode;
+    enum cw_epoll_output_mode epoll_output_mode;
     uint64_t epoll_min_wait_ns;
     uint64_t epoll_min_dispatch_ns;
     uint64_t epoll_min_callback_ns;

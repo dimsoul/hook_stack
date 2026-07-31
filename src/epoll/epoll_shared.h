@@ -48,6 +48,7 @@ enum cw_epoll_dispatch_flags {
     CW_EPOLL_DISPATCH_ONESHOT_CANDIDATE = 1U << 8,
     CW_EPOLL_DISPATCH_ONESHOT_MISSING_REARM = 1U << 9,
     CW_EPOLL_DISPATCH_MSG_PEEK = 1U << 10,
+    CW_EPOLL_DISPATCH_CALLBACK_COMPLETED = 1U << 11,
 };
 
 enum cw_epoll_wait_kind {
@@ -167,6 +168,9 @@ struct cw_epoll_counters {
     __u64 callback_overflow;
     __u64 callback_emitted;
     __u64 callback_dropped;
+    __u64 evidence_exact;
+    __u64 evidence_ready_to_io;
+    __u64 evidence_ready_only;
 };
 
 struct cw_epoll_loop_key {

@@ -1027,6 +1027,7 @@ bool cw_epoll_print_summary(struct output_options *output)
             "  Linux I/O backend   : epoll\n");
     fprintf(stream,
             "\n[1] Capture overview\n"
+            "  Detail output       : %s\n"
             "  Observation scope   : %s\n"
             "  Bootstrap state     : %u registration%s from %u epoll "
             "FD%s (%u scans, %u conflicts, %u failures)\n"
@@ -1057,8 +1058,13 @@ bool cw_epoll_print_summary(struct output_options *output)
             "    unmatched/overflow: %llu / %llu\n"
             "  Callback records    : %llu\n"
             "  Callback dropped    : %llu\n"
+            "  Evidence exact      : %llu\n"
+            "  Evidence ready-to-I/O: %llu\n"
+            "  Evidence ready-only : %llu\n"
             "  Dispatch records    : %llu\n"
             "  Dispatch dropped    : %llu\n",
+            cw_epoll_output_mode_name(
+                output->epoll_output_mode),
             output->epoll_started_target ?
                 "complete from target start" :
                 "post-attach only; earlier activity is unavailable",
@@ -1104,6 +1110,9 @@ bool cw_epoll_print_summary(struct output_options *output)
             (unsigned long long)counters.callback_overflow,
             (unsigned long long)counters.callback_emitted,
             (unsigned long long)counters.callback_dropped,
+            (unsigned long long)counters.evidence_exact,
+            (unsigned long long)counters.evidence_ready_to_io,
+            (unsigned long long)counters.evidence_ready_only,
             (unsigned long long)counters.dispatch_emitted,
             (unsigned long long)counters.dispatch_dropped);
     if (counters.potential_et_undrained)
@@ -1243,7 +1252,8 @@ int cw_epoll_write_summary_json(struct output_options *output)
         correlatable - counters.dispatches - counters.unconsumed : 0;
     if (fprintf(
             stream,
-            "{\"type\":\"epoll_summary\",\"calls\":%llu,"
+            "{\"type\":\"epoll_summary\",\"detail_mode\":\"%s\","
+            "\"calls\":%llu,"
             "\"ready_returns\":%llu,\"ready_events\":%llu,"
             "\"timeouts\":%llu,\"interrupted\":%llu,"
             "\"errors\":%llu,\"saturated_batches\":%llu,"
@@ -1268,12 +1278,17 @@ int cw_epoll_write_summary_json(struct output_options *output)
             "\"callback_overflow\":%llu,"
             "\"callback_emitted\":%llu,"
             "\"callback_dropped\":%llu,"
+            "\"evidence_exact\":%llu,"
+            "\"evidence_ready_to_io\":%llu,"
+            "\"evidence_ready_only\":%llu,"
             "\"pending_at_stop\":%llu,"
             "\"observation_from_target_start\":%s,"
             "\"bootstrap_scans\":%u,\"bootstrap_epoll_fds\":%u,"
             "\"bootstrap_registrations\":%u,"
             "\"bootstrap_conflicts\":%u,\"bootstrap_failures\":%u,"
             "\"loops\":[",
+            cw_epoll_output_mode_name(
+                output->epoll_output_mode),
             (unsigned long long)counters.calls,
             (unsigned long long)counters.ready_returns,
             (unsigned long long)counters.ready_events,
@@ -1310,6 +1325,9 @@ int cw_epoll_write_summary_json(struct output_options *output)
             (unsigned long long)counters.callback_overflow,
             (unsigned long long)counters.callback_emitted,
             (unsigned long long)counters.callback_dropped,
+            (unsigned long long)counters.evidence_exact,
+            (unsigned long long)counters.evidence_ready_to_io,
+            (unsigned long long)counters.evidence_ready_only,
             (unsigned long long)pending_at_stop,
             output->epoll_started_target ? "true" : "false",
             output->epoll_bootstrap_scans,

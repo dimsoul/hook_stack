@@ -1079,6 +1079,18 @@ static __attribute__((noinline)) void cw_epoll_finish_dispatch_item(
         if (resource_stats)
             __sync_fetch_and_add(&resource_stats->unconsumed, 1);
     }
+    if (counters) {
+        if (candidate->item.flags &
+            CW_EPOLL_DISPATCH_CALLBACK_COMPLETED)
+            __sync_fetch_and_add(
+                &counters->evidence_exact, 1);
+        else if (consumed)
+            __sync_fetch_and_add(
+                &counters->evidence_ready_to_io, 1);
+        else
+            __sync_fetch_and_add(
+                &counters->evidence_ready_only, 1);
+    }
     if (candidate->item.io_errors) {
         if (counters)
             __sync_fetch_and_add(
@@ -1140,10 +1152,8 @@ static __attribute__((noinline)) void cw_epoll_finish_dispatch_item(
 
     emit_detail =
         dispatch_ns >= cw_epoll_cfg.min_dispatch_ns ||
-        (now > candidate->item.ready_ns &&
-         now - candidate->item.ready_ns >=
-            cw_epoll_cfg.min_dispatch_ns) ||
         !consumed ||
+        candidate->item.io_errors ||
         (candidate->item.flags &
          (CW_EPOLL_DISPATCH_ET_UNDRAINED |
           CW_EPOLL_DISPATCH_ONESHOT_MISSING_REARM));

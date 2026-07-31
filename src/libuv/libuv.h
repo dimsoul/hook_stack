@@ -14,6 +14,7 @@
 #include "libuv/libuv_shared.h"
 
 struct callweave_bpf;
+struct output_options;
 
 struct cw_libuv_callback_attachment {
     uint64_t address;
@@ -21,6 +22,13 @@ struct cw_libuv_callback_attachment {
     char path[PATH_MAX];
     struct bpf_link *entry;
     struct bpf_link *return_link;
+};
+
+struct cw_libuv_poll_registration {
+    uint64_t handle;
+    uint32_t generation;
+    int fd;
+    bool seeded;
 };
 
 struct cw_libuv_runtime {
@@ -34,6 +42,9 @@ struct cw_libuv_runtime {
     size_t callback_count;
     size_t callback_capacity;
     uint64_t callback_attach_failures;
+    struct cw_libuv_poll_registration *registrations;
+    size_t registration_count;
+    size_t registration_capacity;
 };
 
 int cw_libuv_attach(struct cw_libuv_runtime *runtime,
@@ -41,12 +52,17 @@ int cw_libuv_attach(struct cw_libuv_runtime *runtime,
                     pid_t pid, const char *module_path);
 int cw_libuv_handle_registration(
     void *context, void *data, size_t data_size);
+void cw_libuv_refresh_epoll(
+    struct cw_libuv_runtime *runtime,
+    struct output_options *output);
 void cw_libuv_print_summary(
     const struct cw_libuv_runtime *runtime,
-    int counters_map_fd, FILE *stream);
+    int counters_map_fd, int epoll_counters_map_fd,
+    uint64_t fallback_tokens, FILE *stream);
 int cw_libuv_write_summary_json(
     const struct cw_libuv_runtime *runtime,
-    int counters_map_fd, FILE *stream);
+    int counters_map_fd, int epoll_counters_map_fd,
+    uint64_t fallback_tokens, FILE *stream);
 void cw_libuv_destroy(struct cw_libuv_runtime *runtime);
 
 #endif

@@ -14,6 +14,21 @@
 #include "epoll/epoll.h"
 #include "epoll/epoll_internal.h"
 
+const char *cw_epoll_output_mode_name(uint32_t mode)
+{
+    switch (mode) {
+    case CW_EPOLL_OUTPUT_LIVE:
+        return "live";
+    case CW_EPOLL_OUTPUT_VERBOSE:
+        return "verbose";
+    case CW_EPOLL_OUTPUT_CUSTOM:
+        return "custom";
+    case CW_EPOLL_OUTPUT_SUMMARY:
+    default:
+        return "summary";
+    }
+}
+
 const char *cw_epoll_wait_kind_name(uint32_t kind)
 {
     switch (kind) {
@@ -40,6 +55,16 @@ const char *cw_epoll_callback_match_name(uint32_t match)
     default:
         return "unknown";
     }
+}
+
+static const char *dispatch_evidence_name(
+    const struct cw_epoll_dispatch_item *item)
+{
+    if (item->flags & CW_EPOLL_DISPATCH_CALLBACK_COMPLETED)
+        return "exact";
+    if (item->flags & CW_EPOLL_DISPATCH_CONSUMED)
+        return "ready-to-I/O";
+    return "ready-only";
 }
 
 const char *cw_epoll_io_operation_name(uint32_t operation)
@@ -343,6 +368,50 @@ static void print_epoll_event(
     putchar('\n');
 }
 
+static bool seed_libuv_ready_token(
+    struct output_options *output,
+    const struct cw_epoll_event *event,
+    const struct cw_epoll_ready *ready)
+{
+    struct cw_epoll_fd_key epoll_key = {
+        .pid = event->pid,
+        .fd = event->epoll_fd,
+    };
+    struct cw_epoll_fd_key fd_key = {
+        .pid = event->pid,
+    };
+    struct cw_epoll_token_key token_key = {
+        .data = ready->data,
+        .pid = event->pid,
+        .epoll_fd = event->epoll_fd,
+    };
+    struct cw_epoll_token_value token = {0};
+    uint32_t epoll_generation = 1;
+    uint32_t fd_generation = 1;
+
+    if (!output->libuv_mode || ready->fd >= 0 ||
+        ready->data > INT32_MAX ||
+        output->epoll_token_map_fd < 0 ||
+        output->epoll_fd_generation_map_fd < 0)
+        return false;
+    fd_key.fd = (int32_t)ready->data;
+    (void)bpf_map_lookup_elem(
+        output->epoll_fd_generation_map_fd,
+        &epoll_key, &epoll_generation);
+    (void)bpf_map_lookup_elem(
+        output->epoll_fd_generation_map_fd,
+        &fd_key, &fd_generation);
+    token_key.epoll_generation = epoll_generation;
+    token.fd = fd_key.fd;
+    token.fd_generation = fd_generation;
+    if (bpf_map_update_elem(
+            output->epoll_token_map_fd,
+            &token_key, &token, BPF_NOEXIST))
+        return false;
+    output->libuv_fallback_tokens++;
+    return true;
+}
+
 int cw_epoll_handle_event(void *context, void *data, size_t data_size)
 {
     struct output_options *output = context;
@@ -352,11 +421,16 @@ int cw_epoll_handle_event(void *context, void *data, size_t data_size)
     if (data_size < sizeof(*event) ||
         !cw_capture_running(output->control))
         return 0;
-    for (index = 0; index < event->captured_events; index++)
+    for (index = 0; index < event->captured_events; index++) {
+        (void)seed_libuv_ready_token(
+            output, event, &event->ready[index]);
         cw_fd_cache_one(
             &output->fd_resources, output->target_pid,
             event->ready[index].fd);
+    }
 
+    if (output->epoll_output_mode == CW_EPOLL_OUTPUT_SUMMARY)
+        return 0;
     if (output->json_output) {
         if (write_epoll_json(output, event)) {
             fprintf(stderr, "failed to write epoll JSON output: %s\n",
@@ -511,6 +585,7 @@ static int write_dispatch_json_item(
         fprintf(
             stream,
             ",\"consumed\":%s,\"dispatch_ns\":%llu,"
+            "\"evidence\":\"%s\","
             "\"return_to_wait_ns\":%llu,"
             "\"cycle_offcpu_ns\":%llu,"
             "\"cycle_blocked_ns\":%llu,"
@@ -523,6 +598,7 @@ static int write_dispatch_json_item(
             item->flags & CW_EPOLL_DISPATCH_CONSUMED ?
                 "true" : "false",
             (unsigned long long)dispatch_latency(event, item),
+            dispatch_evidence_name(item),
             (unsigned long long)event->return_to_wait_ns,
             (unsigned long long)event->cycle_offcpu_ns,
             (unsigned long long)event->cycle_blocked_ns,
@@ -684,7 +760,7 @@ static void print_dispatch_item(
                item->last_result);
         if (item->requested_bytes ||
             (item->flags & CW_EPOLL_DISPATCH_MSG_PEEK))
-            printf("  evidence: requested=%llu%s\n",
+            printf("  I/O args: requested=%llu%s\n",
                    (unsigned long long)item->requested_bytes,
                    item->flags & CW_EPOLL_DISPATCH_MSG_PEEK ?
                        " MSG_PEEK" : "");
@@ -694,6 +770,15 @@ static void print_dispatch_item(
             "window", dispatch_latency(event, item));
         putchar('\n');
     }
+    printf("  evidence: %s", dispatch_evidence_name(item));
+    if (!(item->flags & CW_EPOLL_DISPATCH_CALLBACK_COMPLETED)) {
+        if (item->flags & CW_EPOLL_DISPATCH_CONSUMED)
+            printf(" (callback boundary unavailable; "
+                   "correlated by FD and I/O stack)");
+        else
+            printf(" (no callback completion or matching I/O observed)");
+    }
+    putchar('\n');
     printf("  status  : %s\n\n",
            dispatch_status(item, single_read_resource));
 }
@@ -711,6 +796,8 @@ int cw_epoll_handle_dispatch_event(
     item = &event->item;
     cw_fd_cache_one(
         &output->fd_resources, output->target_pid, item->fd);
+    if (output->epoll_output_mode == CW_EPOLL_OUTPUT_SUMMARY)
+        return 0;
     if (output->json_output) {
         if (write_dispatch_json_item(output, event, item)) {
             fprintf(
@@ -763,6 +850,7 @@ static int write_callback_json(
             "\"epoll_generation\":%u,\"fd_generation\":%u,"
             "\"data\":\"0x%016llx\",\"ready_events\":%u,"
             "\"match\":\"%s\","
+            "\"evidence\":\"exact\","
             "\"callback_key\":\"0x%016llx\","
             "\"ready_flags\":",
             (unsigned long long)realtime_ns,
@@ -858,6 +946,7 @@ static void print_callback_event(
         ready_flags);
     if (resource[0])
         printf("  resource: %s\n", resource);
+    printf("  evidence: exact (ready event and completed callback)\n");
     print_wake_source(&event->wake);
     printf("  timing  :");
     print_interval("ready->callback", event->delay_ns);
@@ -896,6 +985,8 @@ int cw_epoll_handle_callback_event(
         return 0;
     cw_fd_cache_one(
         &output->fd_resources, output->target_pid, event->fd);
+    if (output->epoll_output_mode == CW_EPOLL_OUTPUT_SUMMARY)
+        return 0;
     if (output->json_output) {
         if (write_callback_json(output, event)) {
             fprintf(

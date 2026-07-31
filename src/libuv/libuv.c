@@ -16,8 +16,11 @@
 #include "core/core_config.h"
 #include "async/async_config.h"
 #include "epoll/epoll_config.h"
+#include "epoll/epoll.h"
+#include "epoll/epoll_shared.h"
 #include "io_uring/io_uring_config.h"
 #include "callweave.skel.h"
+#include "callweave_internal.h"
 #include "libuv/libuv.h"
 #include "symbols.h"
 
@@ -251,6 +254,44 @@ failed:
     return error;
 }
 
+static struct cw_libuv_poll_registration *remember_registration(
+    struct cw_libuv_runtime *runtime,
+    const struct cw_libuv_registration_event *event)
+{
+    struct cw_libuv_poll_registration *items;
+    size_t capacity;
+    size_t index;
+
+    for (index = 0; index < runtime->registration_count; index++) {
+        struct cw_libuv_poll_registration *registration =
+            &runtime->registrations[index];
+
+        if (registration->handle == event->handle &&
+            registration->generation == event->generation) {
+            registration->fd = event->fd;
+            return registration;
+        }
+    }
+    if (runtime->registration_count ==
+        runtime->registration_capacity) {
+        capacity = runtime->registration_capacity ?
+            runtime->registration_capacity * 2 : 8;
+        items = realloc(
+            runtime->registrations,
+            capacity * sizeof(*runtime->registrations));
+        if (!items)
+            return NULL;
+        runtime->registrations = items;
+        runtime->registration_capacity = capacity;
+    }
+    items = &runtime->registrations[runtime->registration_count++];
+    memset(items, 0, sizeof(*items));
+    items->handle = event->handle;
+    items->generation = event->generation;
+    items->fd = event->fd;
+    return items;
+}
+
 int cw_libuv_handle_registration(
     void *context, void *data, size_t data_size)
 {
@@ -265,15 +306,81 @@ int cw_libuv_handle_registration(
      * epoll capture. Remembering the callback prevents repeated warnings on
      * every uv_poll_start() for the same address.
      */
+    (void)remember_registration(runtime, event);
     (void)attach_callback(runtime, event);
     return 0;
 }
 
+void cw_libuv_refresh_epoll(
+    struct cw_libuv_runtime *runtime,
+    struct output_options *output)
+{
+    size_t index;
+
+    if (!runtime || !output)
+        return;
+    for (index = 0; index < runtime->registration_count; index++) {
+        struct cw_libuv_poll_registration *registration =
+            &runtime->registrations[index];
+
+        if (registration->seeded || registration->fd < 0)
+            continue;
+        if (!cw_epoll_seed_libuv_fd(
+                output, (uint32_t)runtime->pid,
+                registration->fd))
+            continue;
+        registration->seeded = true;
+        output->libuv_fallback_tokens++;
+    }
+}
+
+static const char *attribution_mode(
+    const struct cw_epoll_counters *counters)
+{
+    if (counters->evidence_exact &&
+        (counters->evidence_ready_to_io ||
+         counters->evidence_ready_only))
+        return "mixed exact/fallback";
+    if (counters->evidence_exact)
+        return "exact callback";
+    if (counters->evidence_ready_to_io)
+        return "ready-to-I/O fallback";
+    if (counters->evidence_ready_only)
+        return "ready-only";
+    return "no classified ready paths";
+}
+
+static void read_attribution(
+    int map_fd, struct cw_epoll_counters *counters,
+    uint64_t *classified, uint64_t *pending)
+{
+    uint64_t correlatable;
+    uint32_t zero = 0;
+
+    memset(counters, 0, sizeof(*counters));
+    if (map_fd >= 0)
+        (void)bpf_map_lookup_elem(map_fd, &zero, counters);
+    *classified =
+        counters->evidence_exact +
+        counters->evidence_ready_to_io +
+        counters->evidence_ready_only;
+    correlatable =
+        counters->ready_events > counters->unresolved_events ?
+            counters->ready_events - counters->unresolved_events : 0;
+    *pending = correlatable > *classified ?
+        correlatable - *classified : 0;
+}
+
 void cw_libuv_print_summary(
     const struct cw_libuv_runtime *runtime,
-    int counters_map_fd, FILE *stream)
+    int counters_map_fd, int epoll_counters_map_fd,
+    uint64_t fallback_tokens, FILE *stream)
 {
     struct cw_libuv_counters counters = {0};
+    struct cw_epoll_counters attribution;
+    uint64_t classified;
+    uint64_t pending;
+    double exact_percent;
     uint32_t zero = 0;
 
     if (!runtime || !stream)
@@ -281,6 +388,12 @@ void cw_libuv_print_summary(
     if (counters_map_fd >= 0)
         (void)bpf_map_lookup_elem(
             counters_map_fd, &zero, &counters);
+    read_attribution(
+        epoll_counters_map_fd, &attribution,
+        &classified, &pending);
+    exact_percent = classified ?
+        (double)attribution.evidence_exact * 100.0 /
+            (double)classified : 0.0;
     fprintf(
         stream,
         "\nlibuv adapter health\n"
@@ -299,6 +412,33 @@ void cw_libuv_print_summary(
         runtime->callback_count -
             (size_t)runtime->callback_attach_failures,
         (unsigned long long)runtime->callback_attach_failures);
+    fprintf(
+        stream,
+        "\nlibuv attribution coverage\n"
+        "  Mode                : %s\n"
+        "  Classified paths    : %llu\n"
+        "  Exact               : %llu (%.2f%%)\n"
+        "  Ready-to-I/O        : %llu "
+        "(callback boundary unavailable)\n"
+        "  Ready-only          : %llu "
+        "(no matching callback completion or I/O)\n"
+        "  Learned FD tokens   : %llu "
+        "(from observed libuv FDs)\n"
+        "  Unresolved ready    : %llu\n"
+        "  Pending at stop     : %llu\n"
+        "  Evidence policy     : exact requires a completed callback; "
+        "fallback paths use kernel-backed FD and I/O correlation\n",
+        attribution_mode(&attribution),
+        (unsigned long long)classified,
+        (unsigned long long)attribution.evidence_exact,
+        exact_percent,
+        (unsigned long long)
+            attribution.evidence_ready_to_io,
+        (unsigned long long)
+            attribution.evidence_ready_only,
+        (unsigned long long)fallback_tokens,
+        (unsigned long long)attribution.unresolved_events,
+        (unsigned long long)pending);
 }
 
 static int write_json_string(FILE *stream, const char *text)
@@ -334,9 +474,13 @@ static int write_json_string(FILE *stream, const char *text)
 
 int cw_libuv_write_summary_json(
     const struct cw_libuv_runtime *runtime,
-    int counters_map_fd, FILE *stream)
+    int counters_map_fd, int epoll_counters_map_fd,
+    uint64_t fallback_tokens, FILE *stream)
 {
     struct cw_libuv_counters counters = {0};
+    struct cw_epoll_counters attribution;
+    uint64_t classified;
+    uint64_t pending;
     uint32_t zero = 0;
 
     if (!runtime || !stream)
@@ -344,6 +488,9 @@ int cw_libuv_write_summary_json(
     if (counters_map_fd >= 0)
         (void)bpf_map_lookup_elem(
             counters_map_fd, &zero, &counters);
+    read_attribution(
+        epoll_counters_map_fd, &attribution,
+        &classified, &pending);
     if (fputs(
             "{\"type\":\"libuv_summary\",\"module\":",
             stream) == EOF ||
@@ -355,7 +502,15 @@ int cw_libuv_write_summary_json(
             "\"registration_events\":%llu,"
             "\"registration_dropped\":%llu,"
             "\"unique_callbacks\":%zu,"
-            "\"callback_attach_failures\":%llu}\n",
+            "\"callback_attach_failures\":%llu,"
+            "\"attribution_mode\":\"%s\","
+            "\"classified_ready_paths\":%llu,"
+            "\"evidence_exact\":%llu,"
+            "\"evidence_ready_to_io\":%llu,"
+            "\"evidence_ready_only\":%llu,"
+            "\"learned_fd_tokens\":%llu,"
+            "\"unresolved_ready\":%llu,"
+            "\"pending_at_stop\":%llu}\n",
             (unsigned long long)counters.initialized,
             (unsigned long long)counters.started,
             (unsigned long long)counters.stopped,
@@ -365,7 +520,17 @@ int cw_libuv_write_summary_json(
             runtime->callback_count -
                 (size_t)runtime->callback_attach_failures,
             (unsigned long long)
-                runtime->callback_attach_failures) < 0)
+                runtime->callback_attach_failures,
+            attribution_mode(&attribution),
+            (unsigned long long)classified,
+            (unsigned long long)attribution.evidence_exact,
+            (unsigned long long)
+                attribution.evidence_ready_to_io,
+            (unsigned long long)
+                attribution.evidence_ready_only,
+            (unsigned long long)fallback_tokens,
+            (unsigned long long)attribution.unresolved_events,
+            (unsigned long long)pending) < 0)
         return -1;
     return 0;
 }
@@ -387,4 +552,8 @@ void cw_libuv_destroy(struct cw_libuv_runtime *runtime)
     runtime->callbacks = NULL;
     runtime->callback_count = 0;
     runtime->callback_capacity = 0;
+    free(runtime->registrations);
+    runtime->registrations = NULL;
+    runtime->registration_count = 0;
+    runtime->registration_capacity = 0;
 }

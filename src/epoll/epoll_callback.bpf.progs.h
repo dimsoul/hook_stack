@@ -250,6 +250,15 @@ int trace_epoll_callback_entry(struct pt_regs *ctx)
 static __attribute__((noinline)) void cw_epoll_finish_callback(
     struct cw_epoll_callback_frame *frame)
 {
+    struct cw_epoll_dispatch_key dispatch_key = {
+        .pid_tgid =
+            ((__u64)frame->event.global_pid << 32) |
+            frame->event.global_tid,
+        .fd = frame->event.fd,
+    };
+    struct cw_epoll_dispatch_candidate *candidate =
+        bpf_map_lookup_elem(
+            &epoll_dispatch_candidates, &dispatch_key);
     struct cw_epoll_resource_key resource_key = {
         .pid = frame->event.pid,
         .epoll_fd = frame->event.epoll_fd,
@@ -270,6 +279,10 @@ static __attribute__((noinline)) void cw_epoll_finish_callback(
     frame->event.duration_ns =
         now > frame->event.start_ns ?
             now - frame->event.start_ns : 0;
+    if (candidate &&
+        candidate->item.ready_ns == frame->event.ready_ns)
+        candidate->item.flags |=
+            CW_EPOLL_DISPATCH_CALLBACK_COMPLETED;
     if (counters)
         __sync_fetch_and_add(
             &counters->callback_completed, 1);

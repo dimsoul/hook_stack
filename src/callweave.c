@@ -369,6 +369,12 @@ static void usage(FILE *stream, const char *program)
             "resources\n"
             "      --libuv               automatically correlate uv_poll_t "
             "handles and callbacks\n"
+            "      --summary-only        print final epoll/libuv summary "
+            "only (default)\n"
+            "      --live                print slow or anomalous epoll/libuv "
+            "events\n"
+            "      --verbose             print every epoll/libuv detail "
+            "event\n"
             "      --libuv-binary PATH   ELF containing libuv public APIs "
             "(normally auto-detected)\n"
             "      --epoll-callback FUNC correlate ready event to callback "
@@ -384,14 +390,15 @@ static void usage(FILE *stream, const char *program)
             "(required)\n"
             "      --epoll-callback-fd-arg N\n"
             "                             alias for --epoll-callback-key-arg\n"
-            "      --min-epoll-callback-us US\n"
+            "      --min-epoll-callback-us US (advanced)\n"
             "                             only emit callbacks lasting at "
             "least US\n"
             "      --exec PROGRAM         launch PROGRAM after epoll tracing "
             "is ready;\n"
             "                             put its arguments after `--`\n"
-            "      --min-epoll-wait-us US only emit waits at least US\n"
-            "      --min-epoll-dispatch-us US\n"
+            "      --min-epoll-wait-us US (advanced)\n"
+            "                             only emit waits at least US\n"
+            "      --min-epoll-dispatch-us US (advanced)\n"
             "                             only emit ready-to-I/O dispatches "
             "at least US\n"
             "      --epoll-top N          show N busiest event-loop "
@@ -767,6 +774,9 @@ enum long_option_id {
     OPT_LIBUV,
     OPT_LIBUV_BINARY,
     OPT_EPOLL,
+    OPT_SUMMARY_ONLY,
+    OPT_LIVE,
+    OPT_VERBOSE,
     OPT_EPOLL_CALLBACK,
     OPT_EPOLL_CALLBACK_BINARY,
     OPT_EPOLL_CALLBACK_FD_ARG,
@@ -828,6 +838,9 @@ int main(int argc, char **argv)
         {"libuv-binary", required_argument, NULL,
          OPT_LIBUV_BINARY},
         {"epoll", no_argument, NULL, OPT_EPOLL},
+        {"summary-only", no_argument, NULL, OPT_SUMMARY_ONLY},
+        {"live", no_argument, NULL, OPT_LIVE},
+        {"verbose", no_argument, NULL, OPT_VERBOSE},
         {"epoll-callback", required_argument, NULL,
          OPT_EPOLL_CALLBACK},
         {"epoll-callback-binary", required_argument, NULL,
@@ -937,6 +950,8 @@ int main(int argc, char **argv)
     bool epoll_callback_match_seen = false;
     bool libuv_option_seen = false;
     bool epoll_top_option_seen = false;
+    bool epoll_output_option_seen = false;
+    bool epoll_threshold_option_seen = false;
     bool check_config = false;
     bool json_output = false;
     bool finalize_outputs = true;
@@ -1209,6 +1224,46 @@ int main(int argc, char **argv)
         case OPT_EPOLL:
             output.epoll_mode = true;
             break;
+        case OPT_SUMMARY_ONLY:
+            if (epoll_output_option_seen &&
+                output.epoll_output_mode !=
+                    CW_EPOLL_OUTPUT_SUMMARY) {
+                fprintf(stderr,
+                        "--summary-only, --live, and --verbose are "
+                        "mutually exclusive\n");
+                error = 2;
+                goto cleanup;
+            }
+            output.epoll_output_mode =
+                CW_EPOLL_OUTPUT_SUMMARY;
+            epoll_output_option_seen = true;
+            break;
+        case OPT_LIVE:
+            if (epoll_output_option_seen &&
+                output.epoll_output_mode != CW_EPOLL_OUTPUT_LIVE) {
+                fprintf(stderr,
+                        "--summary-only, --live, and --verbose are "
+                        "mutually exclusive\n");
+                error = 2;
+                goto cleanup;
+            }
+            output.epoll_output_mode = CW_EPOLL_OUTPUT_LIVE;
+            epoll_output_option_seen = true;
+            break;
+        case OPT_VERBOSE:
+            if (epoll_output_option_seen &&
+                output.epoll_output_mode !=
+                    CW_EPOLL_OUTPUT_VERBOSE) {
+                fprintf(stderr,
+                        "--summary-only, --live, and --verbose are "
+                        "mutually exclusive\n");
+                error = 2;
+                goto cleanup;
+            }
+            output.epoll_output_mode =
+                CW_EPOLL_OUTPUT_VERBOSE;
+            epoll_output_option_seen = true;
+            break;
         case OPT_EPOLL_CALLBACK:
             epoll_callback_name = optarg;
             epoll_callback_option_seen = true;
@@ -1255,6 +1310,7 @@ int main(int argc, char **argv)
             break;
         case OPT_MIN_EPOLL_CALLBACK_US:
             epoll_callback_option_seen = true;
+            epoll_threshold_option_seen = true;
             if (parse_cli_us(
                     "--min-epoll-callback-us", optarg,
                     &output.epoll_min_callback_ns)) {
@@ -1263,6 +1319,7 @@ int main(int argc, char **argv)
             }
             break;
         case OPT_MIN_EPOLL_WAIT_US:
+            epoll_threshold_option_seen = true;
             if (parse_cli_us("--min-epoll-wait-us", optarg,
                              &output.epoll_min_wait_ns)) {
                 error = 2;
@@ -1270,6 +1327,7 @@ int main(int argc, char **argv)
             }
             break;
         case OPT_MIN_EPOLL_DISPATCH_US:
+            epoll_threshold_option_seen = true;
             if (parse_cli_us("--min-epoll-dispatch-us", optarg,
                              &output.epoll_min_dispatch_ns)) {
                 error = 2;
@@ -1344,6 +1402,63 @@ int main(int argc, char **argv)
         goto cleanup;
     }
     output.json_output = json_output;
+    if (epoll_output_option_seen &&
+        epoll_threshold_option_seen) {
+        fprintf(
+            stderr,
+            "--summary-only, --live, and --verbose cannot be combined "
+            "with --min-epoll-*-us; use one output mode or explicit "
+            "thresholds\n");
+        error = 2;
+        goto cleanup;
+    }
+    if (!epoll_output_option_seen &&
+        epoll_threshold_option_seen)
+        output.epoll_output_mode = CW_EPOLL_OUTPUT_CUSTOM;
+    if (output.epoll_mode && output.max_events) {
+        if (output.epoll_output_mode ==
+                CW_EPOLL_OUTPUT_SUMMARY &&
+            epoll_output_option_seen) {
+            fprintf(
+                stderr,
+                "--max-events cannot be combined with --summary-only\n");
+            error = 2;
+            goto cleanup;
+        }
+        if (output.epoll_output_mode == CW_EPOLL_OUTPUT_LIVE) {
+            fprintf(
+                stderr,
+                "--max-events cannot be combined with --live; use "
+                "--verbose or explicit --min-epoll-*-us thresholds\n");
+            error = 2;
+            goto cleanup;
+        }
+        if (!epoll_output_option_seen &&
+            !epoll_threshold_option_seen)
+            output.epoll_output_mode =
+                CW_EPOLL_OUTPUT_VERBOSE;
+    }
+    if (output.epoll_mode) {
+        switch (output.epoll_output_mode) {
+        case CW_EPOLL_OUTPUT_LIVE:
+            output.epoll_min_wait_ns = UINT64_MAX;
+            output.epoll_min_dispatch_ns = 1000000ULL;
+            output.epoll_min_callback_ns = 1000000ULL;
+            break;
+        case CW_EPOLL_OUTPUT_VERBOSE:
+            output.epoll_min_wait_ns = 0;
+            output.epoll_min_dispatch_ns = 0;
+            output.epoll_min_callback_ns = 0;
+            break;
+        case CW_EPOLL_OUTPUT_SUMMARY:
+            output.epoll_min_wait_ns = UINT64_MAX;
+            output.epoll_min_dispatch_ns = UINT64_MAX;
+            output.epoll_min_callback_ns = UINT64_MAX;
+            break;
+        case CW_EPOLL_OUTPUT_CUSTOM:
+            break;
+        }
+    }
     if (module_name && target_pid <= 0) {
         fprintf(stderr, "--module requires --pid\n");
         return 2;
@@ -1428,12 +1543,13 @@ int main(int argc, char **argv)
         goto cleanup;
     }
     if (!output.epoll_mode &&
-        (output.epoll_min_wait_ns ||
-         output.epoll_min_dispatch_ns ||
+        (epoll_threshold_option_seen ||
+         epoll_output_option_seen ||
          epoll_top_option_seen ||
          epoll_callback_option_seen)) {
         fprintf(stderr,
-                "epoll filters and callback options require --epoll\n");
+                "epoll output, filters, and callback options require "
+                "--epoll or --libuv\n");
         error = 2;
         goto cleanup;
     }
@@ -1524,6 +1640,7 @@ int main(int argc, char **argv)
             fprintf(stderr,
                     "--epoll/--libuv is a standalone mode; combine it "
                     "only with "
+                    "--summary-only, --live, --verbose, "
                     "--pid or --exec, --min-epoll-wait-us, "
                     "--min-epoll-dispatch-us, --epoll-top, "
                     "--epoll-callback or libuv options, "
@@ -2624,10 +2741,17 @@ trace_target_ready:
         if (output.io_uring_top)
             fprintf(stderr, ", top %u submit groups",
                     output.io_uring_top);
-        if (output.epoll_min_wait_ns)
+        if (output.epoll_mode)
+            fprintf(
+                stderr, ", detail output %s",
+                cw_epoll_output_mode_name(
+                    output.epoll_output_mode));
+        if (output.epoll_output_mode == CW_EPOLL_OUTPUT_CUSTOM &&
+            output.epoll_min_wait_ns)
             fprintf(stderr, ", minimum epoll wait %.3f us",
                     (double)output.epoll_min_wait_ns / 1000.0);
-        if (output.epoll_min_dispatch_ns)
+        if (output.epoll_output_mode == CW_EPOLL_OUTPUT_CUSTOM &&
+            output.epoll_min_dispatch_ns)
             fprintf(stderr, ", minimum epoll dispatch %.3f us",
                     (double)output.epoll_min_dispatch_ns / 1000.0);
         if (output.libuv_mode)
@@ -2641,7 +2765,8 @@ trace_target_ready:
                 epoll_callback_key_arg,
                 cw_epoll_callback_match_name(
                     epoll_callback_match));
-        if (output.epoll_min_callback_ns)
+        if (output.epoll_output_mode == CW_EPOLL_OUTPUT_CUSTOM &&
+            output.epoll_min_callback_ns)
             fprintf(stderr, ", minimum callback %.3f us",
                     (double)output.epoll_min_callback_ns / 1000.0);
         if (output.epoll_mode)
@@ -2691,12 +2816,19 @@ trace_target_ready:
         if (output.io_uring_callback_name)
             printf(", CQE -> callback %s arg%u",
                    output.io_uring_callback_name, io_callback_arg);
-        if (output.epoll_min_wait_ns) {
+        if (output.epoll_mode)
+            printf(
+                ", detail output %s",
+                cw_epoll_output_mode_name(
+                    output.epoll_output_mode));
+        if (output.epoll_output_mode == CW_EPOLL_OUTPUT_CUSTOM &&
+            output.epoll_min_wait_ns) {
             printf(",");
             print_interval("min-epoll-wait",
                            output.epoll_min_wait_ns);
         }
-        if (output.epoll_min_dispatch_ns) {
+        if (output.epoll_output_mode == CW_EPOLL_OUTPUT_CUSTOM &&
+            output.epoll_min_dispatch_ns) {
             printf(",");
             print_interval("min-epoll-dispatch",
                            output.epoll_min_dispatch_ns);
@@ -2712,7 +2844,8 @@ trace_target_ready:
                 epoll_callback_key_arg,
                 cw_epoll_callback_match_name(
                     epoll_callback_match));
-        if (output.epoll_min_callback_ns) {
+        if (output.epoll_output_mode == CW_EPOLL_OUTPUT_CUSTOM &&
+            output.epoll_min_callback_ns) {
             printf(",");
             print_interval(
                 "min-epoll-callback",
@@ -2796,6 +2929,9 @@ trace_target_ready:
             int warmup_error = ring_buffer__poll(
                 ring_buffer, 1);
 
+            if (output.libuv_mode)
+                cw_libuv_refresh_epoll(
+                    &libuv_runtime, &output);
             if (warmup_error < 0 &&
                 warmup_error != -EINTR)
                 break;
@@ -2826,6 +2962,9 @@ trace_target_ready:
         int signal_error;
 
         error = ring_buffer__poll(ring_buffer, 250);
+        if (output.libuv_mode)
+            cw_libuv_refresh_epoll(
+                &libuv_runtime, &output);
         signal_error = cw_capture_drain_signals(&control);
         if (signal_error) {
             error = signal_error;
@@ -2917,6 +3056,8 @@ cleanup:
         cw_libuv_print_summary(
             &libuv_runtime,
             output.libuv_counters_map_fd,
+            output.epoll_counters_map_fd,
+            output.libuv_fallback_tokens,
             output.json_output ? stderr : stdout);
     finalize_outputs = !cw_capture_cancelled(&control);
     if (output.report_stream) {
@@ -2949,6 +3090,8 @@ cleanup:
                 cw_libuv_write_summary_json(
                     &libuv_runtime,
                     output.libuv_counters_map_fd,
+                    output.epoll_counters_map_fd,
+                    output.libuv_fallback_tokens,
                     output.json_stream) && !error)
                 error = -(errno ? errno : EIO);
         } else if (!output.io_uring_mode && finalize_outputs) {

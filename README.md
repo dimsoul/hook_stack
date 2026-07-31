@@ -391,9 +391,27 @@ required:
 
 ```sh
 sudo ./callweave -p PID --libuv
-sudo ./callweave -p PID --libuv \
-  --min-epoll-callback-us 500 --duration 20
+sudo ./callweave -p PID --libuv --live --duration 20
 ```
+
+The default is summary-only output: Callweave keeps all BPF aggregates and
+prints the final diagnosis without streaming each ready event. Use `--live`
+to stream slow or anomalous paths, or `--verbose` to stream every wait,
+dispatch, and callback detail:
+
+```sh
+sudo ./callweave -p PID --libuv
+sudo ./callweave -p PID --libuv --live
+sudo ./callweave -p PID --libuv --verbose
+```
+
+In `--live` mode, normal long idle waits remain quiet; wait errors,
+unhandled/handoff paths, I/O errors, EPOLLET/ONESHOT warnings, dispatches of
+at least 1 ms, and callbacks of at least 1 ms are emitted. The existing
+`--min-epoll-wait-us`, `--min-epoll-dispatch-us`, and
+`--min-epoll-callback-us` options select custom thresholds and remain
+available for advanced use. Explicit thresholds are mutually exclusive with
+the three output-mode options.
 
 For the smallest startup blind window, let Callweave launch the target:
 
@@ -415,10 +433,34 @@ sudo ./callweave -p PID --libuv \
 The final output is headed `libuv summary`, identifies epoll as the Linux I/O
 backend, retains the useful backend diagnostic sections, and adds a
 `libuv adapter health` block with handle lifecycle, registration-event,
-unique callback-attachment, and attachment-failure counts. Callback rows use
+unique callback-attachment, and attachment-failure counts. A separate
+`libuv attribution coverage` block classifies every finished, resolvable
+ready path by the strongest evidence Callweave actually observed:
+
+- `exact`: the epoll ready event and a complete callback entry/return pair
+  were both observed.
+- `ready-to-I/O`: the callback boundary was unavailable, but the ready FD was
+  correlated with a later read, write, receive, send, accept, or related I/O
+  syscall and its user stack.
+- `ready-only`: the FD became ready, but no complete callback or matching I/O
+  was observed before that thread returned to epoll.
+
+This classification is per ready path, so one capture can contain all three
+levels. Callweave never promotes a fallback path to `exact`. In live text
+output, dispatch and callback records include an `evidence` line. In JSON
+Lines output, `epoll_dispatch` and `epoll_callback` records contain an
+`evidence` field, while `epoll_summary` and `libuv_summary` contain the
+coverage counters. Summary mode writes only the final summary records; select
+`--live`, `--verbose`, or explicit thresholds when per-event JSON records are
+needed. When a newly launched libuv process registers a poll
+handle before its final epoll registration is visible, Callweave retries a
+targeted `/proc/PID/fdinfo` lookup for that learned FD and seeds the normal
+epoll token map without adding work to the BPF ready-event loop. Callback
+rows use
 the actual `uv_poll_t *` as their automatically learned key.
-JSON Lines mode emits the normal `epoll_callback`/`epoll_summary` records and
-an additional final `libuv_summary` record.
+JSON Lines mode always emits the final `epoll_summary` and `libuv_summary`;
+detail-enabled modes additionally emit the matching epoll and callback
+records.
 
 There are two deliberate boundaries in this first version:
 
@@ -426,6 +468,8 @@ There are two deliberate boundaries in this first version:
   attachment cannot be reconstructed safely from a stable public API. Generic
   epoll registrations are still recovered from `/proc/PID/fdinfo`, but
   automatic callback attribution begins with later libuv registrations.
+  Earlier handles therefore remain observable through `ready-to-I/O` or
+  `ready-only` evidence instead of disappearing from the report.
 - The callback pointer must belong to a file-backed executable mapping so a
   uprobe can be attached. This covers native C/C++ callbacks, including
   stripped functions because their runtime address is sufficient. It does not
@@ -446,8 +490,7 @@ before registering its poll handle:
 ./test/trace_libuv_test 20
 
 # Terminal 2
-sudo ./callweave -p PID --libuv \
-  --min-epoll-callback-us 1000 --epoll-top 5
+sudo ./callweave -p PID --libuv --live --epoll-top 5
 ```
 
 The example writes to a nonblocking pipe every 50 ms and deliberately sleeps
@@ -466,8 +509,15 @@ a callback function in advance:
 
 ```sh
 sudo ./callweave -p PID --epoll
-sudo ./callweave -p PID --epoll --duration 10 --max-events 100
+sudo ./callweave -p PID --epoll --live --duration 10
+sudo ./callweave -p PID --epoll --verbose --duration 10
 ```
+
+The same output modes apply to generic epoll diagnostics. The default prints
+the final aggregate report, `--live` streams slow and anomalous paths, and
+`--verbose` streams every detail. For backward-compatible bounded event
+capture, `--max-events` without an explicit mode implies verbose output;
+it cannot be combined with `--summary-only` or `--live`.
 
 To guarantee observation from the target's first epoll operation, let
 Callweave launch it after the BPF programs and ring buffers are ready:
@@ -765,9 +815,12 @@ JSON Lines output contains `epoll_wait`, `epoll_dispatch`, and, when enabled,
 `epoll_callback` records followed by one `epoll_summary` record:
 
 ```sh
-sudo ./callweave -p PID --epoll --format json \
+sudo ./callweave -p PID --epoll --verbose --format json \
   --output /tmp/callweave-epoll.jsonl
 ```
+
+Without `--verbose`, `--live`, or custom thresholds, JSON mode writes only the
+final `epoll_summary` (and `libuv_summary` in libuv mode).
 
 Without `--epoll-callback`, generic mode associates readiness only with
 subsequent syscalls on the same event-loop thread. Use the callback option for

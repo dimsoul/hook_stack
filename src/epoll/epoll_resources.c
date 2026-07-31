@@ -219,6 +219,151 @@ static int seed_registration(
     return 1;
 }
 
+static bool force_seed_libuv_registration(
+    struct output_options *output, uint32_t pid,
+    int epoll_fd, int fd, uint32_t events, uint64_t data)
+{
+    uint32_t epoll_generation =
+        seed_fd_generation(output, pid, epoll_fd);
+    uint32_t fd_generation =
+        seed_fd_generation(output, pid, fd);
+    struct cw_epoll_resource_key resource_key = {
+        .pid = pid,
+        .epoll_fd = epoll_fd,
+        .epoll_generation = epoll_generation,
+        .fd = fd,
+        .fd_generation = fd_generation,
+    };
+    struct cw_epoll_registration registration = {
+        .data = data,
+        .events = events,
+    };
+    struct cw_epoll_token_key token_key = {
+        .data = data,
+        .pid = pid,
+        .epoll_fd = epoll_fd,
+        .epoll_generation = epoll_generation,
+    };
+    struct cw_epoll_token_value token = {
+        .fd = fd,
+        .fd_generation = fd_generation,
+    };
+    struct cw_epoll_resource_stats stats = {
+        .dispatch_stack_id = -1,
+        .callback_stack_id = -1,
+    };
+    bool update_stats;
+
+    update_stats = bpf_map_lookup_elem(
+        output->epoll_resource_stats_map_fd,
+        &resource_key, &stats) != 0;
+    if (update_stats) {
+        memset(&stats, 0, sizeof(stats));
+        stats.dispatch_stack_id = -1;
+        stats.callback_stack_id = -1;
+    }
+    if (!update_stats &&
+        (!stats.active || stats.data != data ||
+         stats.interest_events != events))
+        update_stats = true;
+    if (update_stats) {
+        stats.data = data;
+        stats.interest_events = events;
+        stats.active = 1;
+        if (!stats.registrations)
+            stats.registrations = 1;
+        if (bpf_map_update_elem(
+                output->epoll_resource_stats_map_fd,
+                &resource_key, &stats, BPF_ANY))
+            return false;
+    }
+    if (bpf_map_update_elem(
+            output->epoll_registration_map_fd,
+            &resource_key, &registration, BPF_ANY) ||
+        bpf_map_update_elem(
+            output->epoll_token_map_fd,
+            &token_key, &token, BPF_ANY))
+        return false;
+    cw_fd_cache_one(
+        &output->fd_resources, output->target_pid, fd);
+    return true;
+}
+
+bool cw_epoll_seed_libuv_fd(
+    struct output_options *output, uint32_t pid, int fd)
+{
+    char directory_path[64];
+    struct dirent *entry;
+    DIR *directory;
+    bool seeded = false;
+
+    if (!output || output->target_pid <= 0 || fd < 0 ||
+        output->epoll_registration_map_fd < 0 ||
+        output->epoll_token_map_fd < 0 ||
+        output->epoll_resource_stats_map_fd < 0 ||
+        output->epoll_fd_generation_map_fd < 0)
+        return false;
+    snprintf(
+        directory_path, sizeof(directory_path),
+        "/proc/%d/fd", (int)output->target_pid);
+    directory = opendir(directory_path);
+    if (!directory)
+        return false;
+    while (!seeded && (entry = readdir(directory)) != NULL) {
+        char link_path[96];
+        char target[PATH_MAX];
+        char info_path[96];
+        char line[512];
+        char *end = NULL;
+        FILE *file;
+        ssize_t length;
+        long epoll_fd;
+
+        errno = 0;
+        epoll_fd = strtol(entry->d_name, &end, 10);
+        if (errno || end == entry->d_name || *end ||
+            epoll_fd < 0 || epoll_fd > INT_MAX)
+            continue;
+        snprintf(
+            link_path, sizeof(link_path),
+            "/proc/%d/fd/%ld",
+            (int)output->target_pid, epoll_fd);
+        length = readlink(
+            link_path, target, sizeof(target) - 1);
+        if (length < 0)
+            continue;
+        target[length] = '\0';
+        if (strcmp(target, "anon_inode:[eventpoll]"))
+            continue;
+        snprintf(
+            info_path, sizeof(info_path),
+            "/proc/%d/fdinfo/%ld",
+            (int)output->target_pid, epoll_fd);
+        file = fopen(info_path, "r");
+        if (!file)
+            continue;
+        while (fgets(line, sizeof(line), file)) {
+            unsigned long long raw_events;
+            unsigned long long data;
+            int target_fd;
+
+            if (sscanf(
+                    line,
+                    "tfd: %d events: %llx data: %llx",
+                    &target_fd, &raw_events, &data) != 3 ||
+                target_fd != fd)
+                continue;
+            seeded = force_seed_libuv_registration(
+                output, pid, (int)epoll_fd, fd,
+                (uint32_t)raw_events, (uint64_t)data);
+            break;
+        }
+        fclose(file);
+    }
+    closedir(directory);
+    return seeded;
+}
+
 static void seed_epoll_fd(
     struct output_options *output, uint32_t pid, int epoll_fd,
     struct seed_pass_result *result)
