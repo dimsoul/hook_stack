@@ -35,6 +35,8 @@ const char *cw_epoll_callback_match_name(uint32_t match)
         return "fd";
     case CW_EPOLL_CALLBACK_MATCH_DATA:
         return "data";
+    case CW_EPOLL_CALLBACK_MATCH_LIBUV:
+        return "libuv-handle";
     default:
         return "unknown";
     }
@@ -743,9 +745,7 @@ static int write_callback_json(
                 event->blocked_ns - event->runqueue_ns : 0;
     char ready_flags[128];
     char resource[PATH_MAX];
-    uint64_t callback_key =
-        event->match_kind == CW_EPOLL_CALLBACK_MATCH_FD ?
-            (uint32_t)event->fd : event->data;
+    uint64_t callback_key = event->callback_key;
 
     if (!stream)
         return 0;
@@ -831,6 +831,13 @@ static void print_callback_event(
         snprintf(
             callback_key, sizeof(callback_key),
             "%d -> fd=%d", event->fd, event->fd);
+    else if (event->match_kind ==
+             CW_EPOLL_CALLBACK_MATCH_LIBUV)
+        snprintf(
+            callback_key, sizeof(callback_key),
+            "handle=0x%llx -> fd=%d",
+            (unsigned long long)event->callback_key,
+            event->fd);
     else
         snprintf(
             callback_key, sizeof(callback_key),
@@ -838,8 +845,10 @@ static void print_callback_event(
             (unsigned long long)event->data, event->fd);
     print_event_time(event->start_ns);
     printf(
-        "EPOLL CALLBACK %s PID %u/TID %u (%.*s) "
+        "%s %s PID %u/TID %u (%.*s) "
         "epfd=%d match=%s key=%s events=%s\n",
+        output->libuv_mode ?
+            "LIBUV CALLBACK" : "EPOLL CALLBACK",
         output->epoll_callback_name,
         event->pid, event->tid,
         (int)sizeof(event->comm), event->comm,

@@ -5,6 +5,7 @@
 #include "async/async_config.h"
 #include "epoll/epoll_config.h"
 #include "epoll/epoll_shared.h"
+#include "libuv/libuv_shared.h"
 #include "io_uring/io_uring_config.h"
 #include "io_uring/io_uring_shared.h"
 #include <bpf/bpf_core_read.h>
@@ -356,6 +357,7 @@ struct {
 
 #include "io_uring/io_uring.bpf.maps.h"
 #include "epoll/epoll.bpf.maps.h"
+#include "libuv/libuv.bpf.maps.h"
 
 static __always_inline int get_process_info(u64 *pid_tgid, u32 *global_pid,
                                             u32 *global_tid, u32 *pid,
@@ -1786,6 +1788,7 @@ int trace_sched_waking(struct bpf_raw_tracepoint_args *ctx)
 #include "io_uring/io_uring.bpf.progs.h"
 #include "epoll/epoll.bpf.progs.h"
 #include "epoll/epoll_wake.bpf.progs.h"
+#include "libuv/libuv.bpf.progs.h"
 #include "epoll/epoll_callback.bpf.progs.h"
 
 char LICENSE[] SEC("license") = "GPL";

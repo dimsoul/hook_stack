@@ -777,14 +777,20 @@ static void print_callback_table(
 
     if (!output->epoll_callback_name)
         return;
-    fprintf(
-        stream,
-        "\n[10] Callback execution: %s "
-        "(match=%s key-arg%u)\n",
-        output->epoll_callback_name,
-        cw_epoll_callback_match_name(
-            output->epoll_callback_match),
-        output->epoll_callback_key_arg);
+    if (output->libuv_mode)
+        fprintf(
+            stream,
+            "\n[10] libuv callback execution "
+            "(automatic uv_poll_t handle matching)\n");
+    else
+        fprintf(
+            stream,
+            "\n[10] Callback execution: %s "
+            "(match=%s key-arg%u)\n",
+            output->epoll_callback_name,
+            cw_epoll_callback_match_name(
+                output->epoll_callback_match),
+            output->epoll_callback_key_arg);
     callbacks = calloc(count ? count : 1, sizeof(*callbacks));
     if (!callbacks) {
         fprintf(stream, "  Cannot allocate callback summary rows.\n");
@@ -796,11 +802,17 @@ static void print_callback_table(
         callbacks[callback_count++] = rows[index];
     }
     if (!callback_count) {
-        fprintf(
-            stream,
-            "  No callback invocation matched a ready event. "
-            "Verify --epoll-callback-key-arg and "
-            "--epoll-callback-match.\n");
+        if (output->libuv_mode)
+            fprintf(
+                stream,
+                "  No discovered libuv callback invocation matched "
+                "an epoll-ready FD.\n");
+        else
+            fprintf(
+                stream,
+                "  No callback invocation matched a ready event. "
+                "Verify --epoll-callback-key-arg and "
+                "--epoll-callback-match.\n");
         free(callbacks);
         return;
     }
@@ -873,6 +885,13 @@ static void print_callback_table(
                 callback_key, sizeof(callback_key),
                 "%d -> %d",
                 callbacks[index].key.fd,
+                callbacks[index].key.fd);
+        else if (output->epoll_callback_match ==
+                 CW_EPOLL_CALLBACK_MATCH_LIBUV)
+            snprintf(
+                callback_key, sizeof(callback_key),
+                "0x%016llx -> %d",
+                (unsigned long long)stats->callback_key,
                 callbacks[index].key.fd);
         else
             snprintf(
@@ -984,9 +1003,10 @@ bool cw_epoll_print_summary(struct output_options *output)
         correlatable - counters.dispatches - counters.unconsumed : 0;
     if (output->json_output) {
         fprintf(stream,
-                "\nepoll capture stopped: waits=%llu ready=%llu "
+                "\n%s capture stopped: waits=%llu ready=%llu "
                 "timeouts=%llu errors=%llu; structured summary "
                 "written to JSON output\n",
+                output->libuv_mode ? "libuv" : "epoll",
                 (unsigned long long)counters.calls,
                 (unsigned long long)counters.ready_events,
                 (unsigned long long)counters.timeouts,
@@ -997,8 +1017,15 @@ bool cw_epoll_print_summary(struct output_options *output)
         return true;
     }
 
+    fprintf(
+        stream, "\n%s summary\n",
+        output->libuv_mode ? "libuv" : "epoll");
+    if (output->libuv_mode)
+        fprintf(
+            stream,
+            "  Runtime             : native uv_poll_t adapter\n"
+            "  Linux I/O backend   : epoll\n");
     fprintf(stream,
-            "\nepoll summary\n"
             "\n[1] Capture overview\n"
             "  Observation scope   : %s\n"
             "  Bootstrap state     : %u registration%s from %u epoll "
@@ -1026,7 +1053,7 @@ bool cw_epoll_print_summary(struct output_options *output)
             "  Wake attributed     : %llu\n"
             "    eventfd/timerfd/signalfd: %llu / %llu / %llu\n"
             "  Callback match/done : %llu / %llu\n"
-            "    matched by fd/data: %llu / %llu\n"
+            "    matched fd/data/libuv: %llu / %llu / %llu\n"
             "    unmatched/overflow: %llu / %llu\n"
             "  Callback records    : %llu\n"
             "  Callback dropped    : %llu\n"
@@ -1072,6 +1099,7 @@ bool cw_epoll_print_summary(struct output_options *output)
             (unsigned long long)counters.callback_completed,
             (unsigned long long)counters.callback_fd_matched,
             (unsigned long long)counters.callback_data_matched,
+            (unsigned long long)counters.callback_libuv_matched,
             (unsigned long long)counters.callback_unmatched,
             (unsigned long long)counters.callback_overflow,
             (unsigned long long)counters.callback_emitted,
@@ -1234,6 +1262,7 @@ int cw_epoll_write_summary_json(struct output_options *output)
             "\"callback_matched\":%llu,"
             "\"callback_fd_matched\":%llu,"
             "\"callback_data_matched\":%llu,"
+            "\"callback_libuv_matched\":%llu,"
             "\"callback_unmatched\":%llu,"
             "\"callback_completed\":%llu,"
             "\"callback_overflow\":%llu,"
@@ -1275,6 +1304,7 @@ int cw_epoll_write_summary_json(struct output_options *output)
             (unsigned long long)counters.callback_matched,
             (unsigned long long)counters.callback_fd_matched,
             (unsigned long long)counters.callback_data_matched,
+            (unsigned long long)counters.callback_libuv_matched,
             (unsigned long long)counters.callback_unmatched,
             (unsigned long long)counters.callback_completed,
             (unsigned long long)counters.callback_overflow,

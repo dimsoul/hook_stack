@@ -10,6 +10,7 @@
 enum cw_epoll_callback_match {
     CW_EPOLL_CALLBACK_MATCH_FD = 1,
     CW_EPOLL_CALLBACK_MATCH_DATA,
+    CW_EPOLL_CALLBACK_MATCH_LIBUV,
 };
 
 enum cw_epoll_io_operation {
@@ -160,6 +161,7 @@ struct cw_epoll_counters {
     __u64 callback_matched;
     __u64 callback_fd_matched;
     __u64 callback_data_matched;
+    __u64 callback_libuv_matched;
     __u64 callback_unmatched;
     __u64 callback_completed;
     __u64 callback_overflow;
@@ -256,6 +258,7 @@ struct cw_epoll_resource_stats {
     __u64 callback_offcpu_ns;
     __u64 callback_blocked_ns;
     __u64 callback_runqueue_ns;
+    __u64 callback_key;
     __s32 callback_stack_id;
     __u32 callback_reserved;
 };
@@ -333,6 +336,7 @@ struct cw_epoll_callback_event {
     __u64 blocked_ns;
     __u64 runqueue_ns;
     __u64 data;
+    __u64 callback_key;
     __u32 pid;
     __u32 tid;
     __u32 global_pid;

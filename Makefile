@@ -33,6 +33,12 @@ ifeq ($(strip $(ZLIB_LIBS)),)
 ZLIB_LIBS := -lz
 endif
 
+LIBUV_CFLAGS := $(shell $(PKG_CONFIG) --cflags libuv 2>/dev/null)
+LIBUV_LIBS := $(shell $(PKG_CONFIG) --libs libuv 2>/dev/null)
+ifneq ($(strip $(LIBUV_LIBS)),)
+LIBUV_DEFAULT_TARGET = $(LIBUV_TEST_BINARY)
+endif
+
 CFLAGS ?= -O2 -g
 CFLAGS += -std=gnu11 -Wall -Wextra -Wpedantic -Wno-overlength-strings
 BPF_CFLAGS ?= -O2 -g
@@ -46,16 +52,18 @@ COMPLEX_ASYNC_TEST_BINARY := test/trace_complex_async_test
 LOCK_TEST_BINARY := test/trace_lock_test
 IO_URING_TEST_BINARY := test/trace_io_uring_test
 EPOLL_TEST_BINARY := test/trace_epoll_test
+LIBUV_TEST_BINARY := test/trace_libuv_test
 BPF_OBJECT := src/callweave.bpf.o
 VMLINUX_HEADER := src/vmlinux.h
 SKELETON_HEADER := src/callweave.skel.h
 
 .DELETE_ON_ERROR:
-.PHONY: all clean test-program demo-async demo-io-uring demo-epoll
+.PHONY: all clean test-program test-libuv demo-async demo-io-uring demo-epoll
 
 all: $(BINARY) $(TEST_BINARY) $(ASYNC_TEST_BINARY) \
 	$(THREAD_POOL_TEST_BINARY) $(COMPLEX_ASYNC_TEST_BINARY) \
-	$(LOCK_TEST_BINARY) $(IO_URING_TEST_BINARY) $(EPOLL_TEST_BINARY)
+	$(LOCK_TEST_BINARY) $(IO_URING_TEST_BINARY) $(EPOLL_TEST_BINARY) \
+	$(LIBUV_DEFAULT_TARGET)
 
 $(VMLINUX_HEADER):
 	@test -r /sys/kernel/btf/vmlinux || \
@@ -68,6 +76,9 @@ $(BPF_OBJECT): src/callweave.bpf.c \
 		src/epoll/epoll.bpf.maps.h src/epoll/epoll.bpf.progs.h \
 		src/epoll/epoll_wake.bpf.progs.h \
 		src/epoll/epoll_callback.bpf.progs.h \
+		src/libuv/libuv_shared.h \
+		src/libuv/libuv.bpf.maps.h \
+		src/libuv/libuv.bpf.progs.h \
 		src/io_uring/io_uring_config.h \
 		src/io_uring/io_uring_shared.h \
 		src/io_uring/io_uring.bpf.maps.h \
@@ -83,6 +94,7 @@ $(BINARY): src/callweave.c src/core/capture_control.c \
 		src/async/async_output.c src/config.c \
 		src/epoll/epoll.c src/epoll/epoll_report.c \
 		src/epoll/epoll_resources.c \
+		src/libuv/libuv.c \
 		src/symbols.c src/io_uring/io_uring.c \
 		src/io_uring/io_uring_report.c \
 		src/io_uring/io_uring_resources.c \
@@ -95,6 +107,7 @@ $(BINARY): src/callweave.c src/core/capture_control.c \
 		src/core/fd_resources.h \
 		src/epoll/epoll.h src/epoll/epoll_internal.h \
 		src/epoll/epoll_config.h src/epoll/epoll_shared.h \
+		src/libuv/libuv.h src/libuv/libuv_shared.h \
 		src/io_uring/io_uring_config.h \
 		src/callweave_internal.h \
 		src/config.h src/symbols.h \
@@ -105,6 +118,7 @@ $(BINARY): src/callweave.c src/core/capture_control.c \
 		src/async/async_output.c src/config.c \
 		src/epoll/epoll.c src/epoll/epoll_report.c \
 		src/epoll/epoll_resources.c \
+		src/libuv/libuv.c \
 		src/symbols.c src/io_uring/io_uring.c \
 		src/io_uring/io_uring_report.c \
 		src/io_uring/io_uring_resources.c src/report.c -o $@ \
@@ -138,6 +152,16 @@ $(EPOLL_TEST_BINARY): test/test_epoll.c
 	$(CC) -std=gnu11 -O0 -g -Wall -Wextra -fno-omit-frame-pointer \
 		-fno-inline -rdynamic $< -o $@ -pthread
 
+$(LIBUV_TEST_BINARY): test/test_libuv.c
+	@test -n "$(LIBUV_LIBS)" || \
+		{ echo "error: libuv development files are required for test-libuv" >&2; \
+		  echo "install libuv1-dev, then run make test-libuv" >&2; exit 1; }
+	$(CC) -std=gnu11 -O0 -g -Wall -Wextra -fno-omit-frame-pointer \
+		-fno-inline -rdynamic $(LIBUV_CFLAGS) $< -o $@ \
+		$(LIBUV_LIBS) -pthread
+
+test-libuv: $(LIBUV_TEST_BINARY)
+
 test-program: $(TEST_BINARY) $(ASYNC_TEST_BINARY) \
 	$(THREAD_POOL_TEST_BINARY) $(COMPLEX_ASYNC_TEST_BINARY) \
 	$(LOCK_TEST_BINARY) $(IO_URING_TEST_BINARY) $(EPOLL_TEST_BINARY)
@@ -156,5 +180,6 @@ clean:
 		$(THREAD_POOL_TEST_BINARY) $(COMPLEX_ASYNC_TEST_BINARY) \
 		$(LOCK_TEST_BINARY) $(IO_URING_TEST_BINARY) \
 		$(EPOLL_TEST_BINARY) $(BPF_OBJECT) \
+		$(LIBUV_TEST_BINARY) \
 		$(VMLINUX_HEADER) \
 		$(SKELETON_HEADER)

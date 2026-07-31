@@ -54,6 +54,9 @@ the target application.
 - Correlate an epoll-ready FD with a selected user callback and report
   ready-to-callback delay, callback duration, scheduler-state attribution,
   slowest call sites, and nested callback execution.
+- Automatically adapt native libuv `uv_poll_t` watchers by learning their
+  handle, FD, event mask, and callback from the public libuv API, without
+  requiring callback names or argument positions.
 - Pair nested and recursive calls independently for each thread.
 - Stop cleanly on `SIGINT` or `SIGTERM`.
 
@@ -107,6 +110,16 @@ For Debian or Ubuntu, the dependencies are typically installed with:
 sudo apt install make clang llvm bpftool binutils libbpf-dev libelf-dev zlib1g-dev
 ```
 
+Neither epoll nor libuv is a Callweave runtime dependency. epoll is a Linux
+kernel API, while the libuv adapter observes the copy already used by the
+target process and does not link Callweave with `-luv`. Only the optional
+libuv example requires the development package:
+
+```sh
+sudo apt install libuv1-dev
+make test-libuv
+```
+
 ## Build
 
 Run the build from the repository root:
@@ -146,6 +159,8 @@ do not require editing a single monolithic loader:
   integrations can use parallel directories.
 - `src/epoll/`: epoll syscall correlation, existing-registration discovery,
   event-loop/resource aggregation, rendering, and BPF programs.
+- `src/libuv/`: native `uv_poll_t` API observation, handle-to-FD state, and
+  dynamic attachment to callbacks discovered at runtime.
 - `src/report.c`: async JSON Lines and self-contained HTML reports.
 - `src/callweave.bpf.c`: common eBPF probes and async tracing.
 - `src/async/async_events.h` and `src/io_uring/io_uring_shared.h`:
@@ -164,6 +179,8 @@ Usage:
   ./callweave -p PID --config PATH
   ./callweave -p PID --io-uring
   ./callweave -p PID --epoll
+  ./callweave -p PID --libuv
+  ./callweave --libuv --exec PROGRAM -- [ARGS...]
   ./callweave --check-config PATH
 ```
 
@@ -352,6 +369,95 @@ per-operation aggregates, error codes, Top-N groups, ring diagnostics, invalid
 SQE samples, and linked-request edges. The asynchronous-chain HTML report
 currently has a different data model and is therefore not accepted in this
 mode.
+
+### libuv automatic adapter
+
+The first libuv adapter covers native `uv_poll_t` watchers. It observes
+`uv_poll_init`, `uv_poll_init_socket`, `uv_poll_start`, `uv_poll_stop`, and
+`uv_close` to learn the relationship:
+
+```text
+uv_poll_t handle -> monitored FD -> registered callback
+```
+
+When `uv_poll_start` succeeds, Callweave resolves the callback pointer to its
+file-backed ELF mapping and dynamically attaches entry and return uprobes.
+The existing epoll tracer then connects kernel readiness to that handle and
+reports ready-to-callback delay, callback execution time, scheduler
+attribution, resource identity, and the callback stack.
+
+No callback name, callback argument number, FD, or `epoll_event.data` value is
+required:
+
+```sh
+sudo ./callweave -p PID --libuv
+sudo ./callweave -p PID --libuv \
+  --min-epoll-callback-us 500 --duration 20
+```
+
+For the smallest startup blind window, let Callweave launch the target:
+
+```sh
+sudo ./callweave --libuv --duration 20 \
+  --exec ./server -- --port 8080
+```
+
+The ELF defining `uv_poll_start` is normally found automatically among the
+target's mapped modules, or among the executable's dynamic dependencies in
+`--exec` mode. Use the optional override only for a later `dlopen`, unusual
+loader layout, or bundled libuv that cannot be inferred:
+
+```sh
+sudo ./callweave -p PID --libuv \
+  --libuv-binary /opt/application/lib/libuv.so.1
+```
+
+The final output is headed `libuv summary`, identifies epoll as the Linux I/O
+backend, retains the useful backend diagnostic sections, and adds a
+`libuv adapter health` block with handle lifecycle, registration-event,
+unique callback-attachment, and attachment-failure counts. Callback rows use
+the actual `uv_poll_t *` as their automatically learned key.
+JSON Lines mode emits the normal `epoll_callback`/`epoll_summary` records and
+an additional final `libuv_summary` record.
+
+There are two deliberate boundaries in this first version:
+
+- With `-p PID`, libuv handles whose `uv_poll_init/start` calls finished before
+  attachment cannot be reconstructed safely from a stable public API. Generic
+  epoll registrations are still recovered from `/proc/PID/fdinfo`, but
+  automatic callback attribution begins with later libuv registrations.
+- The callback pointer must belong to a file-backed executable mapping so a
+  uprobe can be attached. This covers native C/C++ callbacks, including
+  stripped functions because their runtime address is sufficient. It does not
+  yet identify a Node.js/V8 JIT JavaScript callback; that requires a separate
+  runtime-specific adapter.
+
+Build the optional example after installing `libuv1-dev`:
+
+```sh
+make test-libuv
+```
+
+Then use two terminals. The example prints its PID and waits five seconds
+before registering its poll handle:
+
+```sh
+# Terminal 1
+./test/trace_libuv_test 20
+
+# Terminal 2
+sudo ./callweave -p PID --libuv \
+  --min-epoll-callback-us 1000 --epoll-top 5
+```
+
+The example writes to a nonblocking pipe every 50 ms and deliberately sleeps
+for about 3 ms in every fifth poll callback, making the callback execution and
+blocked-time attribution visible. It is also usable through `--exec`:
+
+```sh
+sudo ./callweave --libuv --duration 12 \
+  --exec ./test/trace_libuv_test -- 20
+```
 
 ### epoll event-loop diagnostics
 

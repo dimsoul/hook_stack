@@ -36,6 +36,8 @@ struct elf_symbol_info {
 };
 
 static const char *path_basename(const char *path);
+static struct proc_map *find_map(
+    struct map_list *maps, uint64_t address);
 void map_list_free(struct map_list *maps)
 {
     free(maps->items);
@@ -318,6 +320,175 @@ out:
     if (file_descriptor >= 0)
         close(file_descriptor);
     return result;
+}
+
+int resolve_process_symbol_module(pid_t pid, const char *symbol_name,
+                                  char *path, size_t path_size)
+{
+    struct map_list maps = {0};
+    size_t matches = 0;
+    size_t i;
+    int error = 0;
+
+    if (read_process_maps((uint32_t)pid, &maps))
+        return -(errno ? errno : EIO);
+    for (i = 0; i < maps.count; i++) {
+        struct elf_symbol_info info;
+        int result;
+
+        if (!is_first_path_occurrence(&maps, i) ||
+            access(maps.items[i].path, R_OK))
+            continue;
+        result = find_elf_symbol(
+            maps.items[i].path, symbol_name, &info);
+        if (result < 0)
+            continue;
+        if (!result)
+            continue;
+        matches++;
+        if (matches == 1 &&
+            snprintf(path, path_size, "%s",
+                     maps.items[i].path) >= (int)path_size) {
+            error = -ENAMETOOLONG;
+            goto out;
+        }
+    }
+    if (!matches)
+        error = -ENOENT;
+    else if (matches > 1)
+        error = -ENOTUNIQ;
+out:
+    map_list_free(&maps);
+    return error;
+}
+
+static int linked_candidate(
+    char *line, char *candidate, size_t candidate_size)
+{
+    char *start = strstr(line, "=>");
+    char *end;
+
+    if (start)
+        start += 2;
+    else
+        start = line;
+    while (*start == ' ' || *start == '\t')
+        start++;
+    if (*start != '/')
+        return 0;
+    end = start;
+    while (*end && *end != ' ' && *end != '\t' &&
+           *end != '\r' && *end != '\n')
+        end++;
+    if ((size_t)(end - start) >= candidate_size)
+        return -ENAMETOOLONG;
+    memcpy(candidate, start, (size_t)(end - start));
+    candidate[end - start] = '\0';
+    return 1;
+}
+
+int resolve_linked_symbol_module(const char *executable,
+                                 const char *symbol_name,
+                                 char *path, size_t path_size)
+{
+    struct elf_symbol_info info;
+    char candidate[PATH_MAX];
+    char resolved[PATH_MAX];
+    char *line = NULL;
+    size_t line_capacity = 0;
+    int pipe_fds[2] = {-1, -1};
+    FILE *output = NULL;
+    pid_t child = -1;
+    int result;
+    int status = 0;
+    int error = -ENOENT;
+
+    result = find_elf_symbol(executable, symbol_name, &info);
+    if (result > 0) {
+        if (snprintf(path, path_size, "%s", executable) >=
+            (int)path_size)
+            return -ENAMETOOLONG;
+        return 0;
+    }
+    if (pipe2(pipe_fds, O_CLOEXEC))
+        return -errno;
+    child = fork();
+    if (child < 0) {
+        error = -errno;
+        goto out;
+    }
+    if (!child) {
+        if (dup2(pipe_fds[1], STDOUT_FILENO) < 0)
+            _exit(126);
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        execlp("ldd", "ldd", "--", executable, (char *)NULL);
+        _exit(127);
+    }
+    close(pipe_fds[1]);
+    pipe_fds[1] = -1;
+    output = fdopen(pipe_fds[0], "r");
+    if (!output) {
+        error = -errno;
+        goto out;
+    }
+    pipe_fds[0] = -1;
+    while (getline(&line, &line_capacity, output) >= 0) {
+        result = linked_candidate(
+            line, candidate, sizeof(candidate));
+        if (result <= 0 || !realpath(candidate, resolved))
+            continue;
+        result = find_elf_symbol(resolved, symbol_name, &info);
+        if (result <= 0)
+            continue;
+        if (snprintf(path, path_size, "%s", resolved) >=
+            (int)path_size)
+            error = -ENAMETOOLONG;
+        else
+            error = 0;
+        break;
+    }
+out:
+    free(line);
+    if (output)
+        fclose(output);
+    if (pipe_fds[0] >= 0)
+        close(pipe_fds[0]);
+    if (pipe_fds[1] >= 0)
+        close(pipe_fds[1]);
+    if (child > 0) {
+        while (waitpid(child, &status, 0) < 0 && errno == EINTR)
+            ;
+    }
+    return error;
+}
+
+int resolve_process_address(pid_t pid, uint64_t address,
+                            char *path, size_t path_size,
+                            uint64_t *file_offset)
+{
+    struct map_list maps = {0};
+    struct proc_map *map;
+    int error = 0;
+
+    if (!path || !path_size || !file_offset)
+        return -EINVAL;
+    if (read_process_maps((uint32_t)pid, &maps))
+        return -(errno ? errno : EIO);
+    map = find_map(&maps, address);
+    if (!map || !map->path[0] || !strchr(map->perms, 'x')) {
+        error = -ENOENT;
+        goto out;
+    }
+    if (snprintf(path, path_size, "%s", map->path) >=
+        (int)path_size) {
+        error = -ENAMETOOLONG;
+        goto out;
+    }
+    *file_offset = map->offset + (address - map->start);
+out:
+    map_list_free(&maps);
+    return error;
 }
 
 int print_symbol_result(const char *path, const char *symbol_name)

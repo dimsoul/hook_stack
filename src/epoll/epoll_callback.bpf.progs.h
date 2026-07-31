@@ -93,6 +93,29 @@ static __attribute__((noinline)) void cw_epoll_callback_match(
                 candidate = NULL;
         }
     }
+    if (cw_epoll_cfg.callback_match ==
+            CW_EPOLL_CALLBACK_MATCH_LIBUV) {
+        struct cw_libuv_handle_key handle_key = {
+            .pid = identity->pid,
+            .handle = callback_key,
+        };
+        struct cw_libuv_poll_handle *handle =
+            bpf_map_lookup_elem(
+                &libuv_poll_handles, &handle_key);
+        __u64 cookie = bpf_get_attach_cookie(ctx);
+
+        if (handle && handle->active &&
+            handle->fd >= 0 &&
+            (!cookie || handle->callback == cookie)) {
+            fd = handle->fd;
+            dispatch_key.fd = fd;
+            candidate = bpf_map_lookup_elem(
+                &epoll_dispatch_candidates, &dispatch_key);
+            if (candidate)
+                match_kind =
+                    CW_EPOLL_CALLBACK_MATCH_LIBUV;
+        }
+    }
     if (!candidate || fd < 0) {
         cw_epoll_callback_record_unmatched(counters);
         return;
@@ -105,6 +128,7 @@ static __attribute__((noinline)) void cw_epoll_callback_match(
         now > candidate->item.ready_ns ?
             now - candidate->item.ready_ns : 0;
     frame->event.data = candidate->item.data;
+    frame->event.callback_key = callback_key;
     frame->event.pid = identity->pid;
     frame->event.tid = identity->tid;
     frame->event.global_pid = identity->global_pid;
@@ -135,6 +159,10 @@ static __attribute__((noinline)) void cw_epoll_callback_match(
         match_kind == CW_EPOLL_CALLBACK_MATCH_DATA)
         __sync_fetch_and_add(
             &counters->callback_data_matched, 1);
+    if (counters &&
+        match_kind == CW_EPOLL_CALLBACK_MATCH_LIBUV)
+        __sync_fetch_and_add(
+            &counters->callback_libuv_matched, 1);
     resource_key.pid = identity->pid;
     resource_key.epoll_fd = batch->epoll_fd;
     resource_key.epoll_generation =
@@ -147,6 +175,7 @@ static __attribute__((noinline)) void cw_epoll_callback_match(
     if (resource_stats) {
         __sync_fetch_and_add(
             &resource_stats->callback_matched, 1);
+        resource_stats->callback_key = callback_key;
         __sync_fetch_and_add(
             &resource_stats->callback_total_delay_ns,
             frame->event.delay_ns);

@@ -98,6 +98,8 @@ struct output_options {
     uint32_t epoll_bootstrap_conflicts;
     uint32_t epoll_bootstrap_failures;
     bool epoll_started_target;
+    bool libuv_mode;
+    int libuv_counters_map_fd;
     const char *epoll_callback_name;
     uint32_t epoll_callback_key_arg;
     uint32_t epoll_callback_match;

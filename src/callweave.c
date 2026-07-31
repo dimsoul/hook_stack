@@ -44,6 +44,7 @@
 #include "config.h"
 #include "epoll/epoll.h"
 #include "io_uring/io_uring.h"
+#include "libuv/libuv.h"
 #include "report.h"
 #include "symbols.h"
 
@@ -308,6 +309,8 @@ static void usage(FILE *stream, const char *program)
             "  %s -p PID --io-uring\n"
             "  %s -p PID --epoll\n"
             "  %s --epoll --exec PROGRAM -- [ARGS...]\n"
+            "  %s -p PID --libuv\n"
+            "  %s --libuv --exec PROGRAM -- [ARGS...]\n"
             "  %s --check-config PATH\n"
             "\n"
             "Options:\n"
@@ -364,6 +367,10 @@ static void usage(FILE *stream, const char *program)
             "user_data, 1-8 (default 1)\n"
             "      --epoll               trace epoll waits, dispatch, and "
             "resources\n"
+            "      --libuv               automatically correlate uv_poll_t "
+            "handles and callbacks\n"
+            "      --libuv-binary PATH   ELF containing libuv public APIs "
+            "(normally auto-detected)\n"
             "      --epoll-callback FUNC correlate ready event to callback "
             "execution\n"
             "      --epoll-callback-binary PATH\n"
@@ -393,9 +400,9 @@ static void usage(FILE *stream, const char *program)
             "\n"
             "When -p is used without --binary or --module, /proc/PID/exe is used.\n"
             "Without -p, an explicit BINARY is required except for "
-            "--epoll --exec.\n",
+            "--epoll/--libuv --exec.\n",
             program, program, program, program, program, program, program,
-            program, program, program);
+            program, program, program, program, program);
 }
 
 static int parse_pid(const char *text, pid_t *pid)
@@ -757,6 +764,8 @@ enum long_option_id {
     OPT_IO_CALLBACK,
     OPT_IO_CALLBACK_BINARY,
     OPT_IO_CALLBACK_ARG,
+    OPT_LIBUV,
+    OPT_LIBUV_BINARY,
     OPT_EPOLL,
     OPT_EPOLL_CALLBACK,
     OPT_EPOLL_CALLBACK_BINARY,
@@ -815,6 +824,9 @@ int main(int argc, char **argv)
          OPT_IO_CALLBACK_BINARY},
         {"io-callback-arg", required_argument, NULL,
          OPT_IO_CALLBACK_ARG},
+        {"libuv", no_argument, NULL, OPT_LIBUV},
+        {"libuv-binary", required_argument, NULL,
+         OPT_LIBUV_BINARY},
         {"epoll", no_argument, NULL, OPT_EPOLL},
         {"epoll-callback", required_argument, NULL,
          OPT_EPOLL_CALLBACK},
@@ -868,6 +880,7 @@ int main(int argc, char **argv)
         .epoll_fd_generation_map_fd = -1,
         .epoll_instance_stats_map_fd = -1,
         .epoll_fd_metadata_map_fd = -1,
+        .libuv_counters_map_fd = -1,
         .target_pidfd = -1,
         .diagnostic_interval_ms = 1000,
         .epoll_top = 5,
@@ -876,10 +889,12 @@ int main(int argc, char **argv)
     struct ring_buffer *ring_buffer = NULL;
     struct async_hop_config async_hops[MAX_ASYNC_HOPS] = {0};
     struct bpf_link *async_links[MAX_ASYNC_HOPS * 3] = {0};
+    struct cw_libuv_runtime libuv_runtime = {0};
     char target_path[PATH_MAX] = {0};
     char async_source_path[PATH_MAX] = {0};
     char io_callback_path[PATH_MAX] = {0};
     char epoll_callback_path[PATH_MAX] = {0};
+    char libuv_path[PATH_MAX] = {0};
     const char *binary_argument = NULL;
     const char *module_name = NULL;
     const char *find_symbol_name = NULL;
@@ -895,6 +910,7 @@ int main(int argc, char **argv)
     const char *io_callback_binary = NULL;
     const char *epoll_callback_name = NULL;
     const char *epoll_callback_binary = NULL;
+    const char *libuv_binary = NULL;
     const char *exec_path = NULL;
     char *configured_function = NULL;
     size_t function_offset = 0;
@@ -917,7 +933,9 @@ int main(int argc, char **argv)
     bool async_option_seen = false;
     bool io_callback_option_seen = false;
     bool epoll_callback_option_seen = false;
+    bool epoll_callback_selector_seen = false;
     bool epoll_callback_match_seen = false;
+    bool libuv_option_seen = false;
     bool epoll_top_option_seen = false;
     bool check_config = false;
     bool json_output = false;
@@ -1180,20 +1198,31 @@ int main(int argc, char **argv)
                 goto cleanup;
             }
             break;
+        case OPT_LIBUV:
+            output.libuv_mode = true;
+            output.epoll_mode = true;
+            break;
+        case OPT_LIBUV_BINARY:
+            libuv_binary = optarg;
+            libuv_option_seen = true;
+            break;
         case OPT_EPOLL:
             output.epoll_mode = true;
             break;
         case OPT_EPOLL_CALLBACK:
             epoll_callback_name = optarg;
             epoll_callback_option_seen = true;
+            epoll_callback_selector_seen = true;
             break;
         case OPT_EPOLL_CALLBACK_BINARY:
             epoll_callback_binary = optarg;
             epoll_callback_option_seen = true;
+            epoll_callback_selector_seen = true;
             break;
         case OPT_EPOLL_CALLBACK_FD_ARG:
         case OPT_EPOLL_CALLBACK_KEY_ARG:
             epoll_callback_option_seen = true;
+            epoll_callback_selector_seen = true;
             if (parse_u32_range(
                     optarg, 1, 8, &epoll_callback_key_arg)) {
                 fprintf(
@@ -1206,6 +1235,7 @@ int main(int argc, char **argv)
             break;
         case OPT_EPOLL_CALLBACK_MATCH:
             epoll_callback_option_seen = true;
+            epoll_callback_selector_seen = true;
             epoll_callback_match_seen = true;
             if (!strcmp(optarg, "fd"))
                 epoll_callback_match =
@@ -1372,7 +1402,7 @@ int main(int argc, char **argv)
         if (!output.epoll_mode) {
             fprintf(stderr,
                     "--exec is currently supported with standalone "
-                    "--epoll mode\n");
+                    "--epoll or --libuv mode\n");
             error = 2;
             goto cleanup;
         }
@@ -1404,6 +1434,19 @@ int main(int argc, char **argv)
          epoll_callback_option_seen)) {
         fprintf(stderr,
                 "epoll filters and callback options require --epoll\n");
+        error = 2;
+        goto cleanup;
+    }
+    if (libuv_option_seen && !output.libuv_mode) {
+        fprintf(stderr, "--libuv-binary requires --libuv\n");
+        error = 2;
+        goto cleanup;
+    }
+    if (output.libuv_mode && epoll_callback_selector_seen) {
+        fprintf(
+            stderr,
+            "--libuv automatically discovers callbacks and cannot be "
+            "combined with --epoll-callback options\n");
         error = 2;
         goto cleanup;
     }
@@ -1479,15 +1522,17 @@ int main(int argc, char **argv)
             output.io_uring_min_latency_ns ||
             output.io_uring_errors_only || output.io_uring_top) {
             fprintf(stderr,
-                    "--epoll is a standalone mode; combine it only with "
+                    "--epoll/--libuv is a standalone mode; combine it "
+                    "only with "
                     "--pid or --exec, --min-epoll-wait-us, "
                     "--min-epoll-dispatch-us, --epoll-top, "
-                    "--epoll-callback options, "
+                    "--epoll-callback or libuv options, "
                     "--duration, --max-events, --format, and --output\n");
             error = 2;
             goto cleanup;
         }
-        if (epoll_callback_option_seen &&
+        if (!output.libuv_mode &&
+            epoll_callback_option_seen &&
             (!epoll_callback_name || !epoll_callback_name[0])) {
             fprintf(
                 stderr,
@@ -1569,6 +1614,61 @@ int main(int argc, char **argv)
                 epoll_callback_key_arg;
             output.epoll_callback_match =
                 epoll_callback_match;
+        }
+        if (output.libuv_mode) {
+            if (libuv_binary) {
+                if (!realpath(libuv_binary, libuv_path)) {
+                    fprintf(
+                        stderr,
+                        "cannot resolve libuv binary %s: %s\n",
+                        libuv_binary, strerror(errno));
+                    error = 1;
+                    goto cleanup;
+                }
+            } else if (exec_path) {
+                char executable[PATH_MAX];
+
+                if (!realpath(exec_path, executable)) {
+                    fprintf(
+                        stderr,
+                        "cannot resolve libuv target %s: %s\n",
+                        exec_path, strerror(errno));
+                    error = 1;
+                    goto cleanup;
+                }
+                error = resolve_linked_symbol_module(
+                    executable, "uv_poll_start",
+                    libuv_path, sizeof(libuv_path));
+                if (error) {
+                    fprintf(
+                        stderr,
+                        "cannot auto-detect libuv used by %s: %s; "
+                        "use --libuv-binary PATH\n",
+                        executable, strerror(-error));
+                    goto cleanup;
+                }
+            } else {
+                error = resolve_process_symbol_module(
+                    target_pid, "uv_poll_start",
+                    libuv_path, sizeof(libuv_path));
+                if (error) {
+                    fprintf(
+                        stderr,
+                        "cannot find a mapped ELF defining "
+                        "uv_poll_start in PID %d: %s; "
+                        "use --libuv-binary PATH when libuv will be "
+                        "loaded later\n",
+                        (int)target_pid, strerror(-error));
+                    goto cleanup;
+                }
+            }
+            output.epoll_callback_name = "libuv:auto";
+            output.epoll_callback_key_arg = 1;
+            output.epoll_callback_match =
+                CW_EPOLL_CALLBACK_MATCH_LIBUV;
+            epoll_callback_key_arg = 1;
+            epoll_callback_match =
+                CW_EPOLL_CALLBACK_MATCH_LIBUV;
         }
         goto trace_target_ready;
     }
@@ -1960,6 +2060,50 @@ trace_target_ready:
             goto cleanup;
         }
     }
+    if (!output.libuv_mode) {
+        error = bpf_program__set_autoload(
+            skeleton->progs.trace_libuv_poll_init_entry,
+            false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_libuv_poll_init_return,
+                false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_libuv_poll_init_socket_entry,
+                false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_libuv_poll_init_socket_return,
+                false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_libuv_poll_start_entry,
+                false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_libuv_poll_start_return,
+                false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_libuv_poll_stop_entry,
+                false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_libuv_poll_stop_return,
+                false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_libuv_close_entry,
+                false);
+        if (error) {
+            fprintf(
+                stderr,
+                "failed to disable libuv adapter programs: %s\n",
+                strerror(-error));
+            goto cleanup;
+        }
+    }
     if (output.io_uring_mode || output.epoll_mode) {
         error = bpf_program__set_autoload(
             skeleton->progs.trace_function, false);
@@ -2093,6 +2237,8 @@ trace_target_ready:
         bpf_map__fd(skeleton->maps.epoll_instance_stats);
     output.epoll_fd_metadata_map_fd =
         bpf_map__fd(skeleton->maps.epoll_fd_metadata);
+    output.libuv_counters_map_fd =
+        bpf_map__fd(skeleton->maps.libuv_counters);
 
     if (output.io_uring_mode) {
         error = attach_raw_tracepoint(
@@ -2195,13 +2341,15 @@ trace_target_ready:
                 skeleton->progs.trace_epoll_process_exec,
                 &skeleton->links.trace_epoll_process_exec,
                 "sched_process_exec");
-        if (!error && output.epoll_callback_name)
+        if (!error && output.epoll_callback_name &&
+            !output.libuv_mode)
             error = attach_named_uprobe(
                 skeleton->progs.trace_epoll_callback_entry,
                 &skeleton->links.trace_epoll_callback_entry,
                 epoll_callback_path, output.epoll_callback_name,
                 0, false);
-        if (!error && output.epoll_callback_name)
+        if (!error && output.epoll_callback_name &&
+            !output.libuv_mode)
             error = attach_named_uprobe(
                 skeleton->progs.trace_epoll_callback_return,
                 &skeleton->links.trace_epoll_callback_return,
@@ -2209,6 +2357,13 @@ trace_target_ready:
                 0, true);
         if (error)
             goto cleanup;
+        if (output.libuv_mode) {
+            error = cw_libuv_attach(
+                &libuv_runtime, skeleton,
+                target_pid, libuv_path);
+            if (error)
+                goto cleanup;
+        }
         attach_optional_raw_tracepoint(
             skeleton->progs.trace_epoll_signal_generate,
             &skeleton->links.trace_epoll_signal_generate,
@@ -2392,6 +2547,21 @@ trace_target_ready:
                 goto cleanup;
             }
         }
+        if (output.libuv_mode) {
+            error = ring_buffer__add(
+                ring_buffer,
+                bpf_map__fd(
+                    skeleton->maps.libuv_registration_events),
+                cw_libuv_handle_registration,
+                &libuv_runtime);
+            if (error) {
+                fprintf(
+                    stderr,
+                    "failed to add libuv registration ring buffer: %s\n",
+                    strerror(-error));
+                goto cleanup;
+            }
+        }
     }
 
     if (json_output) {
@@ -2430,6 +2600,8 @@ trace_target_ready:
     if (json_output) {
         if (output.io_uring_mode)
             fprintf(stderr, "Tracing io_uring");
+        else if (output.libuv_mode)
+            fprintf(stderr, "Tracing libuv over epoll");
         else if (output.epoll_mode)
             fprintf(stderr, "Tracing epoll");
         else if (offset_text)
@@ -2458,7 +2630,11 @@ trace_target_ready:
         if (output.epoll_min_dispatch_ns)
             fprintf(stderr, ", minimum epoll dispatch %.3f us",
                     (double)output.epoll_min_dispatch_ns / 1000.0);
-        if (output.epoll_callback_name)
+        if (output.libuv_mode)
+            fprintf(
+                stderr, ", automatic uv_poll_t callback discovery "
+                "from %s", libuv_path);
+        else if (output.epoll_callback_name)
             fprintf(
                 stderr, ", callback %s key-arg%u match=%s",
                 output.epoll_callback_name,
@@ -2486,6 +2662,8 @@ trace_target_ready:
     } else {
         if (output.io_uring_mode)
             printf("Tracing io_uring");
+        else if (output.libuv_mode)
+            printf("Tracing libuv over epoll");
         else if (output.epoll_mode)
             printf("Tracing epoll");
         else if (offset_text)
@@ -2523,7 +2701,11 @@ trace_target_ready:
             print_interval("min-epoll-dispatch",
                            output.epoll_min_dispatch_ns);
         }
-        if (output.epoll_callback_name)
+        if (output.libuv_mode)
+            printf(
+                ", automatic uv_poll_t callback discovery from %s",
+                libuv_path);
+        else if (output.epoll_callback_name)
             printf(
                 ", callback %s key-arg%u match=%s",
                 output.epoll_callback_name,
@@ -2594,6 +2776,8 @@ trace_target_ready:
     }
 
     if (launched.pid > 0) {
+        uint64_t warmup_deadline_ns;
+
         fflush(output.json_output ? stderr : stdout);
         error = resume_launched_target(&launched);
         if (error) {
@@ -2602,11 +2786,22 @@ trace_target_ready:
             goto cleanup;
         }
         /*
-         * BPF links and ring buffers are live before SIGCONT. Give the
-         * dynamic loader a brief opportunity to establish mappings used for
-         * later user-stack symbolization; tracing is already active here.
+         * BPF links and ring buffers are live before SIGCONT. Poll during
+         * loader/application startup so a libuv registration can trigger
+         * callback attachment with the smallest practical blind window.
          */
-        usleep(10000);
+        warmup_deadline_ns =
+            monotonic_time_ns() + 20000000ULL;
+        while (monotonic_time_ns() < warmup_deadline_ns) {
+            int warmup_error = ring_buffer__poll(
+                ring_buffer, 1);
+
+            if (warmup_error < 0 &&
+                warmup_error != -EINTR)
+                break;
+            if (target_process_exited(&output))
+                break;
+        }
         cw_fd_cache_all(&output.fd_resources, target_pid);
         output.target_maps = calloc(
             1, sizeof(*output.target_maps));
@@ -2718,6 +2913,11 @@ cleanup:
     if (finalize_outputs && output.epoll_mode &&
         output.epoll_counters_map_fd >= 0)
         cw_epoll_print_summary(&output);
+    if (finalize_outputs && output.libuv_mode)
+        cw_libuv_print_summary(
+            &libuv_runtime,
+            output.libuv_counters_map_fd,
+            output.json_output ? stderr : stdout);
     finalize_outputs = !cw_capture_cancelled(&control);
     if (output.report_stream) {
         if (finalize_outputs) {
@@ -2745,6 +2945,12 @@ cleanup:
         } else if (output.epoll_mode && finalize_outputs) {
             if (cw_epoll_write_summary_json(&output) && !error)
                 error = -(errno ? errno : EIO);
+            if (output.libuv_mode &&
+                cw_libuv_write_summary_json(
+                    &libuv_runtime,
+                    output.libuv_counters_map_fd,
+                    output.json_stream) && !error)
+                error = -(errno ? errno : EIO);
         } else if (!output.io_uring_mode && finalize_outputs) {
             struct cw_queue_diagnostic diagnostics[MAX_ASYNC_HOPS];
             struct async_hop_stats raw[MAX_ASYNC_HOPS];
@@ -2766,6 +2972,7 @@ cleanup:
         error = -EIO;
     while (async_link_count)
         bpf_link__destroy(async_links[--async_link_count]);
+    cw_libuv_destroy(&libuv_runtime);
     if (ring_buffer)
         ring_buffer__free(ring_buffer);
     if (skeleton)

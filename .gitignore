@@ -9,3 +9,4 @@
 /test/trace_lock_test
 /test/trace_io_uring_test
 /test/trace_epoll_test
+/test/trace_libuv_test
