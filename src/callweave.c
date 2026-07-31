@@ -364,14 +364,19 @@ static void usage(FILE *stream, const char *program)
             "user_data, 1-8 (default 1)\n"
             "      --epoll               trace epoll waits, dispatch, and "
             "resources\n"
-            "      --epoll-callback FUNC correlate ready FD to callback "
+            "      --epoll-callback FUNC correlate ready event to callback "
             "execution\n"
             "      --epoll-callback-binary PATH\n"
             "                             ELF containing the callback "
             "(default target executable)\n"
-            "      --epoll-callback-fd-arg N\n"
+            "      --epoll-callback-key-arg N\n"
             "                             callback argument containing the "
-            "FD, 1-8 (default 1)\n"
+            "FD or event.data, 1-8 (default 1)\n"
+            "      --epoll-callback-match MODE\n"
+            "                             match callback key as fd or data "
+            "(required)\n"
+            "      --epoll-callback-fd-arg N\n"
+            "                             alias for --epoll-callback-key-arg\n"
             "      --min-epoll-callback-us US\n"
             "                             only emit callbacks lasting at "
             "least US\n"
@@ -756,6 +761,8 @@ enum long_option_id {
     OPT_EPOLL_CALLBACK,
     OPT_EPOLL_CALLBACK_BINARY,
     OPT_EPOLL_CALLBACK_FD_ARG,
+    OPT_EPOLL_CALLBACK_KEY_ARG,
+    OPT_EPOLL_CALLBACK_MATCH,
     OPT_MIN_EPOLL_CALLBACK_US,
     OPT_MIN_EPOLL_WAIT_US,
     OPT_MIN_EPOLL_DISPATCH_US,
@@ -815,6 +822,10 @@ int main(int argc, char **argv)
          OPT_EPOLL_CALLBACK_BINARY},
         {"epoll-callback-fd-arg", required_argument, NULL,
          OPT_EPOLL_CALLBACK_FD_ARG},
+        {"epoll-callback-key-arg", required_argument, NULL,
+         OPT_EPOLL_CALLBACK_KEY_ARG},
+        {"epoll-callback-match", required_argument, NULL,
+         OPT_EPOLL_CALLBACK_MATCH},
         {"min-epoll-callback-us", required_argument, NULL,
          OPT_MIN_EPOLL_CALLBACK_US},
         {"min-epoll-wait-us", required_argument, NULL,
@@ -892,7 +903,8 @@ int main(int argc, char **argv)
     uint32_t async_max_age_ms = 30000;
     uint32_t duration_seconds = 0;
     uint32_t io_callback_arg = 1;
-    uint32_t epoll_callback_fd_arg = 1;
+    uint32_t epoll_callback_key_arg = 1;
+    uint32_t epoll_callback_match = 0;
     uint64_t stop_time_ns = 0;
     size_t async_hop_count = 0;
     size_t async_link_count = 0;
@@ -905,6 +917,7 @@ int main(int argc, char **argv)
     bool async_option_seen = false;
     bool io_callback_option_seen = false;
     bool epoll_callback_option_seen = false;
+    bool epoll_callback_match_seen = false;
     bool epoll_top_option_seen = false;
     bool check_config = false;
     bool json_output = false;
@@ -1179,12 +1192,32 @@ int main(int argc, char **argv)
             epoll_callback_option_seen = true;
             break;
         case OPT_EPOLL_CALLBACK_FD_ARG:
+        case OPT_EPOLL_CALLBACK_KEY_ARG:
             epoll_callback_option_seen = true;
             if (parse_u32_range(
-                    optarg, 1, 8, &epoll_callback_fd_arg)) {
+                    optarg, 1, 8, &epoll_callback_key_arg)) {
                 fprintf(
                     stderr,
-                    "invalid --epoll-callback-fd-arg value: %s\n",
+                    "invalid epoll callback key argument: %s\n",
+                    optarg);
+                error = 2;
+                goto cleanup;
+            }
+            break;
+        case OPT_EPOLL_CALLBACK_MATCH:
+            epoll_callback_option_seen = true;
+            epoll_callback_match_seen = true;
+            if (!strcmp(optarg, "fd"))
+                epoll_callback_match =
+                    CW_EPOLL_CALLBACK_MATCH_FD;
+            else if (!strcmp(optarg, "data"))
+                epoll_callback_match =
+                    CW_EPOLL_CALLBACK_MATCH_DATA;
+            else {
+                fprintf(
+                    stderr,
+                    "invalid --epoll-callback-match value '%s'; "
+                    "expected fd or data\n",
                     optarg);
                 error = 2;
                 goto cleanup;
@@ -1459,9 +1492,18 @@ int main(int argc, char **argv)
             fprintf(
                 stderr,
                 "--epoll-callback-binary, "
-                "--epoll-callback-fd-arg, and "
+                "--epoll-callback-key-arg, "
+                "--epoll-callback-match, and "
                 "--min-epoll-callback-us require "
                 "--epoll-callback FUNCTION\n");
+            error = 2;
+            goto cleanup;
+        }
+        if (epoll_callback_name && !epoll_callback_match_seen) {
+            fprintf(
+                stderr,
+                "--epoll-callback requires "
+                "--epoll-callback-match fd|data\n");
             error = 2;
             goto cleanup;
         }
@@ -1523,6 +1565,10 @@ int main(int argc, char **argv)
             }
             output.epoll_callback_name =
                 epoll_callback_name;
+            output.epoll_callback_key_arg =
+                epoll_callback_key_arg;
+            output.epoll_callback_match =
+                epoll_callback_match;
         }
         goto trace_target_ready;
     }
@@ -1745,8 +1791,10 @@ trace_target_ready:
     skeleton->rodata->cw_epoll_cfg.enabled = output.epoll_mode;
     skeleton->rodata->cw_epoll_cfg.callback_enabled =
         output.epoll_callback_name != NULL;
-    skeleton->rodata->cw_epoll_cfg.callback_fd_arg =
-        epoll_callback_fd_arg;
+    skeleton->rodata->cw_epoll_cfg.callback_key_arg =
+        epoll_callback_key_arg;
+    skeleton->rodata->cw_epoll_cfg.callback_match =
+        epoll_callback_match;
     skeleton->rodata->cw_epoll_cfg.defer_until_exec =
         output.epoll_started_target;
     skeleton->rodata->cw_epoll_cfg.min_wait_ns =
@@ -2412,9 +2460,11 @@ trace_target_ready:
                     (double)output.epoll_min_dispatch_ns / 1000.0);
         if (output.epoll_callback_name)
             fprintf(
-                stderr, ", callback %s fd-arg%u",
+                stderr, ", callback %s key-arg%u match=%s",
                 output.epoll_callback_name,
-                epoll_callback_fd_arg);
+                epoll_callback_key_arg,
+                cw_epoll_callback_match_name(
+                    epoll_callback_match));
         if (output.epoll_min_callback_ns)
             fprintf(stderr, ", minimum callback %.3f us",
                     (double)output.epoll_min_callback_ns / 1000.0);
@@ -2475,9 +2525,11 @@ trace_target_ready:
         }
         if (output.epoll_callback_name)
             printf(
-                ", callback %s fd-arg%u",
+                ", callback %s key-arg%u match=%s",
                 output.epoll_callback_name,
-                epoll_callback_fd_arg);
+                epoll_callback_key_arg,
+                cw_epoll_callback_match_name(
+                    epoll_callback_match));
         if (output.epoll_min_callback_ns) {
             printf(",");
             print_interval(

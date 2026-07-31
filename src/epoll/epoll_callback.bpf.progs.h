@@ -11,6 +11,14 @@ cw_epoll_callback_counters(void)
     return bpf_map_lookup_elem(&epoll_counters, &zero);
 }
 
+static __always_inline void cw_epoll_callback_record_unmatched(
+    struct cw_epoll_counters *counters)
+{
+    if (counters)
+        __sync_fetch_and_add(
+            &counters->callback_unmatched, 1);
+}
+
 static __always_inline void cw_epoll_callback_copy_wake(
     const struct cw_epoll_dispatch_key *key,
     const struct cw_epoll_dispatch_candidate *candidate,
@@ -30,28 +38,63 @@ static __attribute__((noinline)) void cw_epoll_callback_match(
     const struct cw_epoll_process_identity *identity,
     struct cw_epoll_callback_frame *frame)
 {
-    __s32 fd = (__s32)read_uprobe_argument(
-        ctx, cw_epoll_cfg.callback_fd_arg);
+    __u64 callback_key = read_uprobe_argument(
+        ctx, cw_epoll_cfg.callback_key_arg);
     struct cw_epoll_dispatch_key dispatch_key = {
         .pid_tgid = pid_tgid,
-        .fd = fd,
+        .fd = -1,
     };
-    struct cw_epoll_dispatch_candidate *candidate =
-        bpf_map_lookup_elem(
-            &epoll_dispatch_candidates, &dispatch_key);
     struct cw_epoll_dispatch_batch *batch =
         bpf_map_lookup_elem(
             &epoll_dispatch_batches, &pid_tgid);
+    struct cw_epoll_dispatch_candidate *candidate = NULL;
     struct cw_epoll_counters *counters =
         cw_epoll_callback_counters();
     struct cw_epoll_resource_key resource_key;
     struct cw_epoll_resource_stats *resource_stats;
+    __u32 match_kind = 0;
+    __s32 fd = -1;
     __u64 now;
 
-    if (fd < 0 || !candidate || !batch) {
-        if (counters)
-            __sync_fetch_and_add(
-                &counters->callback_unmatched, 1);
+    if (!batch) {
+        cw_epoll_callback_record_unmatched(counters);
+        return;
+    }
+    if (cw_epoll_cfg.callback_match ==
+            CW_EPOLL_CALLBACK_MATCH_FD &&
+        callback_key <= 0x7fffffffULL) {
+        fd = (__s32)callback_key;
+        dispatch_key.fd = fd;
+        candidate = bpf_map_lookup_elem(
+            &epoll_dispatch_candidates, &dispatch_key);
+        if (candidate)
+            match_kind = CW_EPOLL_CALLBACK_MATCH_FD;
+    }
+    if (cw_epoll_cfg.callback_match ==
+            CW_EPOLL_CALLBACK_MATCH_DATA) {
+        struct cw_epoll_token_key token_key = {
+            .data = callback_key,
+            .pid = identity->pid,
+            .epoll_fd = batch->epoll_fd,
+            .epoll_generation = batch->epoll_generation,
+        };
+        struct cw_epoll_token_value *token =
+            bpf_map_lookup_elem(&epoll_tokens, &token_key);
+
+        if (token && !token->ambiguous && token->fd >= 0) {
+            fd = token->fd;
+            dispatch_key.fd = fd;
+            candidate = bpf_map_lookup_elem(
+                &epoll_dispatch_candidates, &dispatch_key);
+            if (candidate &&
+                candidate->item.data == callback_key)
+                match_kind = CW_EPOLL_CALLBACK_MATCH_DATA;
+            else
+                candidate = NULL;
+        }
+    }
+    if (!candidate || fd < 0) {
+        cw_epoll_callback_record_unmatched(counters);
         return;
     }
     now = bpf_ktime_get_ns();
@@ -74,6 +117,7 @@ static __attribute__((noinline)) void cw_epoll_callback_match(
         candidate->item.fd_generation;
     frame->event.ready_events =
         candidate->item.ready_events;
+    frame->event.match_kind = match_kind;
     frame->event.stack_id = bpf_get_stackid(
         ctx, &epoll_stacks, BPF_F_USER_STACK);
     bpf_get_current_comm(
@@ -83,6 +127,14 @@ static __attribute__((noinline)) void cw_epoll_callback_match(
     if (counters)
         __sync_fetch_and_add(
             &counters->callback_matched, 1);
+    if (counters &&
+        match_kind == CW_EPOLL_CALLBACK_MATCH_FD)
+        __sync_fetch_and_add(
+            &counters->callback_fd_matched, 1);
+    if (counters &&
+        match_kind == CW_EPOLL_CALLBACK_MATCH_DATA)
+        __sync_fetch_and_add(
+            &counters->callback_data_matched, 1);
     resource_key.pid = identity->pid;
     resource_key.epoll_fd = batch->epoll_fd;
     resource_key.epoll_generation =

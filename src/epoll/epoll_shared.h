@@ -7,6 +7,11 @@
 #define CW_EPOLL_MAX_READY 16
 #define CW_EPOLL_MAX_CALLBACK_DEPTH 8
 
+enum cw_epoll_callback_match {
+    CW_EPOLL_CALLBACK_MATCH_FD = 1,
+    CW_EPOLL_CALLBACK_MATCH_DATA,
+};
+
 enum cw_epoll_io_operation {
     CW_EPOLL_IO_NONE,
     CW_EPOLL_IO_READ,
@@ -153,6 +158,8 @@ struct cw_epoll_counters {
     __u64 timerfd_ready;
     __u64 signalfd_ready;
     __u64 callback_matched;
+    __u64 callback_fd_matched;
+    __u64 callback_data_matched;
     __u64 callback_unmatched;
     __u64 callback_completed;
     __u64 callback_overflow;
@@ -335,6 +342,7 @@ struct cw_epoll_callback_event {
     __u32 epoll_generation;
     __u32 fd_generation;
     __u32 ready_events;
+    __u32 match_kind;
     __s32 stack_id;
     char comm[CW_EPOLL_COMM_LEN];
     struct cw_epoll_wake_source wake;

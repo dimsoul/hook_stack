@@ -99,6 +99,8 @@ struct output_options {
     uint32_t epoll_bootstrap_failures;
     bool epoll_started_target;
     const char *epoll_callback_name;
+    uint32_t epoll_callback_key_arg;
+    uint32_t epoll_callback_match;
     const char *io_uring_callback_name;
     const struct async_hop_config *async_hops;
     size_t async_hop_count;

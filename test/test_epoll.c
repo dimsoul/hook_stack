@@ -23,6 +23,10 @@
 
 static volatile sig_atomic_t stopping;
 
+struct test_resource {
+    int fd;
+};
+
 struct test_context {
     int epoll_fd;
     int event_fd;
@@ -34,6 +38,14 @@ struct test_context {
     int reused_fd;
     bool bad_oneshot;
     bool slow_callback;
+    bool data_ptr;
+    struct test_resource event_resource;
+    struct test_resource timer_resource;
+    struct test_resource signal_resource;
+    struct test_resource socket_resource;
+    struct test_resource bad_socket_resource;
+    struct test_resource oneshot_resource;
+    struct test_resource reused_resource;
     unsigned long long bad_et_ready;
     unsigned long long oneshot_ready;
 };
@@ -44,21 +56,33 @@ static void handle_signal(int signal_number)
     stopping = 1;
 }
 
-static int add_to_epoll(int epoll_fd, int fd, uint32_t events)
+static uint64_t epoll_test_data(
+    int fd, const struct test_resource *resource)
+{
+    if (resource)
+        return (uint64_t)(uintptr_t)resource;
+    return 0xe000000000000000ULL | (uint32_t)fd;
+}
+
+static int add_to_epoll(
+    int epoll_fd, int fd, uint32_t events,
+    const struct test_resource *resource)
 {
     struct epoll_event event = {
         .events = events,
-        .data.u64 = 0xe000000000000000ULL | (uint32_t)fd,
+        .data.u64 = epoll_test_data(fd, resource),
     };
 
     return epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event);
 }
 
-static int modify_epoll(int epoll_fd, int fd, uint32_t events)
+static int modify_epoll(
+    int epoll_fd, int fd, uint32_t events,
+    const struct test_resource *resource)
 {
     struct epoll_event event = {
         .events = events,
-        .data.u64 = 0xe000000000000000ULL | (uint32_t)fd,
+        .data.u64 = epoll_test_data(fd, resource),
     };
 
     return epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &event);
@@ -74,7 +98,8 @@ static int create_reused_registration(
         close(alias);
     if (old_fd < 0)
         return -1;
-    if (add_to_epoll(context->epoll_fd, old_fd, EPOLLIN)) {
+    if (add_to_epoll(
+            context->epoll_fd, old_fd, EPOLLIN, NULL)) {
         close(old_fd);
         return -1;
     }
@@ -83,7 +108,11 @@ static int create_reused_registration(
     *reused_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (*reused_fd < 0)
         return -1;
-    if (add_to_epoll(context->epoll_fd, *reused_fd, EPOLLIN)) {
+    context->reused_resource.fd = *reused_fd;
+    if (add_to_epoll(
+            context->epoll_fd, *reused_fd, EPOLLIN,
+            context->data_ptr ?
+                &context->reused_resource : NULL)) {
         close(*reused_fd);
         *reused_fd = -1;
         return -1;
@@ -165,17 +194,15 @@ static void consume_oneshot(struct test_context *context)
     if (!context->bad_oneshot &&
         modify_epoll(
             context->epoll_fd, context->oneshot_fd,
-            EPOLLIN | EPOLLRDHUP | EPOLLONESHOT))
+            EPOLLIN | EPOLLRDHUP | EPOLLONESHOT,
+            context->data_ptr ?
+                &context->oneshot_resource : NULL))
         fprintf(stderr, "ONESHOT rearm failed: %s\n", strerror(errno));
 }
 
-__attribute__((noinline))
-void epoll_test_callback(
-    int fd, struct test_context *context,
-    const struct epoll_event *event)
+static void consume_ready_fd(
+    int fd, struct test_context *context)
 {
-    (void)event;
-
     if (fd == context->event_fd || fd == context->timer_fd ||
         fd == context->reused_fd)
         consume_counter(fd);
@@ -196,6 +223,39 @@ void epoll_test_callback(
     }
 }
 
+__attribute__((noinline))
+void epoll_test_callback(
+    int fd, struct test_context *context,
+    const struct epoll_event *event)
+{
+    (void)event;
+    consume_ready_fd(fd, context);
+}
+
+__attribute__((noinline))
+void epoll_test_data_callback(
+    const struct test_resource *resource,
+    struct test_context *context,
+    const struct epoll_event *event)
+{
+    (void)event;
+    if (resource)
+        consume_ready_fd(resource->fd, context);
+}
+
+static void dispatch_ready_event(
+    struct test_context *context,
+    const struct epoll_event *event)
+{
+    if (context->data_ptr)
+        epoll_test_data_callback(
+            event->data.ptr, context, event);
+    else
+        epoll_test_callback(
+            (int)(uint32_t)event->data.u64,
+            context, event);
+}
+
 static void *second_waiter(void *argument)
 {
     struct test_context *context = argument;
@@ -210,11 +270,8 @@ static void *second_waiter(void *argument)
                 continue;
             break;
         }
-        for (index = 0; index < ready; index++) {
-            int fd = (int)(uint32_t)events[index].data.u64;
-
-            epoll_test_callback(fd, context, &events[index]);
-        }
+        for (index = 0; index < ready; index++)
+            dispatch_ready_event(context, &events[index]);
     }
     return NULL;
 }
@@ -251,6 +308,7 @@ int main(int argc, char **argv)
     bool demonstrate_multi_waiter = false;
     bool demonstrate_fd_reuse = false;
     bool demonstrate_slow_callback = false;
+    bool demonstrate_data_ptr = false;
     struct itimerspec timer = {
         .it_interval = {
             .tv_nsec = 150000000,
@@ -298,11 +356,16 @@ int main(int argc, char **argv)
                 demonstrate_slow_callback = true;
                 continue;
             }
+            if (!strcmp(argv[argument], "--data-ptr")) {
+                demonstrate_data_ptr = true;
+                continue;
+            }
             if (iteration_limit) {
                 fprintf(stderr,
                         "usage: %s [ITERATIONS] [--bad-et] "
                         "[--bad-oneshot] [--multi-waiter] "
-                        "[--fd-reuse] [--slow-callback]\n",
+                        "[--fd-reuse] [--slow-callback] "
+                        "[--data-ptr]\n",
                         argv[0]);
                 return 2;
             }
@@ -331,6 +394,8 @@ int main(int argc, char **argv)
         printf("; two waiters enabled");
     if (demonstrate_slow_callback)
         printf("; intentionally blocked callback enabled");
+    if (demonstrate_data_ptr)
+        printf("; event.data.ptr callback enabled");
     putchar('\n');
     fflush(stdout);
     sleep(2);
@@ -355,21 +420,7 @@ int main(int argc, char **argv)
                    SOCK_CLOEXEC, 0, oneshot_sockets) ||
         (demonstrate_bad_et &&
          socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK |
-                    SOCK_CLOEXEC, 0, bad_sockets)) ||
-        timerfd_settime(timer_fd, 0, &timer, NULL) ||
-        add_to_epoll(epoll_fd, event_fd, EPOLLIN) ||
-        add_to_epoll(epoll_fd, timer_fd, EPOLLIN) ||
-        add_to_epoll(epoll_fd, signal_fd, EPOLLIN) ||
-        add_to_epoll(
-            epoll_fd, sockets[0],
-            EPOLLIN | EPOLLRDHUP | EPOLLET) ||
-        add_to_epoll(
-            epoll_fd, oneshot_sockets[0],
-            EPOLLIN | EPOLLRDHUP | EPOLLONESHOT) ||
-        (demonstrate_bad_et &&
-         add_to_epoll(
-             epoll_fd, bad_sockets[0],
-             EPOLLIN | EPOLLRDHUP | EPOLLET))) {
+                    SOCK_CLOEXEC, 0, bad_sockets))) {
         fprintf(stderr, "epoll test setup failed: %s\n", strerror(errno));
         goto failure;
     }
@@ -384,7 +435,47 @@ int main(int argc, char **argv)
         .reused_fd = -1,
         .bad_oneshot = demonstrate_bad_oneshot,
         .slow_callback = demonstrate_slow_callback,
+        .data_ptr = demonstrate_data_ptr,
+        .event_resource = {.fd = event_fd},
+        .timer_resource = {.fd = timer_fd},
+        .signal_resource = {.fd = signal_fd},
+        .socket_resource = {.fd = sockets[0]},
+        .bad_socket_resource = {.fd = bad_sockets[0]},
+        .oneshot_resource = {.fd = oneshot_sockets[0]},
+        .reused_resource = {.fd = -1},
     };
+    if (timerfd_settime(timer_fd, 0, &timer, NULL) ||
+        add_to_epoll(
+            epoll_fd, event_fd, EPOLLIN,
+            demonstrate_data_ptr ?
+                &context.event_resource : NULL) ||
+        add_to_epoll(
+            epoll_fd, timer_fd, EPOLLIN,
+            demonstrate_data_ptr ?
+                &context.timer_resource : NULL) ||
+        add_to_epoll(
+            epoll_fd, signal_fd, EPOLLIN,
+            demonstrate_data_ptr ?
+                &context.signal_resource : NULL) ||
+        add_to_epoll(
+            epoll_fd, sockets[0],
+            EPOLLIN | EPOLLRDHUP | EPOLLET,
+            demonstrate_data_ptr ?
+                &context.socket_resource : NULL) ||
+        add_to_epoll(
+            epoll_fd, oneshot_sockets[0],
+            EPOLLIN | EPOLLRDHUP | EPOLLONESHOT,
+            demonstrate_data_ptr ?
+                &context.oneshot_resource : NULL) ||
+        (demonstrate_bad_et &&
+         add_to_epoll(
+             epoll_fd, bad_sockets[0],
+             EPOLLIN | EPOLLRDHUP | EPOLLET,
+             demonstrate_data_ptr ?
+                 &context.bad_socket_resource : NULL))) {
+        fprintf(stderr, "epoll test setup failed: %s\n", strerror(errno));
+        goto failure;
+    }
     printf("epoll resources: epfd=%d eventfd=%d timerfd=%d "
            "signalfd=%d socket=%d oneshot=%d bad-et=%d reused=%d\n",
            epoll_fd, event_fd, timer_fd, signal_fd, sockets[0],
@@ -436,7 +527,9 @@ int main(int argc, char **argv)
             if (demonstrate_bad_oneshot) {
                 if (modify_epoll(
                         epoll_fd, oneshot_sockets[0],
-                        EPOLLIN | EPOLLRDHUP | EPOLLONESHOT)) {
+                        EPOLLIN | EPOLLRDHUP | EPOLLONESHOT,
+                        demonstrate_data_ptr ?
+                            &context.oneshot_resource : NULL)) {
                     fprintf(stderr,
                             "bad ONESHOT rearm setup failed: %s\n",
                             strerror(errno));
@@ -483,11 +576,8 @@ int main(int argc, char **argv)
             fprintf(stderr, "epoll_wait failed: %s\n", strerror(errno));
             goto failure;
         }
-        for (index = 0; index < ready; index++) {
-            int fd = (int)(uint32_t)events[index].data.u64;
-
-            epoll_test_callback(fd, &context, &events[index]);
-        }
+        for (index = 0; index < ready; index++)
+            dispatch_ready_event(&context, &events[index]);
         iteration++;
         usleep(50000);
     }

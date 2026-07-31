@@ -28,6 +28,18 @@ const char *cw_epoll_wait_kind_name(uint32_t kind)
     }
 }
 
+const char *cw_epoll_callback_match_name(uint32_t match)
+{
+    switch (match) {
+    case CW_EPOLL_CALLBACK_MATCH_FD:
+        return "fd";
+    case CW_EPOLL_CALLBACK_MATCH_DATA:
+        return "data";
+    default:
+        return "unknown";
+    }
+}
+
 const char *cw_epoll_io_operation_name(uint32_t operation)
 {
     switch (operation) {
@@ -731,6 +743,9 @@ static int write_callback_json(
                 event->blocked_ns - event->runqueue_ns : 0;
     char ready_flags[128];
     char resource[PATH_MAX];
+    uint64_t callback_key =
+        event->match_kind == CW_EPOLL_CALLBACK_MATCH_FD ?
+            (uint32_t)event->fd : event->data;
 
     if (!stream)
         return 0;
@@ -747,6 +762,8 @@ static int write_callback_json(
             "\"epoll_fd\":%d,\"fd\":%d,"
             "\"epoll_generation\":%u,\"fd_generation\":%u,"
             "\"data\":\"0x%016llx\",\"ready_events\":%u,"
+            "\"match\":\"%s\","
+            "\"callback_key\":\"0x%016llx\","
             "\"ready_flags\":",
             (unsigned long long)realtime_ns,
             event->pid, event->tid,
@@ -754,7 +771,9 @@ static int write_callback_json(
             event->epoll_fd, event->fd,
             event->epoll_generation, event->fd_generation,
             (unsigned long long)event->data,
-            event->ready_events) < 0 ||
+            event->ready_events,
+            cw_epoll_callback_match_name(event->match_kind),
+            (unsigned long long)callback_key) < 0 ||
         cw_epoll_write_json_string(
             stream, ready_flags, strlen(ready_flags)) ||
         fputs(",\"callback\":", stream) == EOF ||
@@ -801,20 +820,33 @@ static void print_callback_event(
                 event->blocked_ns - event->runqueue_ns : 0;
     char ready_flags[128];
     char resource[PATH_MAX];
+    char callback_key[48];
 
     cw_epoll_format_events(
         event->ready_events, ready_flags, sizeof(ready_flags));
     cw_fd_resolve(
         &output->fd_resources, output->target_pid,
         event->fd, resource, sizeof(resource));
+    if (event->match_kind == CW_EPOLL_CALLBACK_MATCH_FD)
+        snprintf(
+            callback_key, sizeof(callback_key),
+            "%d -> fd=%d", event->fd, event->fd);
+    else
+        snprintf(
+            callback_key, sizeof(callback_key),
+            "0x%016llx -> fd=%d",
+            (unsigned long long)event->data, event->fd);
     print_event_time(event->start_ns);
     printf(
         "EPOLL CALLBACK %s PID %u/TID %u (%.*s) "
-        "epfd=%d fd=%d events=%s\n",
+        "epfd=%d match=%s key=%s events=%s\n",
         output->epoll_callback_name,
         event->pid, event->tid,
         (int)sizeof(event->comm), event->comm,
-        event->epoll_fd, event->fd, ready_flags);
+        event->epoll_fd,
+        cw_epoll_callback_match_name(event->match_kind),
+        callback_key,
+        ready_flags);
     if (resource[0])
         printf("  resource: %s\n", resource);
     print_wake_source(&event->wake);

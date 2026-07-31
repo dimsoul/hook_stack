@@ -778,8 +778,13 @@ static void print_callback_table(
     if (!output->epoll_callback_name)
         return;
     fprintf(
-        stream, "\n[10] Callback execution: %s\n",
-        output->epoll_callback_name);
+        stream,
+        "\n[10] Callback execution: %s "
+        "(match=%s key-arg%u)\n",
+        output->epoll_callback_name,
+        cw_epoll_callback_match_name(
+            output->epoll_callback_match),
+        output->epoll_callback_key_arg);
     callbacks = calloc(count ? count : 1, sizeof(*callbacks));
     if (!callbacks) {
         fprintf(stream, "  Cannot allocate callback summary rows.\n");
@@ -793,8 +798,9 @@ static void print_callback_table(
     if (!callback_count) {
         fprintf(
             stream,
-            "  No callback invocation matched a ready FD. "
-            "Verify --epoll-callback-fd-arg.\n");
+            "  No callback invocation matched a ready event. "
+            "Verify --epoll-callback-key-arg and "
+            "--epoll-callback-match.\n");
         free(callbacks);
         return;
     }
@@ -803,16 +809,16 @@ static void print_callback_table(
         compare_callback_rows);
     fprintf(
         stream,
-        "  %-6s %-5s %-5s %8s %12s %12s %12s %12s "
+        "  %-6s %-26s %-5s %8s %12s %12s %12s %12s "
         "%12s %12s %12s\n",
-        "EPFD", "FD", "GEN", "CALLS", "AVG R->CB",
+        "EPFD", "CALLBACK KEY -> FD", "GEN", "CALLS", "AVG R->CB",
         "MAX R->CB", "AVG WORK", "MAX WORK",
         "AVG ONCPU", "AVG BLOCK", "AVG RUNQ");
     fprintf(
         stream,
-        "  %-6s %-5s %-5s %8s %12s %12s %12s %12s "
+        "  %-6s %-26s %-5s %8s %12s %12s %12s %12s "
         "%12s %12s %12s\n",
-        "------", "-----", "-----", "--------",
+        "------", "--------------------------", "-----", "--------",
         "------------", "------------", "------------",
         "------------", "------------", "------------",
         "------------");
@@ -832,6 +838,7 @@ static void print_callback_table(
         char average_oncpu[32];
         char average_blocked[32];
         char average_runqueue[32];
+        char callback_key[32];
 
         format_interval(
             average_delay, sizeof(average_delay),
@@ -860,12 +867,25 @@ static void print_callback_table(
             average_runqueue, sizeof(average_runqueue),
             completed ?
                 stats->callback_runqueue_ns / completed : 0);
+        if (output->epoll_callback_match ==
+                CW_EPOLL_CALLBACK_MATCH_FD)
+            snprintf(
+                callback_key, sizeof(callback_key),
+                "%d -> %d",
+                callbacks[index].key.fd,
+                callbacks[index].key.fd);
+        else
+            snprintf(
+                callback_key, sizeof(callback_key),
+                "0x%016llx -> %d",
+                (unsigned long long)stats->data,
+                callbacks[index].key.fd);
         fprintf(
             stream,
-            "  %-6d %-5d %-5u %8llu %12s %12s %12s %12s "
+            "  %-6d %-26s %-5u %8llu %12s %12s %12s %12s "
             "%12s %12s %12s\n",
             callbacks[index].key.epoll_fd,
-            callbacks[index].key.fd,
+            callback_key,
             callbacks[index].key.fd_generation,
             (unsigned long long)completed,
             average_delay, maximum_delay,
@@ -1006,6 +1026,7 @@ bool cw_epoll_print_summary(struct output_options *output)
             "  Wake attributed     : %llu\n"
             "    eventfd/timerfd/signalfd: %llu / %llu / %llu\n"
             "  Callback match/done : %llu / %llu\n"
+            "    matched by fd/data: %llu / %llu\n"
             "    unmatched/overflow: %llu / %llu\n"
             "  Callback records    : %llu\n"
             "  Callback dropped    : %llu\n"
@@ -1049,6 +1070,8 @@ bool cw_epoll_print_summary(struct output_options *output)
             (unsigned long long)counters.signalfd_ready,
             (unsigned long long)counters.callback_matched,
             (unsigned long long)counters.callback_completed,
+            (unsigned long long)counters.callback_fd_matched,
+            (unsigned long long)counters.callback_data_matched,
             (unsigned long long)counters.callback_unmatched,
             (unsigned long long)counters.callback_overflow,
             (unsigned long long)counters.callback_emitted,
@@ -1209,6 +1232,8 @@ int cw_epoll_write_summary_json(struct output_options *output)
             "\"eventfd_ready\":%llu,\"timerfd_ready\":%llu,"
             "\"signalfd_ready\":%llu,"
             "\"callback_matched\":%llu,"
+            "\"callback_fd_matched\":%llu,"
+            "\"callback_data_matched\":%llu,"
             "\"callback_unmatched\":%llu,"
             "\"callback_completed\":%llu,"
             "\"callback_overflow\":%llu,"
@@ -1248,6 +1273,8 @@ int cw_epoll_write_summary_json(struct output_options *output)
             (unsigned long long)counters.timerfd_ready,
             (unsigned long long)counters.signalfd_ready,
             (unsigned long long)counters.callback_matched,
+            (unsigned long long)counters.callback_fd_matched,
+            (unsigned long long)counters.callback_data_matched,
             (unsigned long long)counters.callback_unmatched,
             (unsigned long long)counters.callback_completed,
             (unsigned long long)counters.callback_overflow,
