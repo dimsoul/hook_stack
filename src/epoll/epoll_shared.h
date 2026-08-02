@@ -11,6 +11,7 @@ enum cw_epoll_callback_match {
     CW_EPOLL_CALLBACK_MATCH_FD = 1,
     CW_EPOLL_CALLBACK_MATCH_DATA,
     CW_EPOLL_CALLBACK_MATCH_LIBUV,
+    CW_EPOLL_CALLBACK_MATCH_LIBEVENT,
 };
 
 enum cw_epoll_io_operation {
@@ -163,6 +164,7 @@ struct cw_epoll_counters {
     __u64 callback_fd_matched;
     __u64 callback_data_matched;
     __u64 callback_libuv_matched;
+    __u64 callback_libevent_matched;
     __u64 callback_unmatched;
     __u64 callback_completed;
     __u64 callback_overflow;

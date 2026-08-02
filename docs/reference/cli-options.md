@@ -20,13 +20,15 @@ The executable is the authoritative source for the complete option list:
 ./callweave -p PID --io-uring
 ./callweave -p PID --epoll
 ./callweave -p PID --libuv
+./callweave -p PID --libevent
 ./callweave --epoll --exec PROGRAM -- [ARGS...]
 ./callweave --libuv --exec PROGRAM -- [ARGS...]
+./callweave --libevent --exec PROGRAM -- [ARGS...]
 ```
 
 ## Output detail modes
 
-The epoll and libuv modes default to the final aggregate summary.
+The epoll, libuv, and libevent modes default to the final aggregate summary.
 
 | Option | Behavior |
 | --- | --- |
@@ -62,8 +64,10 @@ See [asynchronous call chains](../features/async-call-chain.md) and [queue diagn
 - `--io-uring`: SQE-to-CQE lifecycle, ring health, errors, and io-wq behavior.
 - `--epoll`: wait batches, ready-to-I/O dispatch, FD lifetime, wake sources, and event-loop health.
 - `--libuv`: epoll diagnostics plus automatic native `uv_poll_t` callback discovery.
+- `--libevent`: epoll diagnostics plus automatic libevent event/FD/callback discovery.
+- `--libuv-binary PATH`, `--libevent-binary PATH`: override runtime-library auto-detection for unusual loader layouts or later `dlopen`.
 
-See [io_uring](../features/io-uring.md), [epoll](../features/epoll.md), and [libuv](../runtimes/libuv.md).
+See [io_uring](../features/io-uring.md), [epoll](../features/epoll.md), [libuv](../runtimes/libuv.md), and [libevent](../runtimes/libevent.md).
 
 ## Capture and export controls
 

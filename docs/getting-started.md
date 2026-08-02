@@ -20,14 +20,15 @@ For Debian or Ubuntu, the dependencies are typically installed with:
 sudo apt install make clang llvm bpftool binutils libbpf-dev libelf-dev zlib1g-dev
 ```
 
-Neither epoll nor libuv is a Callweave runtime dependency. epoll is a Linux
-kernel API, while the libuv adapter observes the copy already used by the
-target process and does not link Callweave with `-luv`. Only the optional
-libuv example requires the development package:
+Neither epoll nor the libuv/libevent libraries are Callweave runtime
+dependencies. epoll is a Linux kernel API, while runtime adapters observe the
+copy already used by the target process. Only the optional examples require
+the development packages:
 
 ```sh
-sudo apt install libuv1-dev
+sudo apt install libuv1-dev libevent-dev
 make test-libuv
+make test-libevent
 ```
 
 ## Build
@@ -71,6 +72,10 @@ do not require editing a single monolithic loader:
   event-loop/resource aggregation, rendering, and BPF programs.
 - `src/libuv/`: native `uv_poll_t` API observation, handle-to-FD state, and
   dynamic attachment to callbacks discovered at runtime.
+- `src/libevent/`: public libevent API observation, event lifecycle and
+  event-to-FD state, and dynamic callback discovery.
+- `src/runtime/`: callback-address resolution and dynamic uprobe attachment
+  shared by runtime adapters.
 - `src/report.c`: async JSON Lines and self-contained HTML reports.
 - `src/callweave.bpf.c`: common eBPF probes and async tracing.
 - `src/async/async_events.h` and `src/io_uring/io_uring_shared.h`:

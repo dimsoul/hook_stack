@@ -52,6 +52,8 @@ const char *cw_epoll_callback_match_name(uint32_t match)
         return "data";
     case CW_EPOLL_CALLBACK_MATCH_LIBUV:
         return "libuv-handle";
+    case CW_EPOLL_CALLBACK_MATCH_LIBEVENT:
+        return "libevent-object-or-fd";
     default:
         return "unknown";
     }
@@ -924,6 +926,13 @@ static void print_callback_event(
         snprintf(
             callback_key, sizeof(callback_key),
             "handle=0x%llx -> fd=%d",
+            (unsigned long long)event->callback_key,
+            event->fd);
+    else if (event->match_kind ==
+             CW_EPOLL_CALLBACK_MATCH_LIBEVENT)
+        snprintf(
+            callback_key, sizeof(callback_key),
+            "object/fd=0x%llx -> fd=%d",
             (unsigned long long)event->callback_key,
             event->fd);
     else

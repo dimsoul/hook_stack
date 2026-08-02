@@ -219,7 +219,7 @@ static int seed_registration(
     return 1;
 }
 
-static bool force_seed_libuv_registration(
+static bool force_seed_runtime_registration(
     struct output_options *output, uint32_t pid,
     int epoll_fd, int fd, uint32_t events, uint64_t data)
 {
@@ -289,7 +289,7 @@ static bool force_seed_libuv_registration(
     return true;
 }
 
-bool cw_epoll_seed_libuv_fd(
+bool cw_epoll_seed_runtime_fd(
     struct output_options *output, uint32_t pid, int fd)
 {
     char directory_path[64];
@@ -353,7 +353,7 @@ bool cw_epoll_seed_libuv_fd(
                     &target_fd, &raw_events, &data) != 3 ||
                 target_fd != fd)
                 continue;
-            seeded = force_seed_libuv_registration(
+            seeded = force_seed_runtime_registration(
                 output, pid, (int)epoll_fd, fd,
                 (uint32_t)raw_events, (uint64_t)data);
             break;

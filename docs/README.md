@@ -22,8 +22,9 @@
 ## Runtime adapters
 
 - [libuv](runtimes/libuv.md): automatic `uv_poll_t` handle, FD, and callback correlation.
+- [libevent](runtimes/libevent.md): automatic event lifecycle, I/O FD, and callback correlation.
 
-Runtime-specific behavior belongs under `docs/runtimes/`. A future adapter such as libevent or Boost.Asio should add one document here instead of extending the project README.
+Runtime-specific behavior belongs under `docs/runtimes/`. A future adapter such as Boost.Asio should add one document here instead of extending the project README.
 
 ## Output and interpretation
 

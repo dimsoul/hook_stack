@@ -44,6 +44,7 @@
 #include "config.h"
 #include "epoll/epoll.h"
 #include "io_uring/io_uring.h"
+#include "libevent/libevent.h"
 #include "libuv/libuv.h"
 #include "report.h"
 #include "symbols.h"
@@ -311,6 +312,8 @@ static void usage(FILE *stream, const char *program)
             "  %s --epoll --exec PROGRAM -- [ARGS...]\n"
             "  %s -p PID --libuv\n"
             "  %s --libuv --exec PROGRAM -- [ARGS...]\n"
+            "  %s -p PID --libevent\n"
+            "  %s --libevent --exec PROGRAM -- [ARGS...]\n"
             "  %s --check-config PATH\n"
             "\n"
             "Options:\n"
@@ -369,13 +372,18 @@ static void usage(FILE *stream, const char *program)
             "resources\n"
             "      --libuv               automatically correlate uv_poll_t "
             "handles and callbacks\n"
-            "      --summary-only        print final epoll/libuv summary "
+            "      --libevent            automatically correlate libevent "
+            "I/O callbacks\n"
+            "      --summary-only        print final epoll/runtime summary "
             "only (default)\n"
-            "      --live                print slow or anomalous epoll/libuv "
+            "      --live                print slow or anomalous epoll/runtime "
             "events\n"
-            "      --verbose             print every epoll/libuv detail "
+            "      --verbose             print every epoll/runtime detail "
             "event\n"
             "      --libuv-binary PATH   ELF containing libuv public APIs "
+            "(normally auto-detected)\n"
+            "      --libevent-binary PATH\n"
+            "                             ELF containing libevent public APIs "
             "(normally auto-detected)\n"
             "      --epoll-callback FUNC correlate ready event to callback "
             "execution\n"
@@ -407,9 +415,9 @@ static void usage(FILE *stream, const char *program)
             "\n"
             "When -p is used without --binary or --module, /proc/PID/exe is used.\n"
             "Without -p, an explicit BINARY is required except for "
-            "--epoll/--libuv --exec.\n",
+            "--epoll/--libuv/--libevent --exec.\n",
             program, program, program, program, program, program, program,
-            program, program, program, program, program);
+            program, program, program, program, program, program, program);
 }
 
 static int parse_pid(const char *text, pid_t *pid)
@@ -773,6 +781,8 @@ enum long_option_id {
     OPT_IO_CALLBACK_ARG,
     OPT_LIBUV,
     OPT_LIBUV_BINARY,
+    OPT_LIBEVENT,
+    OPT_LIBEVENT_BINARY,
     OPT_EPOLL,
     OPT_SUMMARY_ONLY,
     OPT_LIVE,
@@ -837,6 +847,9 @@ int main(int argc, char **argv)
         {"libuv", no_argument, NULL, OPT_LIBUV},
         {"libuv-binary", required_argument, NULL,
          OPT_LIBUV_BINARY},
+        {"libevent", no_argument, NULL, OPT_LIBEVENT},
+        {"libevent-binary", required_argument, NULL,
+         OPT_LIBEVENT_BINARY},
         {"epoll", no_argument, NULL, OPT_EPOLL},
         {"summary-only", no_argument, NULL, OPT_SUMMARY_ONLY},
         {"live", no_argument, NULL, OPT_LIVE},
@@ -894,6 +907,7 @@ int main(int argc, char **argv)
         .epoll_instance_stats_map_fd = -1,
         .epoll_fd_metadata_map_fd = -1,
         .libuv_counters_map_fd = -1,
+        .libevent_counters_map_fd = -1,
         .target_pidfd = -1,
         .diagnostic_interval_ms = 1000,
         .epoll_top = 5,
@@ -903,11 +917,13 @@ int main(int argc, char **argv)
     struct async_hop_config async_hops[MAX_ASYNC_HOPS] = {0};
     struct bpf_link *async_links[MAX_ASYNC_HOPS * 3] = {0};
     struct cw_libuv_runtime libuv_runtime = {0};
+    struct cw_libevent_runtime libevent_runtime = {0};
     char target_path[PATH_MAX] = {0};
     char async_source_path[PATH_MAX] = {0};
     char io_callback_path[PATH_MAX] = {0};
     char epoll_callback_path[PATH_MAX] = {0};
     char libuv_path[PATH_MAX] = {0};
+    char libevent_path[PATH_MAX] = {0};
     const char *binary_argument = NULL;
     const char *module_name = NULL;
     const char *find_symbol_name = NULL;
@@ -924,6 +940,7 @@ int main(int argc, char **argv)
     const char *epoll_callback_name = NULL;
     const char *epoll_callback_binary = NULL;
     const char *libuv_binary = NULL;
+    const char *libevent_binary = NULL;
     const char *exec_path = NULL;
     char *configured_function = NULL;
     size_t function_offset = 0;
@@ -949,6 +966,7 @@ int main(int argc, char **argv)
     bool epoll_callback_selector_seen = false;
     bool epoll_callback_match_seen = false;
     bool libuv_option_seen = false;
+    bool libevent_option_seen = false;
     bool epoll_top_option_seen = false;
     bool epoll_output_option_seen = false;
     bool epoll_threshold_option_seen = false;
@@ -1220,6 +1238,14 @@ int main(int argc, char **argv)
         case OPT_LIBUV_BINARY:
             libuv_binary = optarg;
             libuv_option_seen = true;
+            break;
+        case OPT_LIBEVENT:
+            output.libevent_mode = true;
+            output.epoll_mode = true;
+            break;
+        case OPT_LIBEVENT_BINARY:
+            libevent_binary = optarg;
+            libevent_option_seen = true;
             break;
         case OPT_EPOLL:
             output.epoll_mode = true;
@@ -1517,7 +1543,7 @@ int main(int argc, char **argv)
         if (!output.epoll_mode) {
             fprintf(stderr,
                     "--exec is currently supported with standalone "
-                    "--epoll or --libuv mode\n");
+                    "--epoll, --libuv, or --libevent mode\n");
             error = 2;
             goto cleanup;
         }
@@ -1549,7 +1575,7 @@ int main(int argc, char **argv)
          epoll_callback_option_seen)) {
         fprintf(stderr,
                 "epoll output, filters, and callback options require "
-                "--epoll or --libuv\n");
+                "--epoll, --libuv, or --libevent\n");
         error = 2;
         goto cleanup;
     }
@@ -1558,10 +1584,22 @@ int main(int argc, char **argv)
         error = 2;
         goto cleanup;
     }
-    if (output.libuv_mode && epoll_callback_selector_seen) {
+    if (libevent_option_seen && !output.libevent_mode) {
+        fprintf(stderr, "--libevent-binary requires --libevent\n");
+        error = 2;
+        goto cleanup;
+    }
+    if (output.libuv_mode && output.libevent_mode) {
+        fprintf(stderr, "--libuv and --libevent are mutually exclusive\n");
+        error = 2;
+        goto cleanup;
+    }
+    if ((output.libuv_mode || output.libevent_mode) &&
+        epoll_callback_selector_seen) {
         fprintf(
             stderr,
-            "--libuv automatically discovers callbacks and cannot be "
+            "runtime adapters automatically discover callbacks and "
+            "cannot be "
             "combined with --epoll-callback options\n");
         error = 2;
         goto cleanup;
@@ -1638,17 +1676,18 @@ int main(int argc, char **argv)
             output.io_uring_min_latency_ns ||
             output.io_uring_errors_only || output.io_uring_top) {
             fprintf(stderr,
-                    "--epoll/--libuv is a standalone mode; combine it "
+                    "--epoll/--libuv/--libevent is a standalone mode; "
+                    "combine it "
                     "only with "
                     "--summary-only, --live, --verbose, "
                     "--pid or --exec, --min-epoll-wait-us, "
                     "--min-epoll-dispatch-us, --epoll-top, "
-                    "--epoll-callback or libuv options, "
+                    "--epoll-callback or runtime-adapter options, "
                     "--duration, --max-events, --format, and --output\n");
             error = 2;
             goto cleanup;
         }
-        if (!output.libuv_mode &&
+        if (!output.libuv_mode && !output.libevent_mode &&
             epoll_callback_option_seen &&
             (!epoll_callback_name || !epoll_callback_name[0])) {
             fprintf(
@@ -1786,6 +1825,60 @@ int main(int argc, char **argv)
             epoll_callback_key_arg = 1;
             epoll_callback_match =
                 CW_EPOLL_CALLBACK_MATCH_LIBUV;
+        }
+        if (output.libevent_mode) {
+            if (libevent_binary) {
+                if (!realpath(libevent_binary, libevent_path)) {
+                    fprintf(
+                        stderr,
+                        "cannot resolve libevent binary %s: %s\n",
+                        libevent_binary, strerror(errno));
+                    error = 1;
+                    goto cleanup;
+                }
+            } else if (exec_path) {
+                char executable[PATH_MAX];
+
+                if (!realpath(exec_path, executable)) {
+                    fprintf(
+                        stderr,
+                        "cannot resolve libevent target %s: %s\n",
+                        exec_path, strerror(errno));
+                    error = 1;
+                    goto cleanup;
+                }
+                error = resolve_linked_symbol_module(
+                    executable, "event_add",
+                    libevent_path, sizeof(libevent_path));
+                if (error) {
+                    fprintf(
+                        stderr,
+                        "cannot auto-detect libevent used by %s: %s; "
+                        "use --libevent-binary PATH\n",
+                        executable, strerror(-error));
+                    goto cleanup;
+                }
+            } else {
+                error = resolve_process_symbol_module(
+                    target_pid, "event_add",
+                    libevent_path, sizeof(libevent_path));
+                if (error) {
+                    fprintf(
+                        stderr,
+                        "cannot find a mapped ELF defining event_add "
+                        "in PID %d: %s; use --libevent-binary PATH "
+                        "when libevent will be loaded later\n",
+                        (int)target_pid, strerror(-error));
+                    goto cleanup;
+                }
+            }
+            output.epoll_callback_name = "libevent:auto";
+            output.epoll_callback_key_arg = 1;
+            output.epoll_callback_match =
+                CW_EPOLL_CALLBACK_MATCH_LIBEVENT;
+            epoll_callback_key_arg = 1;
+            epoll_callback_match =
+                CW_EPOLL_CALLBACK_MATCH_LIBEVENT;
         }
         goto trace_target_ready;
     }
@@ -2221,6 +2314,93 @@ trace_target_ready:
             goto cleanup;
         }
     }
+    if (!output.libevent_mode) {
+        error = bpf_program__set_autoload(
+            skeleton->progs.trace_libevent_new_entry, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_libevent_new_return, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_libevent_assign_entry, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_libevent_assign_return, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_libevent_add_entry, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_libevent_add_return, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_libevent_del_entry, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_libevent_del_return, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_libevent_free_entry, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_libevent_bufferevent_socket_new_entry,
+                false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_libevent_bufferevent_socket_new_return,
+                false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_libevent_bufferevent_setcb_entry,
+                false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_libevent_bufferevent_setfd_entry,
+                false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_libevent_bufferevent_setfd_return,
+                false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_libevent_bufferevent_enable_entry,
+                false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_libevent_bufferevent_enable_return,
+                false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_libevent_bufferevent_disable_entry,
+                false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_libevent_bufferevent_disable_return,
+                false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_libevent_bufferevent_free_entry,
+                false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_libevent_listener_new_entry,
+                false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_libevent_listener_new_return,
+                false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_libevent_listener_free_entry,
+                false);
+        if (error) {
+            fprintf(
+                stderr,
+                "failed to disable libevent adapter programs: %s\n",
+                strerror(-error));
+            goto cleanup;
+        }
+    }
     if (output.io_uring_mode || output.epoll_mode) {
         error = bpf_program__set_autoload(
             skeleton->progs.trace_function, false);
@@ -2356,6 +2536,8 @@ trace_target_ready:
         bpf_map__fd(skeleton->maps.epoll_fd_metadata);
     output.libuv_counters_map_fd =
         bpf_map__fd(skeleton->maps.libuv_counters);
+    output.libevent_counters_map_fd =
+        bpf_map__fd(skeleton->maps.libevent_counters);
 
     if (output.io_uring_mode) {
         error = attach_raw_tracepoint(
@@ -2459,14 +2641,14 @@ trace_target_ready:
                 &skeleton->links.trace_epoll_process_exec,
                 "sched_process_exec");
         if (!error && output.epoll_callback_name &&
-            !output.libuv_mode)
+            !output.libuv_mode && !output.libevent_mode)
             error = attach_named_uprobe(
                 skeleton->progs.trace_epoll_callback_entry,
                 &skeleton->links.trace_epoll_callback_entry,
                 epoll_callback_path, output.epoll_callback_name,
                 0, false);
         if (!error && output.epoll_callback_name &&
-            !output.libuv_mode)
+            !output.libuv_mode && !output.libevent_mode)
             error = attach_named_uprobe(
                 skeleton->progs.trace_epoll_callback_return,
                 &skeleton->links.trace_epoll_callback_return,
@@ -2478,6 +2660,13 @@ trace_target_ready:
             error = cw_libuv_attach(
                 &libuv_runtime, skeleton,
                 target_pid, libuv_path);
+            if (error)
+                goto cleanup;
+        }
+        if (output.libevent_mode) {
+            error = cw_libevent_attach(
+                &libevent_runtime, skeleton,
+                target_pid, libevent_path);
             if (error)
                 goto cleanup;
         }
@@ -2664,6 +2853,22 @@ trace_target_ready:
                 goto cleanup;
             }
         }
+        if (output.libevent_mode) {
+            error = ring_buffer__add(
+                ring_buffer,
+                bpf_map__fd(
+                    skeleton->maps.libevent_registration_events),
+                cw_libevent_handle_registration,
+                &libevent_runtime);
+            if (error) {
+                fprintf(
+                    stderr,
+                    "failed to add libevent registration ring "
+                    "buffer: %s\n",
+                    strerror(-error));
+                goto cleanup;
+            }
+        }
         if (output.libuv_mode) {
             error = ring_buffer__add(
                 ring_buffer,
@@ -2719,6 +2924,8 @@ trace_target_ready:
             fprintf(stderr, "Tracing io_uring");
         else if (output.libuv_mode)
             fprintf(stderr, "Tracing libuv over epoll");
+        else if (output.libevent_mode)
+            fprintf(stderr, "Tracing libevent over epoll");
         else if (output.epoll_mode)
             fprintf(stderr, "Tracing epoll");
         else if (offset_text)
@@ -2758,6 +2965,10 @@ trace_target_ready:
             fprintf(
                 stderr, ", automatic uv_poll_t callback discovery "
                 "from %s", libuv_path);
+        else if (output.libevent_mode)
+            fprintf(
+                stderr, ", automatic libevent callback discovery "
+                "from %s", libevent_path);
         else if (output.epoll_callback_name)
             fprintf(
                 stderr, ", callback %s key-arg%u match=%s",
@@ -2789,6 +3000,8 @@ trace_target_ready:
             printf("Tracing io_uring");
         else if (output.libuv_mode)
             printf("Tracing libuv over epoll");
+        else if (output.libevent_mode)
+            printf("Tracing libevent over epoll");
         else if (output.epoll_mode)
             printf("Tracing epoll");
         else if (offset_text)
@@ -2837,6 +3050,10 @@ trace_target_ready:
             printf(
                 ", automatic uv_poll_t callback discovery from %s",
                 libuv_path);
+        else if (output.libevent_mode)
+            printf(
+                ", automatic libevent callback discovery from %s",
+                libevent_path);
         else if (output.epoll_callback_name)
             printf(
                 ", callback %s key-arg%u match=%s",
@@ -2932,6 +3149,9 @@ trace_target_ready:
             if (output.libuv_mode)
                 cw_libuv_refresh_epoll(
                     &libuv_runtime, &output);
+            if (output.libevent_mode)
+                cw_libevent_refresh_epoll(
+                    &libevent_runtime, &output);
             if (warmup_error < 0 &&
                 warmup_error != -EINTR)
                 break;
@@ -2965,6 +3185,9 @@ trace_target_ready:
         if (output.libuv_mode)
             cw_libuv_refresh_epoll(
                 &libuv_runtime, &output);
+        if (output.libevent_mode)
+            cw_libevent_refresh_epoll(
+                &libevent_runtime, &output);
         signal_error = cw_capture_drain_signals(&control);
         if (signal_error) {
             error = signal_error;
@@ -3052,12 +3275,21 @@ cleanup:
     if (finalize_outputs && output.epoll_mode &&
         output.epoll_counters_map_fd >= 0)
         cw_epoll_print_summary(&output);
-    if (finalize_outputs && output.libuv_mode)
+    if (finalize_outputs && output.libuv_mode &&
+        output.libuv_counters_map_fd >= 0)
         cw_libuv_print_summary(
             &libuv_runtime,
             output.libuv_counters_map_fd,
             output.epoll_counters_map_fd,
             output.libuv_fallback_tokens,
+            output.json_output ? stderr : stdout);
+    if (finalize_outputs && output.libevent_mode &&
+        output.libevent_counters_map_fd >= 0)
+        cw_libevent_print_summary(
+            &libevent_runtime,
+            output.libevent_counters_map_fd,
+            output.epoll_counters_map_fd,
+            output.libevent_fallback_tokens,
             output.json_output ? stderr : stdout);
     finalize_outputs = !cw_capture_cancelled(&control);
     if (output.report_stream) {
@@ -3087,11 +3319,21 @@ cleanup:
             if (cw_epoll_write_summary_json(&output) && !error)
                 error = -(errno ? errno : EIO);
             if (output.libuv_mode &&
+                output.libuv_counters_map_fd >= 0 &&
                 cw_libuv_write_summary_json(
                     &libuv_runtime,
                     output.libuv_counters_map_fd,
                     output.epoll_counters_map_fd,
                     output.libuv_fallback_tokens,
+                    output.json_stream) && !error)
+                error = -(errno ? errno : EIO);
+            if (output.libevent_mode &&
+                output.libevent_counters_map_fd >= 0 &&
+                cw_libevent_write_summary_json(
+                    &libevent_runtime,
+                    output.libevent_counters_map_fd,
+                    output.epoll_counters_map_fd,
+                    output.libevent_fallback_tokens,
                     output.json_stream) && !error)
                 error = -(errno ? errno : EIO);
         } else if (!output.io_uring_mode && finalize_outputs) {
@@ -3116,6 +3358,7 @@ cleanup:
     while (async_link_count)
         bpf_link__destroy(async_links[--async_link_count]);
     cw_libuv_destroy(&libuv_runtime);
+    cw_libevent_destroy(&libevent_runtime);
     if (ring_buffer)
         ring_buffer__free(ring_buffer);
     if (skeleton)

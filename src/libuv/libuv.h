@@ -12,17 +12,10 @@
 #include <bpf/libbpf.h>
 
 #include "libuv/libuv_shared.h"
+#include "runtime/runtime_adapter.h"
 
 struct callweave_bpf;
 struct output_options;
-
-struct cw_libuv_callback_attachment {
-    uint64_t address;
-    uint64_t file_offset;
-    char path[PATH_MAX];
-    struct bpf_link *entry;
-    struct bpf_link *return_link;
-};
 
 struct cw_libuv_poll_registration {
     uint64_t handle;
@@ -34,14 +27,9 @@ struct cw_libuv_poll_registration {
 struct cw_libuv_runtime {
     pid_t pid;
     char module_path[PATH_MAX];
-    struct bpf_program *callback_entry;
-    struct bpf_program *callback_return;
+    struct cw_runtime_callback_registry callback_registry;
     struct bpf_link *api_links[9];
     size_t api_link_count;
-    struct cw_libuv_callback_attachment *callbacks;
-    size_t callback_count;
-    size_t callback_capacity;
-    uint64_t callback_attach_failures;
     struct cw_libuv_poll_registration *registrations;
     size_t registration_count;
     size_t registration_capacity;

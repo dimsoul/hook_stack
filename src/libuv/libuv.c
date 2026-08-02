@@ -22,6 +22,7 @@
 #include "callweave.skel.h"
 #include "callweave_internal.h"
 #include "libuv/libuv.h"
+#include "runtime/runtime_adapter.h"
 #include "symbols.h"
 
 static int attach_named(
@@ -100,10 +101,11 @@ int cw_libuv_attach(struct cw_libuv_runtime *runtime,
             module_path) >=
         (int)sizeof(runtime->module_path))
         return -ENAMETOOLONG;
-    runtime->callback_entry =
-        skeleton->progs.trace_epoll_callback_entry;
-    runtime->callback_return =
-        skeleton->progs.trace_epoll_callback_return;
+    cw_runtime_callback_registry_init(
+        &runtime->callback_registry, pid, "libuv",
+        runtime->module_path, true,
+        skeleton->progs.trace_epoll_callback_entry,
+        skeleton->progs.trace_epoll_callback_return);
 
     error = attach_api(
         runtime,
@@ -143,114 +145,6 @@ int cw_libuv_attach(struct cw_libuv_runtime *runtime,
 
 failed:
     cw_libuv_destroy(runtime);
-    return error;
-}
-
-static struct cw_libuv_callback_attachment *
-find_callback(struct cw_libuv_runtime *runtime, uint64_t address)
-{
-    size_t index;
-
-    for (index = 0; index < runtime->callback_count; index++) {
-        if (runtime->callbacks[index].address == address)
-            return &runtime->callbacks[index];
-    }
-    return NULL;
-}
-
-static struct cw_libuv_callback_attachment *
-append_callback(struct cw_libuv_runtime *runtime)
-{
-    struct cw_libuv_callback_attachment *items;
-    size_t capacity;
-
-    if (runtime->callback_count == runtime->callback_capacity) {
-        capacity = runtime->callback_capacity ?
-                   runtime->callback_capacity * 2 : 8;
-        items = realloc(
-            runtime->callbacks,
-            capacity * sizeof(*runtime->callbacks));
-        if (!items)
-            return NULL;
-        runtime->callbacks = items;
-        runtime->callback_capacity = capacity;
-    }
-    return &runtime->callbacks[runtime->callback_count++];
-}
-
-static int attach_callback(
-    struct cw_libuv_runtime *runtime,
-    const struct cw_libuv_registration_event *event)
-{
-    struct cw_libuv_callback_attachment *attachment;
-    struct bpf_uprobe_opts entry_options = {
-        .sz = sizeof(entry_options),
-        .bpf_cookie = event->callback,
-    };
-    struct bpf_uprobe_opts return_options = {
-        .sz = sizeof(return_options),
-        .bpf_cookie = event->callback,
-        .retprobe = true,
-    };
-    int error;
-
-    if (find_callback(runtime, event->callback))
-        return 0;
-    attachment = append_callback(runtime);
-    if (!attachment)
-        return -ENOMEM;
-    memset(attachment, 0, sizeof(*attachment));
-    attachment->address = event->callback;
-    error = resolve_process_address(
-        runtime->pid, event->callback,
-        attachment->path, sizeof(attachment->path),
-        &attachment->file_offset);
-    if (error)
-        goto failed;
-    attachment->entry = bpf_program__attach_uprobe_opts(
-        runtime->callback_entry, runtime->pid,
-        attachment->path, attachment->file_offset,
-        &entry_options);
-    error = attachment->entry ?
-            libbpf_get_error(attachment->entry) :
-            (errno ? -errno : -EINVAL);
-    if (error) {
-        attachment->entry = NULL;
-        goto failed;
-    }
-    attachment->return_link =
-        bpf_program__attach_uprobe_opts(
-            runtime->callback_return, runtime->pid,
-            attachment->path, attachment->file_offset,
-            &return_options);
-    error = attachment->return_link ?
-            libbpf_get_error(attachment->return_link) :
-            (errno ? -errno : -EINVAL);
-    if (error) {
-        attachment->return_link = NULL;
-        bpf_link__destroy(attachment->entry);
-        attachment->entry = NULL;
-        goto failed;
-    }
-    fprintf(
-        stderr,
-        "libuv: discovered callback 0x%llx for handle "
-        "0x%llx/fd %d; attached %s+0x%llx\n",
-        (unsigned long long)event->callback,
-        (unsigned long long)event->handle,
-        event->fd, attachment->path,
-        (unsigned long long)attachment->file_offset);
-    return 0;
-
-failed:
-    runtime->callback_attach_failures++;
-    fprintf(
-        stderr,
-        "warning: cannot attach discovered libuv callback "
-        "0x%llx for handle 0x%llx/fd %d: %s\n",
-        (unsigned long long)event->callback,
-        (unsigned long long)event->handle,
-        event->fd, strerror(-error));
     return error;
 }
 
@@ -307,7 +201,9 @@ int cw_libuv_handle_registration(
      * every uv_poll_start() for the same address.
      */
     (void)remember_registration(runtime, event);
-    (void)attach_callback(runtime, event);
+    (void)cw_runtime_register_callback(
+        &runtime->callback_registry, event->callback,
+        event->handle, event->fd);
     return 0;
 }
 
@@ -325,7 +221,7 @@ void cw_libuv_refresh_epoll(
 
         if (registration->seeded || registration->fd < 0)
             continue;
-        if (!cw_epoll_seed_libuv_fd(
+        if (!cw_epoll_seed_runtime_fd(
                 output, (uint32_t)runtime->pid,
                 registration->fd))
             continue;
@@ -409,9 +305,10 @@ void cw_libuv_print_summary(
         (unsigned long long)counters.closed,
         (unsigned long long)counters.registrations_emitted,
         (unsigned long long)counters.registrations_dropped,
-        runtime->callback_count -
-            (size_t)runtime->callback_attach_failures,
-        (unsigned long long)runtime->callback_attach_failures);
+        cw_runtime_attached_callback_count(
+            &runtime->callback_registry),
+        (unsigned long long)
+            runtime->callback_registry.attach_failures);
     fprintf(
         stream,
         "\nlibuv attribution coverage\n"
@@ -517,10 +414,10 @@ int cw_libuv_write_summary_json(
             (unsigned long long)counters.closed,
             (unsigned long long)counters.registrations_emitted,
             (unsigned long long)counters.registrations_dropped,
-            runtime->callback_count -
-                (size_t)runtime->callback_attach_failures,
+            cw_runtime_attached_callback_count(
+                &runtime->callback_registry),
             (unsigned long long)
-                runtime->callback_attach_failures,
+                runtime->callback_registry.attach_failures,
             attribution_mode(&attribution),
             (unsigned long long)classified,
             (unsigned long long)attribution.evidence_exact,
@@ -537,21 +434,13 @@ int cw_libuv_write_summary_json(
 
 void cw_libuv_destroy(struct cw_libuv_runtime *runtime)
 {
-    size_t index;
-
     if (!runtime)
         return;
-    for (index = 0; index < runtime->callback_count; index++) {
-        bpf_link__destroy(runtime->callbacks[index].return_link);
-        bpf_link__destroy(runtime->callbacks[index].entry);
-    }
+    cw_runtime_callback_registry_destroy(
+        &runtime->callback_registry);
     while (runtime->api_link_count)
         bpf_link__destroy(
             runtime->api_links[--runtime->api_link_count]);
-    free(runtime->callbacks);
-    runtime->callbacks = NULL;
-    runtime->callback_count = 0;
-    runtime->callback_capacity = 0;
     free(runtime->registrations);
     runtime->registrations = NULL;
     runtime->registration_count = 0;

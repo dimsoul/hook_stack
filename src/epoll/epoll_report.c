@@ -782,6 +782,11 @@ static void print_callback_table(
             stream,
             "\n[10] libuv callback execution "
             "(automatic uv_poll_t handle matching)\n");
+    else if (output->libevent_mode)
+        fprintf(
+            stream,
+            "\n[10] libevent I/O callback execution "
+            "(automatic event-to-FD matching)\n");
     else
         fprintf(
             stream,
@@ -807,6 +812,13 @@ static void print_callback_table(
                 stream,
                 "  No discovered libuv callback invocation matched "
                 "an epoll-ready FD.\n");
+        else if (output->libevent_mode)
+            fprintf(
+                stream,
+                "  No discovered libevent I/O callback invocation "
+                "matched an epoll-ready FD. Timer and signal events "
+                "are reported by adapter health but do not identify "
+                "an application I/O FD.\n");
         else
             fprintf(
                 stream,
@@ -891,6 +903,13 @@ static void print_callback_table(
             snprintf(
                 callback_key, sizeof(callback_key),
                 "0x%016llx -> %d",
+                (unsigned long long)stats->callback_key,
+                callbacks[index].key.fd);
+        else if (output->epoll_callback_match ==
+                 CW_EPOLL_CALLBACK_MATCH_LIBEVENT)
+            snprintf(
+                callback_key, sizeof(callback_key),
+                "0x%llx -> %d",
                 (unsigned long long)stats->callback_key,
                 callbacks[index].key.fd);
         else
@@ -1006,7 +1025,8 @@ bool cw_epoll_print_summary(struct output_options *output)
                 "\n%s capture stopped: waits=%llu ready=%llu "
                 "timeouts=%llu errors=%llu; structured summary "
                 "written to JSON output\n",
-                output->libuv_mode ? "libuv" : "epoll",
+                output->libuv_mode ? "libuv" :
+                    (output->libevent_mode ? "libevent" : "epoll"),
                 (unsigned long long)counters.calls,
                 (unsigned long long)counters.ready_events,
                 (unsigned long long)counters.timeouts,
@@ -1019,11 +1039,17 @@ bool cw_epoll_print_summary(struct output_options *output)
 
     fprintf(
         stream, "\n%s summary\n",
-        output->libuv_mode ? "libuv" : "epoll");
+        output->libuv_mode ? "libuv" :
+            (output->libevent_mode ? "libevent" : "epoll"));
     if (output->libuv_mode)
         fprintf(
             stream,
             "  Runtime             : native uv_poll_t adapter\n"
+            "  Linux I/O backend   : epoll\n");
+    else if (output->libevent_mode)
+        fprintf(
+            stream,
+            "  Runtime             : native libevent adapter\n"
             "  Linux I/O backend   : epoll\n");
     fprintf(stream,
             "\n[1] Capture overview\n"
@@ -1054,7 +1080,8 @@ bool cw_epoll_print_summary(struct output_options *output)
             "  Wake attributed     : %llu\n"
             "    eventfd/timerfd/signalfd: %llu / %llu / %llu\n"
             "  Callback match/done : %llu / %llu\n"
-            "    matched fd/data/libuv: %llu / %llu / %llu\n"
+            "    matched fd/data/libuv/libevent: "
+            "%llu / %llu / %llu / %llu\n"
             "    unmatched/overflow: %llu / %llu\n"
             "  Callback records    : %llu\n"
             "  Callback dropped    : %llu\n"
@@ -1106,6 +1133,7 @@ bool cw_epoll_print_summary(struct output_options *output)
             (unsigned long long)counters.callback_fd_matched,
             (unsigned long long)counters.callback_data_matched,
             (unsigned long long)counters.callback_libuv_matched,
+            (unsigned long long)counters.callback_libevent_matched,
             (unsigned long long)counters.callback_unmatched,
             (unsigned long long)counters.callback_overflow,
             (unsigned long long)counters.callback_emitted,
@@ -1126,6 +1154,17 @@ bool cw_epoll_print_summary(struct output_options *output)
             stream,
             "  Note: ONESHOT warnings mean no rearm or close was "
             "observed before the waiter entered epoll again.\n");
+    if (output->libevent_mode && counters.callback_unmatched)
+        fprintf(
+            stream,
+            "  Note: libevent unmatched callbacks can be non-I/O "
+            "timer/signal callbacks; unmatched does not mean the "
+            "record was dropped.\n");
+    if (output->libevent_mode && pending_at_stop)
+        fprintf(
+            stream,
+            "  Note: pending final cycles were still open at capture "
+            "stop; pending does not mean the record was dropped.\n");
     print_loop_table(loops, loop_count, stream);
     print_instance_table(
         instances, instance_count, loops, loop_count, stream);
@@ -1273,6 +1312,7 @@ int cw_epoll_write_summary_json(struct output_options *output)
             "\"callback_fd_matched\":%llu,"
             "\"callback_data_matched\":%llu,"
             "\"callback_libuv_matched\":%llu,"
+            "\"callback_libevent_matched\":%llu,"
             "\"callback_unmatched\":%llu,"
             "\"callback_completed\":%llu,"
             "\"callback_overflow\":%llu,"
@@ -1320,6 +1360,7 @@ int cw_epoll_write_summary_json(struct output_options *output)
             (unsigned long long)counters.callback_fd_matched,
             (unsigned long long)counters.callback_data_matched,
             (unsigned long long)counters.callback_libuv_matched,
+            (unsigned long long)counters.callback_libevent_matched,
             (unsigned long long)counters.callback_unmatched,
             (unsigned long long)counters.callback_completed,
             (unsigned long long)counters.callback_overflow,

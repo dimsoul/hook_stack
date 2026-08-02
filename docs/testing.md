@@ -183,6 +183,41 @@ ready FD under `matched by fd/data: 0 / N`, and zero bootstrapped
 registrations. The signalfd callback sleeps briefly on purpose so its blocked
 time is visible in callback attribution.
 
+To test automatic libevent adaptation, install the optional development
+package and build its standalone example:
+
+```sh
+sudo apt install libevent-dev
+make test-libevent
+```
+
+Run the target and tracer in separate terminals:
+
+```sh
+# Terminal 1
+./test/trace_libevent_test --iterations 100
+
+# Terminal 2, using the printed PID
+sudo ./callweave -p PID --libevent --live --epoll-top 5
+```
+
+The target prints its PID and waits three seconds before creating its objects.
+It exercises a raw persistent socket event, socket bufferevent read callback,
+existing-FD listener accept callback, and persistent timer. The summary should
+show raw-event, bufferevent, and listener lifecycle counters; application
+callbacks should be separated from libevent-internal callbacks. Exact
+ready-to-callback paths are expected for the socket-backed objects, while the
+timer remains lifecycle-only. To capture definitions from process start:
+
+```sh
+sudo ./callweave --libevent --live --duration 12 \
+  --exec ./test/trace_libevent_test -- \
+  --startup-delay 0 --iterations 80
+```
+
+See the [libevent adapter guide](runtimes/libevent.md) for lifecycle and
+evidence semantics.
+
 The example also passes a task pointer from the main thread through a small
 queue to a worker thread. Use it to test asynchronous stitching:
 

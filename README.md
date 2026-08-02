@@ -10,7 +10,7 @@ It is designed to answer questions such as:
 - How long did it wait before another thread started it?
 - Was the target executing, blocked, or waiting for CPU?
 - Which epoll-ready FD or io_uring request led to the slow work?
-- Did a libuv callback actually run, or is only a weaker fallback correlation available?
+- Did a libuv or libevent callback actually run, or is only a weaker fallback correlation available?
 
 Callweave complements sampling profilers and distributed tracing. A profiler shows where CPU samples accumulate, while Callweave focuses on selected asynchronous operations and explains where their elapsed time went.
 
@@ -24,6 +24,7 @@ Callweave complements sampling profilers and distributed tracing. A profiler sho
 | epoll | Wait batches, ready-to-I/O dispatch, FD lifetime, wake sources, callback timing, ET/ONESHOT diagnostics, and waiter fairness | [epoll diagnostics](docs/features/epoll.md) |
 | io_uring | SQE-to-CQE latency, io-wq behavior, ring pressure, errors, linked requests, resources, and optional user callback correlation | [io_uring diagnostics](docs/features/io-uring.md) |
 | libuv | Automatic native `uv_poll_t` handle, FD, and callback discovery over the epoll tracer | [libuv adapter](docs/runtimes/libuv.md) |
+| libevent | Automatic raw-event, socket-bufferevent, existing-FD listener, FD, and application-callback discovery through stable public APIs | [libevent adapter](docs/runtimes/libevent.md) |
 
 ## Causal model
 
@@ -70,10 +71,10 @@ On Debian or Ubuntu:
 sudo apt install make clang llvm bpftool binutils libbpf-dev libelf-dev zlib1g-dev
 ```
 
-The libuv adapter does not link Callweave against libuv. Only the optional test program needs `libuv1-dev`:
+Runtime adapters do not link Callweave against libuv or libevent. Only their optional test programs need development packages:
 
 ```sh
-sudo apt install libuv1-dev
+sudo apt install libuv1-dev libevent-dev
 ```
 
 See [getting started](docs/getting-started.md) for build artifacts and source layout.
@@ -133,7 +134,13 @@ Automatically adapt native libuv poll callbacks:
 sudo ./callweave -p PID --libuv
 ```
 
-To avoid missing initialization, let Callweave launch an epoll or libuv target after all probes are ready:
+Automatically adapt libevent I/O callbacks:
+
+```sh
+sudo ./callweave -p PID --libevent
+```
+
+To avoid missing initialization, let Callweave launch an epoll or runtime target after all probes are ready:
 
 ```sh
 sudo ./callweave --libuv --duration 20 \
@@ -142,7 +149,7 @@ sudo ./callweave --libuv --duration 20 \
 
 ## Output detail modes
 
-epoll and libuv default to a final aggregate summary:
+epoll, libuv, and libevent default to a final aggregate summary:
 
 ```sh
 sudo ./callweave -p PID --libuv
@@ -174,7 +181,7 @@ sudo ./callweave -p PID \
   --report /tmp/callweave.html
 ```
 
-Standalone epoll, libuv, and io_uring modes also provide structured JSON summaries. See [JSON and HTML output](docs/output/reports.md).
+Standalone epoll, libuv, libevent, and io_uring modes also provide structured JSON summaries. See [JSON and HTML output](docs/output/reports.md).
 
 ## Documentation
 
@@ -188,6 +195,7 @@ Start with the [documentation index](docs/README.md).
 - [epoll diagnostics](docs/features/epoll.md)
 - [io_uring diagnostics](docs/features/io-uring.md)
 - [libuv adapter](docs/runtimes/libuv.md)
+- [libevent adapter](docs/runtimes/libevent.md)
 - [Evidence levels](docs/reference/evidence-levels.md)
 - [Testing guide](docs/testing.md)
 - [Troubleshooting](docs/troubleshooting/common-issues.md)

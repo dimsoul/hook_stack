@@ -108,6 +108,9 @@ struct output_options {
     bool libuv_mode;
     int libuv_counters_map_fd;
     uint64_t libuv_fallback_tokens;
+    bool libevent_mode;
+    int libevent_counters_map_fd;
+    uint64_t libevent_fallback_tokens;
     const char *epoll_callback_name;
     uint32_t epoll_callback_key_arg;
     uint32_t epoll_callback_match;

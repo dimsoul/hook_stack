@@ -32,3 +32,14 @@ chain. In discovery mode, `sched_waking` records wakeups originating in the
 selected process and keys the latest waker stack by target thread. Target
 entry consumes that record so userspace can present a likely handoff site
 without requiring the async source function in advance.
+
+The epoll module provides the shared event-loop evidence model used by native
+runtime adapters. libuv observes public poll-handle APIs, while libevent
+observes public event lifecycle APIs; neither reads private runtime structure
+offsets. Both emit learned callback addresses to userspace. The common runtime
+callback registry resolves each address to its mapped ELF and dynamically
+attaches the same epoll callback entry/return programs. Runtime-specific BPF
+maps retain only the minimum object-to-FD state needed to match the callback
+argument with an epoll-ready candidate. This keeps scheduler attribution,
+evidence levels, reporting, and symbolization in one backend rather than
+duplicating them per runtime.

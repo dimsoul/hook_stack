@@ -116,6 +116,44 @@ static __attribute__((noinline)) void cw_epoll_callback_match(
                     CW_EPOLL_CALLBACK_MATCH_LIBUV;
         }
     }
+    if (cw_epoll_cfg.callback_match ==
+            CW_EPOLL_CALLBACK_MATCH_LIBEVENT) {
+        struct cw_libevent_key object_key = {
+            .pid = identity->pid,
+            .event = callback_key,
+        };
+        struct cw_libevent_bufferevent *bufferevent =
+            bpf_map_lookup_elem(
+                &libevent_bufferevents, &object_key);
+        struct cw_libevent_listener *listener =
+            bpf_map_lookup_elem(
+                &libevent_listeners, &object_key);
+        __u64 cookie = bpf_get_attach_cookie(ctx);
+
+        if (bufferevent && bufferevent->active &&
+            bufferevent->fd >= 0 &&
+            (!cookie ||
+             bufferevent->read_callback == cookie ||
+             bufferevent->write_callback == cookie ||
+             bufferevent->event_callback == cookie)) {
+            fd = bufferevent->fd;
+        } else if (listener && listener->active &&
+                   listener->fd >= 0 &&
+                   (!cookie || listener->callback == cookie)) {
+            fd = listener->fd;
+        } else if (!bufferevent && !listener &&
+                   callback_key <= 0x7fffffffULL) {
+            fd = (__s32)callback_key;
+        }
+        if (fd >= 0) {
+            dispatch_key.fd = fd;
+            candidate = bpf_map_lookup_elem(
+                &epoll_dispatch_candidates, &dispatch_key);
+            if (candidate)
+                match_kind =
+                    CW_EPOLL_CALLBACK_MATCH_LIBEVENT;
+        }
+    }
     if (!candidate || fd < 0) {
         cw_epoll_callback_record_unmatched(counters);
         return;
@@ -163,6 +201,10 @@ static __attribute__((noinline)) void cw_epoll_callback_match(
         match_kind == CW_EPOLL_CALLBACK_MATCH_LIBUV)
         __sync_fetch_and_add(
             &counters->callback_libuv_matched, 1);
+    if (counters &&
+        match_kind == CW_EPOLL_CALLBACK_MATCH_LIBEVENT)
+        __sync_fetch_and_add(
+            &counters->callback_libevent_matched, 1);
     resource_key.pid = identity->pid;
     resource_key.epoll_fd = batch->epoll_fd;
     resource_key.epoll_generation =
