@@ -32,20 +32,31 @@ jobs:
           sudo apt-get install --yes --no-install-recommends \
             binutils \
             build-essential \
+            ca-certificates \
             clang \
+            curl \
             libbpf-dev \
             libelf-dev \
             libevent-dev \
             libuv1-dev \
-            linux-tools-common \
-            "linux-tools-$(uname -r)" \
             llvm \
             pkg-config \
             zlib1g-dev
 
-      - name: Verify bpftool
+      - name: Install bpftool
+        env:
+          BPFTOOL_VERSION: v7.4.0
+          BPFTOOL_SHA256: 68862a7038a269e1d4af5fed53d2b4d763f1cd82a96caa49b76596453bae0c3e
         run: |
-          bpftool_path="$(find /usr/lib -type f -name bpftool -perm /111 -print -quit)"
+          bpftool_archive="$RUNNER_TEMP/bpftool.tar.gz"
+          bpftool_dir="$RUNNER_TEMP/bpftool"
+          curl --fail --location --silent --show-error \
+            --output "$bpftool_archive" \
+            "https://github.com/libbpf/bpftool/releases/download/$BPFTOOL_VERSION/bpftool-$BPFTOOL_VERSION-amd64.tar.gz"
+          echo "$BPFTOOL_SHA256  $bpftool_archive" | sha256sum --check
+          mkdir --parents "$bpftool_dir"
+          tar --extract --gzip --file "$bpftool_archive" --directory "$bpftool_dir"
+          bpftool_path="$bpftool_dir/bpftool"
           test -x "$bpftool_path"
           echo "BPFTOOL=$bpftool_path" >> "$GITHUB_ENV"
           "$bpftool_path" version
