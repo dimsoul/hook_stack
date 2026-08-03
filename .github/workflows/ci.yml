@@ -80,8 +80,18 @@ jobs:
 
       - name: Validate example configurations
         run: |
-          ./callweave --check-config examples/thread-pool.yaml
-          ./callweave --check-config examples/complex-multi-hop.yaml
+          validation_log="$RUNNER_TEMP/callweave-config-validation.log"
+          if ! {
+            ./callweave --check-config examples/thread-pool.yaml
+            ./callweave --check-config examples/complex-multi-hop.yaml
+          } 2>&1 | tee "$validation_log"; then
+            message="$(tail --lines 40 "$validation_log")"
+            message="${message//'%'/'%25'}"
+            message="${message//$'\r'/'%0D'}"
+            message="${message//$'\n'/'%0A'}"
+            echo "::error title=Configuration validation failed::$message"
+            exit 1
+          fi
 
       - name: Run userspace smoke tests
         run: |
