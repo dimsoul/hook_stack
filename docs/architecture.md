@@ -43,3 +43,11 @@ maps retain only the minimum object-to-FD state needed to match the callback
 argument with an epoll-ready candidate. This keeps scheduler attribution,
 evidence levels, reporting, and symbolization in one backend rather than
 duplicating them per runtime.
+
+While an epoll, libuv, or libevent callback frame is active, the common futex
+syscall probes also associate completed waits with that frame. The callback
+event retains per-invocation wait totals and its longest wait. Per-resource
+aggregation stores aggregate futex totals plus the wait details belonging to
+the invocation that established the maximum callback duration. Waker lookup
+uses the same process-and-futex-address key and user-stack map as native
+function attribution.

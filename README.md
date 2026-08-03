@@ -11,6 +11,7 @@ It is designed to answer questions such as:
 - Was the target executing, blocked, or waiting for CPU?
 - Which epoll-ready FD or io_uring request led to the slow work?
 - Did a libuv or libevent callback actually run, or is only a weaker fallback correlation available?
+- Which futex blocked a slow event-loop callback, and which thread woke it?
 
 Callweave complements sampling profilers and distributed tracing. A profiler shows where CPU samples accumulate, while Callweave focuses on selected asynchronous operations and explains where their elapsed time went.
 
@@ -21,7 +22,7 @@ Callweave complements sampling profilers and distributed tracing. A profiler sho
 | Native functions | Entry stack, return value, duration, scheduler-state attribution, and futex waker | [Function tracing](docs/features/function-tracing.md) |
 | Cross-thread work | Up to eight handoffs with queue and work latency for every hop | [Async call chains](docs/features/async-call-chain.md) |
 | Thread pools | Pending and active work, worker observations, tail latency, and deterministic bottleneck hints | [Queue diagnostics](docs/features/queue-diagnostics.md) |
-| epoll | Wait batches, ready-to-I/O dispatch, FD lifetime, wake sources, callback timing, ET/ONESHOT diagnostics, and waiter fairness | [epoll diagnostics](docs/features/epoll.md) |
+| epoll | Wait batches, ready-to-I/O dispatch, FD lifetime, wake sources, callback timing, callback futex/waker attribution, ET/ONESHOT diagnostics, and waiter fairness | [epoll diagnostics](docs/features/epoll.md) |
 | io_uring | SQE-to-CQE latency, io-wq behavior, ring pressure, errors, linked requests, resources, and optional user callback correlation | [io_uring diagnostics](docs/features/io-uring.md) |
 | libuv | Automatic native `uv_poll_t` handle, FD, and callback discovery over the epoll tracer | [libuv adapter](docs/runtimes/libuv.md) |
 | libevent | Automatic raw-event, socket-bufferevent, existing-FD listener, FD, and application-callback discovery through stable public APIs | [libevent adapter](docs/runtimes/libevent.md) |

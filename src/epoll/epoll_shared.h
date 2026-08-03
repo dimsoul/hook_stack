@@ -99,6 +99,21 @@ struct cw_epoll_wake_source {
     char comm[CW_EPOLL_COMM_LEN];
 };
 
+struct cw_epoll_futex_wait {
+    __u64 address;
+    __u64 duration_ns;
+    __u64 wake_ns;
+    __u32 operation;
+    __u32 waker_pid;
+    __u32 waker_tid;
+    __u32 waker_global_pid;
+    __u32 waker_global_tid;
+    __s32 waker_stack_id;
+    __s32 waker_pidns_error;
+    char waker_comm[CW_EPOLL_COMM_LEN];
+    __u32 reserved;
+};
+
 struct cw_epoll_fd_metadata {
     __u64 signal_mask;
     __u32 kind;
@@ -170,6 +185,8 @@ struct cw_epoll_counters {
     __u64 callback_overflow;
     __u64 callback_emitted;
     __u64 callback_dropped;
+    __u64 callback_futex_waits;
+    __u64 callback_futex_wait_ns;
     __u64 evidence_exact;
     __u64 evidence_ready_to_io;
     __u64 evidence_ready_only;
@@ -264,9 +281,15 @@ struct cw_epoll_resource_stats {
     __u64 callback_offcpu_ns;
     __u64 callback_blocked_ns;
     __u64 callback_runqueue_ns;
+    __u64 callback_futex_waits;
+    __u64 callback_futex_wait_ns;
+    __u64 callback_slowest_blocked_ns;
+    __u64 callback_slowest_futex_waits;
+    __u64 callback_slowest_futex_wait_ns;
     __u64 callback_key;
     __s32 callback_stack_id;
     __u32 callback_reserved;
+    struct cw_epoll_futex_wait callback_slowest_futex_wait;
 };
 
 struct cw_epoll_token_key {
@@ -341,6 +364,8 @@ struct cw_epoll_callback_event {
     __u64 offcpu_ns;
     __u64 blocked_ns;
     __u64 runqueue_ns;
+    __u64 futex_waits;
+    __u64 futex_wait_ns;
     __u64 data;
     __u64 callback_key;
     __u32 pid;
@@ -356,6 +381,7 @@ struct cw_epoll_callback_event {
     __s32 stack_id;
     char comm[CW_EPOLL_COMM_LEN];
     struct cw_epoll_wake_source wake;
+    struct cw_epoll_futex_wait longest_futex_wait;
 };
 
 struct cw_epoll_fd_key {

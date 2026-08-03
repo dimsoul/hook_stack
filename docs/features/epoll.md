@@ -191,6 +191,27 @@ example `6 -> fd=6` in `fd` mode or
 `0x00007fff12345678 -> fd=6` in `data` mode. The callback record also carries
 the eventfd/timerfd/signalfd wake source when one is available.
 
+When a matched callback blocks in a standard futex wait, Callweave also
+records the futex address, operation, total wait time, longest wait, candidate
+waker thread, and waker user stack. The final slow-callback section keeps the
+futex information from the same invocation that established that callback
+group's maximum duration, so the reported lock cause corresponds to the
+displayed slowest callback rather than an unrelated aggregate sample:
+
+```text
+blocking in slowest callback:
+  futex waits: count=1 total=25.121 ms
+  longest futex: operation=wait address=0x... duration=25.121 ms
+    waker PID 1234/TID 1236
+    waker #0 libc.so.6 __GI___lll_lock_wake
+    waker #1 server release_connection
+```
+
+`no futex wait observed` is a bounded result, not proof that the callback did
+not block. Its blocked time may come from sleep, timers, I/O, or another wait
+primitive. This version recognizes `FUTEX_WAIT` and `FUTEX_WAIT_BITSET`,
+including their private variants after command-mask normalization.
+
 Limit high-volume detail while retaining all BPF aggregates:
 
 ```sh

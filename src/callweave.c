@@ -2432,7 +2432,8 @@ trace_target_ready:
                     strerror(-error));
             goto cleanup;
         }
-    } else if (output.epoll_mode) {
+    } else if (output.epoll_mode &&
+               !output.epoll_callback_name) {
         error = bpf_program__set_autoload(
             skeleton->progs.trace_sys_enter, false);
         if (!error)
@@ -2635,6 +2636,14 @@ trace_target_ready:
             error = attach_raw_tracepoint(
                 skeleton->progs.trace_sched_wakeup,
                 &skeleton->links.trace_sched_wakeup, "sched_wakeup");
+        if (!error && output.epoll_callback_name)
+            error = attach_raw_tracepoint(
+                skeleton->progs.trace_sys_enter,
+                &skeleton->links.trace_sys_enter, "sys_enter");
+        if (!error && output.epoll_callback_name)
+            error = attach_raw_tracepoint(
+                skeleton->progs.trace_sys_exit,
+                &skeleton->links.trace_sys_exit, "sys_exit");
         if (!error && output.epoll_started_target)
             error = attach_raw_tracepoint(
                 skeleton->progs.trace_epoll_process_exec,

@@ -97,6 +97,13 @@ diagnostics. The additional adapter sections report:
 - `event_add` calls whose definitions were created before tracing began;
 - exact/fallback attribution coverage and targeted FD seed results.
 
+For every matched raw-event, bufferevent, or listener callback, the shared
+epoll callback tracer also attributes standard futex waits. Live output and
+the slowest-callback summary show the futex address, longest wait, candidate
+waker thread, and waker stack. A callback with blocked scheduler time but no
+supported futex wait is explicitly labeled as a possible sleep, timer, I/O,
+or other wait rather than being misdiagnosed as lock contention.
+
 JSON Lines output contains the normal `epoll_summary` plus a
 `libevent_summary` record. Per-event records require `--live`, `--verbose`, or
 explicit `--min-epoll-*-us` thresholds.
@@ -156,7 +163,7 @@ Two-terminal test:
 
 ```sh
 # Terminal 1: prints its PID and waits before creating events.
-./test/trace_libevent_test --iterations 100
+./test/trace_libevent_test --iterations 100 --lock-contention
 
 # Terminal 2
 sudo ./callweave -p PID --libevent --live --epoll-top 5
@@ -174,4 +181,6 @@ The example exercises a persistent Unix-socket raw event, a socket
 bufferevent, an existing-FD listener, and a persistent timer. Every tenth I/O
 callback deliberately runs longer so callback latency and scheduler
 attribution are visible. The listener FD is nonblocking, as required by
-`evconnlistener_new`.
+`evconnlistener_new`. With `--lock-contention`, the writer holds a mutex while
+every tenth raw callback tries to acquire it, producing a deterministic futex
+waker example.

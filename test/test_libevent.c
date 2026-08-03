@@ -31,6 +31,8 @@ struct test_context {
     int bufferevent_handled;
     int accepted;
     int timer_ticks;
+    bool lock_contention;
+    pthread_mutex_t callback_mutex;
 };
 
 static void maybe_stop(struct test_context *context)
@@ -75,6 +77,10 @@ static void socket_ready_callback(
     if (recv(fd, &value, sizeof(value), 0) != 1)
         return;
     context->handled++;
+    if (context->lock_contention && context->handled % 10 == 0) {
+        pthread_mutex_lock(&context->callback_mutex);
+        pthread_mutex_unlock(&context->callback_mutex);
+    }
     if (context->handled % 10 == 0)
         simulate_work(3000);
     else
@@ -155,14 +161,25 @@ static void *writer_main(void *argument)
 
     for (index = 0; index < context->expected; index++) {
         unsigned char value = (unsigned char)index;
+        bool hold_callback_lock =
+            context->lock_contention && (index + 1) % 10 == 0;
+        bool send_failed = false;
         int client;
 
         sleep_milliseconds(100);
+        if (hold_callback_lock)
+            pthread_mutex_lock(&context->callback_mutex);
         if (send(context->writer_fd, &value, sizeof(value), 0) != 1)
-            break;
+            send_failed = true;
         if (send(
                 context->bufferevent_writer_fd,
                 &value, sizeof(value), 0) != 1)
+            send_failed = true;
+        if (hold_callback_lock) {
+            sleep_milliseconds(25);
+            pthread_mutex_unlock(&context->callback_mutex);
+        }
+        if (send_failed)
             break;
         if ((index + 1) % 20)
             continue;
@@ -213,6 +230,7 @@ int main(int argc, char **argv)
     int bufferevent_sockets[2] = {-1, -1};
     int listener_fd = -1;
     int startup_delay = 3;
+    bool mutex_initialized = false;
     int index;
     int error = 1;
 
@@ -230,9 +248,11 @@ int main(int argc, char **argv)
                 fprintf(stderr, "invalid iteration count\n");
                 return 2;
             }
+        } else if (!strcmp(argv[index], "--lock-contention")) {
+            context.lock_contention = true;
         } else {
             fprintf(stderr, "usage: %s [--startup-delay SEC] "
-                    "[--iterations N]\n", argv[0]);
+                    "[--iterations N] [--lock-contention]\n", argv[0]);
             return 2;
         }
     }
@@ -241,6 +261,11 @@ int main(int argc, char **argv)
            (int)getpid(), startup_delay, context.expected);
     fflush(stdout);
     sleep((unsigned int)startup_delay);
+    if (pthread_mutex_init(&context.callback_mutex, NULL)) {
+        fprintf(stderr, "pthread_mutex_init failed\n");
+        goto out;
+    }
+    mutex_initialized = true;
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets)) {
         perror("socketpair");
         goto out;
@@ -368,5 +393,7 @@ out:
         close(bufferevent_sockets[1]);
     if (listener_fd >= 0)
         close(listener_fd);
+    if (mutex_initialized)
+        pthread_mutex_destroy(&context.callback_mutex);
     return error;
 }

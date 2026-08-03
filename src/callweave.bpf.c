@@ -1305,9 +1305,12 @@ static __always_inline int is_traced_invocation(u64 pid_tgid)
         bpf_map_lookup_elem(&thread_states, &pid_tgid);
     struct async_target_thread *async_thread =
         bpf_map_lookup_elem(&async_target_threads, &pid_tgid);
+    struct cw_epoll_callback_thread *callback_thread =
+        bpf_map_lookup_elem(&epoll_callback_threads, &pid_tgid);
 
     return (thread && thread->depth) ||
-           (async_thread && async_thread->depth);
+           (async_thread && async_thread->depth) ||
+           (callback_thread && callback_thread->depth);
 }
 
 static __always_inline void update_regular_futex_wait(
@@ -1352,6 +1355,67 @@ static __always_inline void update_async_futex_wait(
                          sizeof(invocation->wait));
 }
 
+static __attribute__((noinline)) void update_epoll_callback_futex_wait(
+    u64 pid_tgid, const struct wait_resource *wait)
+{
+    struct cw_epoll_callback_thread *thread =
+        bpf_map_lookup_elem(&epoll_callback_threads, &pid_tgid);
+    struct cw_epoll_callback_key key = {
+        .pid_tgid = pid_tgid,
+    };
+    struct cw_epoll_counters *counters;
+    u32 depth;
+    u32 zero = 0;
+    int updated = 0;
+    int i;
+
+    if (!thread || !thread->depth || !wait->duration_ns)
+        return;
+    depth = thread->depth;
+    if (depth > CW_EPOLL_MAX_CALLBACK_DEPTH)
+        depth = CW_EPOLL_MAX_CALLBACK_DEPTH;
+#pragma unroll
+    for (i = 0; i < CW_EPOLL_MAX_CALLBACK_DEPTH; i++) {
+        struct cw_epoll_callback_frame *frame;
+        struct cw_epoll_futex_wait *longest;
+
+        if ((u32)i >= depth)
+            break;
+        key.depth = i;
+        frame = bpf_map_lookup_elem(&epoll_callback_frames, &key);
+        if (!frame || !frame->matched)
+            continue;
+        frame->event.futex_waits++;
+        frame->event.futex_wait_ns += wait->duration_ns;
+        longest = &frame->event.longest_futex_wait;
+        if (wait->duration_ns > longest->duration_ns) {
+            longest->address = wait->address;
+            longest->duration_ns = wait->duration_ns;
+            longest->wake_ns = wait->wake_ns;
+            longest->operation = wait->operation;
+            longest->waker_pid = wait->waker_pid;
+            longest->waker_tid = wait->waker_tid;
+            longest->waker_global_pid = wait->waker_global_pid;
+            longest->waker_global_tid = wait->waker_global_tid;
+            longest->waker_stack_id = wait->waker_stack_id;
+            longest->waker_pidns_error = wait->waker_pidns_error;
+            __builtin_memcpy(
+                longest->waker_comm, wait->waker_comm,
+                sizeof(longest->waker_comm));
+        }
+        updated = 1;
+    }
+    if (!updated)
+        return;
+    counters = bpf_map_lookup_elem(&epoll_counters, &zero);
+    if (counters) {
+        __sync_fetch_and_add(&counters->callback_futex_waits, 1);
+        __sync_fetch_and_add(
+            &counters->callback_futex_wait_ns,
+            wait->duration_ns);
+    }
+}
+
 SEC("raw_tp/sys_enter")
 int trace_sys_enter(struct bpf_raw_tracepoint_args *ctx)
 {
@@ -1368,7 +1432,9 @@ int trace_sys_enter(struct bpf_raw_tracepoint_args *ctx)
     u32 operation;
     s32 pidns_error;
 
-    if (!cw_trace_cfg.attribution_enabled ||
+    if ((!cw_trace_cfg.attribution_enabled &&
+         !(cw_epoll_cfg.callback_enabled &&
+           cw_epoll_capture_active())) ||
         (s32)ctx->args[1] != cw_trace_cfg.futex_syscall_nr)
         return 0;
     if (!get_process_info(&pid_tgid, &global_pid, &global_tid, &pid, &tid,
@@ -1456,6 +1522,7 @@ int trace_sys_exit(struct bpf_raw_tracepoint_args *ctx)
 
     update_regular_futex_wait(pid_tgid, &wait);
     update_async_futex_wait(pid_tgid, &wait);
+    update_epoll_callback_futex_wait(pid_tgid, &wait);
     return 0;
 }
 

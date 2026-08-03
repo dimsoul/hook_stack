@@ -986,6 +986,27 @@ static void print_callback_table(
         } else {
             fprintf(stream, "        process maps unavailable\n");
         }
+        fprintf(stream, "      blocking in slowest callback:\n");
+        if (stats->callback_slowest_futex_waits) {
+            cw_epoll_print_callback_futex(
+                &stats->callback_slowest_futex_wait,
+                stats->callback_slowest_futex_waits,
+                stats->callback_slowest_futex_wait_ns,
+                output, "        ");
+        } else if (stats->callback_slowest_blocked_ns) {
+            char blocked[32];
+
+            format_interval(
+                blocked, sizeof(blocked),
+                stats->callback_slowest_blocked_ns);
+            fprintf(
+                stream,
+                "        blocked=%s; no futex wait observed "
+                "(possible sleep, timer, I/O, or other wait)\n",
+                blocked);
+        } else {
+            fprintf(stream, "        no blocking wait observed\n");
+        }
         if (cw_capture_cancelled(output->control))
             break;
     }
@@ -1006,6 +1027,7 @@ bool cw_epoll_print_summary(struct output_options *output)
     size_t instance_count;
     uint64_t correlatable;
     uint64_t pending_at_stop;
+    char callback_futex_total[32];
     uint32_t zero = 0;
 
     if (output->epoll_counters_map_fd < 0 ||
@@ -1020,6 +1042,9 @@ bool cw_epoll_print_summary(struct output_options *output)
     pending_at_stop =
         correlatable > counters.dispatches + counters.unconsumed ?
         correlatable - counters.dispatches - counters.unconsumed : 0;
+    format_interval(
+        callback_futex_total, sizeof(callback_futex_total),
+        counters.callback_futex_wait_ns);
     if (output->json_output) {
         fprintf(stream,
                 "\n%s capture stopped: waits=%llu ready=%llu "
@@ -1085,6 +1110,7 @@ bool cw_epoll_print_summary(struct output_options *output)
             "    unmatched/overflow: %llu / %llu\n"
             "  Callback records    : %llu\n"
             "  Callback dropped    : %llu\n"
+            "  Callback futex waits: %llu (total %s)\n"
             "  Evidence exact      : %llu\n"
             "  Evidence ready-to-I/O: %llu\n"
             "  Evidence ready-only : %llu\n"
@@ -1138,6 +1164,8 @@ bool cw_epoll_print_summary(struct output_options *output)
             (unsigned long long)counters.callback_overflow,
             (unsigned long long)counters.callback_emitted,
             (unsigned long long)counters.callback_dropped,
+            (unsigned long long)counters.callback_futex_waits,
+            callback_futex_total,
             (unsigned long long)counters.evidence_exact,
             (unsigned long long)counters.evidence_ready_to_io,
             (unsigned long long)counters.evidence_ready_only,
@@ -1229,35 +1257,79 @@ static int write_summary_wake_json(
     return 0;
 }
 
+static int write_summary_futex_json(
+    FILE *stream, const struct cw_epoll_futex_wait *wait)
+{
+    if (!wait->duration_ns)
+        return fputs("null", stream) == EOF ? -1 : 0;
+    if (fprintf(
+            stream,
+            "{\"operation\":\"%s\","
+            "\"address\":\"0x%016llx\","
+            "\"duration_ns\":%llu,\"wake_ns\":%llu,"
+            "\"waker_pid\":%u,\"waker_tid\":%u,"
+            "\"waker_global_pid\":%u,"
+            "\"waker_global_tid\":%u,"
+            "\"waker_stack_id\":%d,\"waker_comm\":",
+            cw_epoll_futex_operation_name(wait->operation),
+            (unsigned long long)wait->address,
+            (unsigned long long)wait->duration_ns,
+            (unsigned long long)wait->wake_ns,
+            wait->waker_pid, wait->waker_tid,
+            wait->waker_global_pid, wait->waker_global_tid,
+            wait->waker_stack_id) < 0 ||
+        cw_epoll_write_json_string(
+            stream, wait->waker_comm, sizeof(wait->waker_comm)) ||
+        fputc('}', stream) == EOF)
+        return -1;
+    return 0;
+}
+
 static int write_summary_callback_json(
     FILE *stream, const struct cw_epoll_resource_stats *stats)
 {
     if (!stats->callback_matched)
         return fputs("null", stream) == EOF ? -1 : 0;
-    return fprintf(
-               stream,
-               "{\"matched\":%llu,\"completed\":%llu,"
-               "\"total_ready_to_callback_ns\":%llu,"
-               "\"maximum_ready_to_callback_ns\":%llu,"
-               "\"total_duration_ns\":%llu,"
-               "\"maximum_duration_ns\":%llu,"
-               "\"offcpu_ns\":%llu,\"blocked_ns\":%llu,"
-               "\"runqueue_ns\":%llu,\"stack_id\":%d}",
-               (unsigned long long)stats->callback_matched,
-               (unsigned long long)stats->callback_completed,
-               (unsigned long long)
-                   stats->callback_total_delay_ns,
-               (unsigned long long)
-                   stats->callback_maximum_delay_ns,
-               (unsigned long long)
-                   stats->callback_total_duration_ns,
-               (unsigned long long)
-                   stats->callback_maximum_duration_ns,
-               (unsigned long long)stats->callback_offcpu_ns,
-               (unsigned long long)stats->callback_blocked_ns,
-               (unsigned long long)stats->callback_runqueue_ns,
-               stats->callback_stack_id) < 0 ?
-        -1 : 0;
+    if (fprintf(
+            stream,
+            "{\"matched\":%llu,\"completed\":%llu,"
+            "\"total_ready_to_callback_ns\":%llu,"
+            "\"maximum_ready_to_callback_ns\":%llu,"
+            "\"total_duration_ns\":%llu,"
+            "\"maximum_duration_ns\":%llu,"
+            "\"offcpu_ns\":%llu,\"blocked_ns\":%llu,"
+            "\"runqueue_ns\":%llu,\"stack_id\":%d,"
+            "\"futex_waits\":%llu,\"futex_wait_ns\":%llu,"
+            "\"slowest_blocked_ns\":%llu,"
+            "\"slowest_futex_waits\":%llu,"
+            "\"slowest_futex_wait_ns\":%llu,"
+            "\"slowest_futex\":",
+            (unsigned long long)stats->callback_matched,
+            (unsigned long long)stats->callback_completed,
+            (unsigned long long)
+                stats->callback_total_delay_ns,
+            (unsigned long long)
+                stats->callback_maximum_delay_ns,
+            (unsigned long long)
+                stats->callback_total_duration_ns,
+            (unsigned long long)
+                stats->callback_maximum_duration_ns,
+            (unsigned long long)stats->callback_offcpu_ns,
+            (unsigned long long)stats->callback_blocked_ns,
+            (unsigned long long)stats->callback_runqueue_ns,
+            stats->callback_stack_id,
+            (unsigned long long)stats->callback_futex_waits,
+            (unsigned long long)stats->callback_futex_wait_ns,
+            (unsigned long long)stats->callback_slowest_blocked_ns,
+            (unsigned long long)
+                stats->callback_slowest_futex_waits,
+            (unsigned long long)
+                stats->callback_slowest_futex_wait_ns) < 0 ||
+        write_summary_futex_json(
+            stream, &stats->callback_slowest_futex_wait) ||
+        fputc('}', stream) == EOF)
+        return -1;
+    return 0;
 }
 
 int cw_epoll_write_summary_json(struct output_options *output)
@@ -1318,6 +1390,8 @@ int cw_epoll_write_summary_json(struct output_options *output)
             "\"callback_overflow\":%llu,"
             "\"callback_emitted\":%llu,"
             "\"callback_dropped\":%llu,"
+            "\"callback_futex_waits\":%llu,"
+            "\"callback_futex_wait_ns\":%llu,"
             "\"evidence_exact\":%llu,"
             "\"evidence_ready_to_io\":%llu,"
             "\"evidence_ready_only\":%llu,"
@@ -1366,6 +1440,8 @@ int cw_epoll_write_summary_json(struct output_options *output)
             (unsigned long long)counters.callback_overflow,
             (unsigned long long)counters.callback_emitted,
             (unsigned long long)counters.callback_dropped,
+            (unsigned long long)counters.callback_futex_waits,
+            (unsigned long long)counters.callback_futex_wait_ns,
             (unsigned long long)counters.evidence_exact,
             (unsigned long long)counters.evidence_ready_to_io,
             (unsigned long long)counters.evidence_ready_only,

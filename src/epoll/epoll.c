@@ -535,6 +535,40 @@ static int write_wake_json(
     return 0;
 }
 
+static int write_callback_futex_json(
+    FILE *stream, const struct cw_epoll_callback_event *event)
+{
+    const struct cw_epoll_futex_wait *wait =
+        &event->longest_futex_wait;
+
+    if (!event->futex_waits || !wait->duration_ns)
+        return fputs("null", stream) == EOF ? -1 : 0;
+    if (fprintf(
+            stream,
+            "{\"waits\":%llu,\"total_wait_ns\":%llu,"
+            "\"longest\":{\"operation\":\"%s\","
+            "\"address\":\"0x%016llx\","
+            "\"duration_ns\":%llu,\"wake_ns\":%llu,"
+            "\"waker_pid\":%u,\"waker_tid\":%u,"
+            "\"waker_global_pid\":%u,"
+            "\"waker_global_tid\":%u,"
+            "\"waker_stack_id\":%d,\"waker_comm\":",
+            (unsigned long long)event->futex_waits,
+            (unsigned long long)event->futex_wait_ns,
+            cw_epoll_futex_operation_name(wait->operation),
+            (unsigned long long)wait->address,
+            (unsigned long long)wait->duration_ns,
+            (unsigned long long)wait->wake_ns,
+            wait->waker_pid, wait->waker_tid,
+            wait->waker_global_pid, wait->waker_global_tid,
+            wait->waker_stack_id) < 0 ||
+        cw_epoll_write_json_string(
+            stream, wait->waker_comm, sizeof(wait->waker_comm)) ||
+        fputs("}}", stream) == EOF)
+        return -1;
+    return 0;
+}
+
 static int write_dispatch_json_item(
     struct output_options *output,
     const struct cw_epoll_dispatch_event *event,
@@ -698,6 +732,77 @@ static void print_wake_source(
                 "schedule->ready" : "source->ready",
             wake->latency_ns);
     putchar('\n');
+}
+
+const char *cw_epoll_futex_operation_name(uint32_t operation)
+{
+    switch (operation) {
+    case 9:
+        return "wait-bitset";
+    case 0:
+    default:
+        return "wait";
+    }
+}
+
+void cw_epoll_print_callback_futex(
+    const struct cw_epoll_futex_wait *wait,
+    uint64_t waits, uint64_t total_wait_ns,
+    const struct output_options *output, const char *indent)
+{
+    uint64_t stack[MAX_ASYNC_STACK_DEPTH] = {0};
+
+    if (!wait || !waits || !wait->duration_ns || !output)
+        return;
+    printf("%sfutex waits: count=%llu", indent,
+           (unsigned long long)waits);
+    print_interval("total", total_wait_ns);
+    putchar('\n');
+    printf("%slongest futex: operation=%s address=0x%016llx",
+           indent, cw_epoll_futex_operation_name(wait->operation),
+           (unsigned long long)wait->address);
+    print_interval("duration", wait->duration_ns);
+    putchar('\n');
+    if (!wait->waker_tid) {
+        printf("%s  waker=unobserved "
+               "(timeout, signal, or unmatched wake)\n", indent);
+        return;
+    }
+    printf("%s  waker PID %u/TID %u (%.*s)", indent,
+           wait->waker_pid, wait->waker_tid,
+           (int)sizeof(wait->waker_comm), wait->waker_comm);
+    if (wait->wake_ns)
+        print_interval("wake-after-wait-start", wait->wake_ns);
+    putchar('\n');
+    if (wait->waker_pid != wait->waker_global_pid ||
+        wait->waker_tid != wait->waker_global_tid)
+        printf("%s  waker global PID %u/TID %u\n", indent,
+               wait->waker_global_pid, wait->waker_global_tid);
+    if (wait->waker_pidns_error)
+        printf("%s  waker PID namespace translation failed: %s (%d)\n",
+               indent, strerror(-wait->waker_pidns_error),
+               wait->waker_pidns_error);
+    if (wait->waker_stack_id < 0) {
+        printf("%s  unable to collect waker stack: %s (%d)\n",
+               indent, strerror(-wait->waker_stack_id),
+               wait->waker_stack_id);
+        return;
+    }
+    if (output->wait_stack_map_fd < 0 ||
+        bpf_map_lookup_elem(
+            output->wait_stack_map_fd,
+            &wait->waker_stack_id, stack)) {
+        printf("%s  waker stack unavailable (stack_id=%d)\n",
+               indent, wait->waker_stack_id);
+        return;
+    }
+    if (!output->target_maps) {
+        printf("%s  waker process maps unavailable\n", indent);
+        return;
+    }
+    print_stack_frames(
+        stack, sizeof(stack), output->target_maps,
+        "        waker ", NULL, NULL, 0, output->control);
 }
 
 static void print_dispatch_item(
@@ -889,6 +994,8 @@ static int write_callback_json(
             stream, resource, strlen(resource)) ||
         fputs(",\"wake\":", stream) == EOF ||
         write_wake_json(stream, &event->wake) ||
+        fputs(",\"futex\":", stream) == EOF ||
+        write_callback_futex_json(stream, event) ||
         fputs("}\n", stream) == EOF ||
         fflush(stream))
         return -1;
@@ -944,8 +1051,9 @@ static void print_callback_event(
     printf(
         "%s %s PID %u/TID %u (%.*s) "
         "epfd=%d match=%s key=%s events=%s\n",
-        output->libuv_mode ?
-            "LIBUV CALLBACK" : "EPOLL CALLBACK",
+        output->libuv_mode ? "LIBUV CALLBACK" :
+            (output->libevent_mode ?
+                "LIBEVENT CALLBACK" : "EPOLL CALLBACK"),
         output->epoll_callback_name,
         event->pid, event->tid,
         (int)sizeof(event->comm), event->comm,
@@ -965,7 +1073,16 @@ static void print_callback_event(
     print_interval("blocked", event->blocked_ns);
     print_interval("run queue", event->runqueue_ns);
     print_interval("preempt/unknown", unknown_ns);
-    printf("\n  callback stack:\n");
+    putchar('\n');
+    if (event->futex_waits)
+        cw_epoll_print_callback_futex(
+            &event->longest_futex_wait,
+            event->futex_waits, event->futex_wait_ns,
+            output, "  ");
+    else if (event->blocked_ns)
+        printf("  blocking: no futex wait observed "
+               "(possible sleep, timer, I/O, or other wait)\n");
+    printf("  callback stack:\n");
     if (event->stack_id < 0 ||
         output->epoll_stack_map_fd < 0 ||
         bpf_map_lookup_elem(

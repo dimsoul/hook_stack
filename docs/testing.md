@@ -195,7 +195,7 @@ Run the target and tracer in separate terminals:
 
 ```sh
 # Terminal 1
-./test/trace_libevent_test --iterations 100
+./test/trace_libevent_test --iterations 100 --lock-contention
 
 # Terminal 2, using the printed PID
 sudo ./callweave -p PID --libevent --live --epoll-top 5
@@ -214,6 +214,11 @@ sudo ./callweave --libevent --live --duration 12 \
   --exec ./test/trace_libevent_test -- \
   --startup-delay 0 --iterations 80
 ```
+
+Add `--lock-contention` after the target arguments in `--exec` mode to make
+every tenth raw-event callback wait on a mutex held by the writer thread. The
+summary should report callback futex waits, the mutex's futex address, and a
+waker stack containing `writer_main`.
 
 See the [libevent adapter guide](runtimes/libevent.md) for lifecycle and
 evidence semantics.

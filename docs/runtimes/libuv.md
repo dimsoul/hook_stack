@@ -95,6 +95,12 @@ JSON Lines mode always emits the final `epoll_summary` and `libuv_summary`;
 detail-enabled modes additionally emit the matching epoll and callback
 records.
 
+Matched native callbacks also inherit epoll callback futex attribution. A
+slow `uv_poll_t` callback that waits on a contended pthread mutex reports the
+futex address, longest wait, candidate waker thread, and waker stack. If the
+blocked interval contains no supported futex wait, the report says so instead
+of guessing a lock cause.
+
 There are two deliberate boundaries in this first version:
 
 - With `-p PID`, libuv handles whose `uv_poll_init/start` calls finished before

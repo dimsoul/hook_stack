@@ -48,8 +48,14 @@ sudo ./callweave -p 1234 \
 ```
 
 Without `--output`, JSON Lines are written to standard output and tracer status
-is written to standard error. `--format json` and `--report` currently require
-an async trace because their data model is a completed causal chain. Existing
-slow-chain filters are applied before either export is written.
-JSON Lines output uses `type: "chain"` for completed chains and appends one
-`type: "queue_diagnostics"` record on exit.
+is written to standard error. HTML `--report` requires an async trace because
+its data model is a completed causal chain. JSON Lines also supports standalone
+epoll, libuv, libevent, and io_uring diagnostics.
+
+Async output uses `type: "chain"` for completed chains and appends one
+`type: "queue_diagnostics"` record on exit. Event-loop output uses
+`epoll_callback` records plus an `epoll_summary`; runtime modes append their
+own summary record. Callback JSON includes a nullable `futex` object with the
+wait count, total wait time, longest wait, futex address, candidate waker, and
+waker stack ID. Resource callback summaries retain aggregate futex totals and
+the futex data from the invocation that established maximum callback duration.

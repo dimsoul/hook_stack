@@ -345,12 +345,27 @@ static __attribute__((noinline)) void cw_epoll_finish_callback(
         __sync_fetch_and_add(
             &resource_stats->callback_runqueue_ns,
             frame->event.runqueue_ns);
+        __sync_fetch_and_add(
+            &resource_stats->callback_futex_waits,
+            frame->event.futex_waits);
+        __sync_fetch_and_add(
+            &resource_stats->callback_futex_wait_ns,
+            frame->event.futex_wait_ns);
         update_peak(
             &resource_stats->callback_maximum_duration_ns,
             frame->event.duration_ns);
-        if (frame->event.duration_ns >= previous_maximum)
+        if (frame->event.duration_ns >= previous_maximum) {
             resource_stats->callback_stack_id =
                 frame->event.stack_id;
+            resource_stats->callback_slowest_blocked_ns =
+                frame->event.blocked_ns;
+            resource_stats->callback_slowest_futex_waits =
+                frame->event.futex_waits;
+            resource_stats->callback_slowest_futex_wait_ns =
+                frame->event.futex_wait_ns;
+            resource_stats->callback_slowest_futex_wait =
+                frame->event.longest_futex_wait;
+        }
     }
     if (frame->event.duration_ns <
         cw_epoll_cfg.min_callback_ns)
