@@ -45,8 +45,7 @@ jobs:
 
       - name: Verify bpftool
         run: |
-          kernel_tools_package="linux-tools-$(uname -r)"
-          bpftool_path="$(dpkg-query -L "$kernel_tools_package" | awk '/\/bpftool$/ { print; exit }')"
+          bpftool_path="$(find /usr/lib -type f -name bpftool -perm /111 -print -quit)"
           test -x "$bpftool_path"
           echo "BPFTOOL=$bpftool_path" >> "$GITHUB_ENV"
           "$bpftool_path" version
