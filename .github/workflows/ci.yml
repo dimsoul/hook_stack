@@ -57,6 +57,7 @@ jobs:
           mkdir --parents "$bpftool_dir"
           tar --extract --gzip --file "$bpftool_archive" --directory "$bpftool_dir"
           bpftool_path="$bpftool_dir/bpftool"
+          chmod 0755 "$bpftool_path"
           test -x "$bpftool_path"
           echo "BPFTOOL=$bpftool_path" >> "$GITHUB_ENV"
           "$bpftool_path" version
