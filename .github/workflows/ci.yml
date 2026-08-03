@@ -95,9 +95,19 @@ jobs:
 
       - name: Run userspace smoke tests
         run: |
-          timeout 15s ./test/trace_epoll_test 4
-          timeout 15s ./test/trace_libuv_test 1
-          timeout 15s ./test/trace_libevent_test \
-            --startup-delay 0 \
-            --iterations 8 \
-            --lock-contention
+          smoke_log="$RUNNER_TEMP/callweave-smoke-tests.log"
+          if ! {
+            timeout 15s ./test/trace_epoll_test 4
+            timeout 15s ./test/trace_libuv_test 1
+            timeout 15s ./test/trace_libevent_test \
+              --startup-delay 0 \
+              --iterations 8 \
+              --lock-contention
+          } 2>&1 | tee "$smoke_log"; then
+            message="$(tail --lines 40 "$smoke_log")"
+            message="${message//'%'/'%25'}"
+            message="${message//$'\r'/'%0D'}"
+            message="${message//$'\n'/'%0A'}"
+            echo "::error title=Userspace smoke tests failed::$message"
+            exit 1
+          fi
