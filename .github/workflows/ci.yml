@@ -31,16 +31,24 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
             binutils \
-            bpftool \
             build-essential \
             clang \
             libbpf-dev \
             libelf-dev \
             libevent-dev \
             libuv1-dev \
+            linux-tools-common \
+            linux-tools-generic \
             llvm \
             pkg-config \
             zlib1g-dev
+
+      - name: Select bpftool binary
+        run: |
+          bpftool_path="$(find /usr/lib/linux-tools -type f -name bpftool -print -quit)"
+          test -n "$bpftool_path"
+          echo "BPFTOOL=$bpftool_path" >> "$GITHUB_ENV"
+          "$bpftool_path" version
 
       - name: Check runner BTF
         run: test -r /sys/kernel/btf/vmlinux
