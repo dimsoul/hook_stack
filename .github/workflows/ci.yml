@@ -38,15 +38,14 @@ jobs:
             libevent-dev \
             libuv1-dev \
             linux-tools-common \
-            linux-tools-generic \
+            "linux-tools-$(uname -r)" \
             llvm \
             pkg-config \
             zlib1g-dev
 
-      - name: Select bpftool binary
+      - name: Verify bpftool
         run: |
-          bpftool_path="$(find /usr/lib/linux-tools -type f -name bpftool -print -quit)"
-          test -n "$bpftool_path"
+          bpftool_path="$(command -v bpftool)"
           echo "BPFTOOL=$bpftool_path" >> "$GITHUB_ENV"
           "$bpftool_path" version
 
