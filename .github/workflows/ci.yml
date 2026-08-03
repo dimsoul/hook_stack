@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: MIT
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-smoke-test:
+    name: Build and smoke test (Ubuntu 24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            binutils \
+            bpftool \
+            build-essential \
+            clang \
+            libbpf-dev \
+            libelf-dev \
+            libevent-dev \
+            libuv1-dev \
+            llvm \
+            pkg-config \
+            zlib1g-dev
+
+      - name: Check runner BTF
+        run: test -r /sys/kernel/btf/vmlinux
+
+      - name: Build all targets
+        run: |
+          make clean
+          make
+
+      - name: Validate example configurations
+        run: |
+          ./callweave --check-config examples/thread-pool.yaml
+          ./callweave --check-config examples/complex-multi-hop.yaml
+
+      - name: Run userspace smoke tests
+        run: |
+          timeout 15s ./test/trace_epoll_test 4
+          timeout 15s ./test/trace_libuv_test 1
+          timeout 15s ./test/trace_libevent_test \
+            --startup-delay 0 \
+            --iterations 8 \
+            --lock-contention

@@ -2,6 +2,8 @@
 
 # callweave-ebpf
 
+[![CI](https://github.com/dimsoul/callweave-ebpf/actions/workflows/ci.yml/badge.svg)](https://github.com/dimsoul/callweave-ebpf/actions/workflows/ci.yml)
+
 `callweave` is a no-instrumentation asynchronous latency debugger for native Linux applications. It uses eBPF and uprobes to connect selected user-space functions, thread handoffs, scheduler delays, epoll readiness, io_uring completions, and runtime callbacks into evidence-backed causal paths.
 
 It is designed to answer questions such as:
