@@ -89,7 +89,7 @@ jobs:
           make clean
           build_log="$RUNNER_TEMP/callweave-build.log"
           if ! make 2>&1 | tee "$build_log"; then
-            message="$(tail --lines 40 "$build_log")"
+            message="$(tail --lines 80 "$build_log")"
             message="${message//'%'/'%25'}"
             message="${message//$'\r'/'%0D'}"
             message="${message//$'\n'/'%0A'}"
