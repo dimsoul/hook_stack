@@ -52,6 +52,10 @@ Set tool variables when the defaults are not appropriate, for example:
 make CLANG=clang-18 BPFTOOL=/usr/sbin/bpftool
 ```
 
+The Makefile targets eBPF ISA v3 by default (`BPF_CPU=v3`). Callweave uses
+32-bit and 64-bit atomic operations that Clang only enables for this target;
+overriding it with an older ISA can make the BPF compilation fail.
+
 ### Source layout
 
 The implementation is split by responsibility so changes to one tracer mode

@@ -4,6 +4,7 @@ CLANG ?= clang
 CC ?= cc
 BPFTOOL ?= bpftool
 PKG_CONFIG ?= pkg-config
+BPF_CPU ?= v3
 
 ifndef BPF_ARCH
 BPF_ARCH := $(shell uname -m)
@@ -48,7 +49,8 @@ endif
 CFLAGS ?= -O2 -g
 CFLAGS += -std=gnu11 -Wall -Wextra -Wpedantic -Wno-overlength-strings
 BPF_CFLAGS ?= -O2 -g
-BPF_CFLAGS += -std=gnu11 -target bpf -D__TARGET_ARCH_$(BPF_ARCH)
+BPF_CFLAGS += -std=gnu11 -target bpf -mcpu=$(BPF_CPU) \
+	-D__TARGET_ARCH_$(BPF_ARCH)
 
 BINARY := callweave
 TEST_BINARY := test/trace_test
