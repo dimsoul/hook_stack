@@ -129,6 +129,15 @@ bool cw_capture_running(const struct cw_capture_control *control)
     return !control || control->phase == CW_CAPTURE_RUNNING;
 }
 
+bool cw_capture_accepts_drain_events(
+    const struct cw_capture_control *control)
+{
+    if (!control || control->phase == CW_CAPTURE_RUNNING)
+        return true;
+    return control->phase == CW_CAPTURE_FINALIZING &&
+           control->reason != CW_STOP_OUTPUT_ERROR;
+}
+
 bool cw_capture_should_finalize(const struct cw_capture_control *control)
 {
     return !control || control->phase != CW_CAPTURE_FORCE_EXIT;

@@ -21,5 +21,7 @@ int resolve_linked_symbol_module(const char *executable,
 int resolve_process_address(pid_t pid, uint64_t address,
                             char *path, size_t path_size,
                             uint64_t *file_offset);
+int resolve_elf_offset_symbol(const char *path, uint64_t file_offset,
+                              char *symbol, size_t symbol_size);
 
 #endif

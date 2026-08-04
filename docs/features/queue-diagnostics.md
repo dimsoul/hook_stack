@@ -26,7 +26,7 @@ final JSON/HTML diagnostic:
 ```sh
 sudo ./callweave -p PID --config examples/complex-multi-hop.yaml \
   --diagnostic-interval-ms 0 \
-  --report /tmp/callweave-report.html
+  --report ./callweave-report.html
 ```
 
 Each stage reports:

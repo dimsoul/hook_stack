@@ -173,9 +173,21 @@ Complete-from-start test:
 
 ```sh
 sudo ./callweave --libevent --live --duration 12 \
+  --report ./callweave-libevent.html \
   --exec ./test/trace_libevent_test -- \
   --startup-delay 0 --iterations 80
 ```
+
+The HTML Sequence view uses lifecycle-role lanes for epoll readiness, the
+libevent loop, and the automatically discovered callback. It distinguishes
+time blocked in `epoll_wait*`, ready-to-callback dispatch delay, and callback
+execution even though the event loop and callback normally share one TID;
+futex attribution remains available in Waterfall and Details. Callback lanes
+combine the runtime role and resolved ELF symbol, such as
+`libevent_callback (socket_ready_callback)` or
+`libevent_callback (bufferevent_read_callback)`. When no symbol is available
+the parenthesized value is `callback@0xADDRESS`, which remains distinct for
+each callback address.
 
 The example exercises a persistent Unix-socket raw event, a socket
 bufferevent, an existing-FD listener, and a persistent timer. Every tenth I/O

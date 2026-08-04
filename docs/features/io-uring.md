@@ -103,6 +103,12 @@ receives `user_data` directly. If a runtime passes a wrapper object or CQE
 pointer instead, a runtime-specific adapter is needed to extract the value;
 choosing an arbitrary argument would otherwise create misleading matches.
 
+When `--max-events` or `--duration` ends capture, callweave drains callback
+records already queued in the secondary ring buffer before writing JSON or
+HTML. Probes are detached before that bounded drain, so a continuously running
+target cannot keep finalization alive. This also prevents the completion limit
+from cutting otherwise matched CQE-to-callback hops out of the final report.
+
 `user_data` is displayed as application context; it is not used as the unique
 correlation key because applications may reuse it. Multishot requests remain
 pending while `IORING_CQE_F_MORE` is set. With `IORING_SETUP_SQPOLL`, the
@@ -114,12 +120,23 @@ JSON Lines output is available for automation:
 
 ```sh
 sudo ./callweave -p PID --io-uring --format json \
-  --output /tmp/callweave-io-uring.jsonl
+  --output ./callweave-io-uring.jsonl
 ```
 
 Each completion is an `io_uring` record. With `--io-callback`, matches are
 additional `io_uring_callback` records. The final `io_uring_summary` includes
 per-operation aggregates, error codes, Top-N groups, ring diagnostics, invalid
-SQE samples, and linked-request edges. The asynchronous-chain HTML report
-currently has a different data model and is therefore not accepted in this
-mode.
+SQE samples, and linked-request edges. Add `--report PATH` for a self-contained
+HTML view. Its Sequence tab uses an io_uring-specific request lifecycle: SQE
+submission enters a kernel lane, optional defer/io-wq queue time is shown only
+when observed, and the remaining SQE-to-CQE interval is labeled kernel
+in-flight rather than thread execution. When `--io-callback` is configured, a
+matched CQE-to-callback handoff is appended. Thread identifiers in the report
+use the global PID namespace consistently.
+
+CQE-to-callback wait begins when the kernel publishes the CQE and ends when the
+matched application callback starts. It is user-space dispatch delay, not
+kernel execution time. For example, an application that asks
+`io_uring_enter()` to wait for a whole batch can leave an already completed NOP
+in the CQ until a slower timeout in the same batch finishes; the NOP then has a
+short kernel in-flight phase but a long CQE-to-callback wait.

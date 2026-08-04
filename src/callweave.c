@@ -47,6 +47,7 @@
 #include "libevent/libevent.h"
 #include "libuv/libuv.h"
 #include "report.h"
+#include "runtime_report.h"
 #include "symbols.h"
 
 _Static_assert(sizeof(struct io_uring_event) == 160,
@@ -1414,10 +1415,11 @@ int main(int argc, char **argv)
         error = 2;
         goto cleanup;
     }
-    if (report_path && !output.show_async) {
+    if (report_path && !output.show_async &&
+        !output.io_uring_mode && !output.epoll_mode) {
         fprintf(stderr,
-                "--report requires async tracing via --config, "
-                "--async-hop, or --async-source\n");
+                "--report requires async tracing, --io-uring, "
+                "--epoll, --libuv, or --libevent\n");
         error = 2;
         goto cleanup;
     }
@@ -1483,6 +1485,12 @@ int main(int argc, char **argv)
             break;
         case CW_EPOLL_OUTPUT_CUSTOM:
             break;
+        }
+        if (report_path && !epoll_output_option_seen &&
+            !epoll_threshold_option_seen) {
+            output.epoll_min_wait_ns = 0;
+            output.epoll_min_dispatch_ns = 0;
+            output.epoll_min_callback_ns = 0;
         }
     }
     if (module_name && target_pid <= 0) {
@@ -1622,12 +1630,12 @@ int main(int argc, char **argv)
             output.show_return_value || output.show_duration ||
             output.show_attribution || output.show_async ||
             output.show_discovery || async_source_name ||
-            async_source_binary || async_option_seen || async_hop_count ||
-            report_path) {
+            async_source_binary || async_option_seen || async_hop_count) {
             fprintf(stderr,
                     "--io-uring is a standalone mode; combine it only with "
                     "--pid, its io_uring filters/callback options, "
-                    "--duration, --max-events, --format, and --output\n");
+                    "--duration, --max-events, --format, --output, and "
+                    "--report\n");
             error = 2;
             goto cleanup;
         }
@@ -1672,7 +1680,7 @@ int main(int argc, char **argv)
             output.show_attribution || output.show_async ||
             output.show_discovery || async_source_name ||
             async_source_binary || async_option_seen || async_hop_count ||
-            report_path || io_callback_option_seen ||
+            io_callback_option_seen ||
             output.io_uring_min_latency_ns ||
             output.io_uring_errors_only || output.io_uring_top) {
             fprintf(stderr,
@@ -1683,7 +1691,8 @@ int main(int argc, char **argv)
                     "--pid or --exec, --min-epoll-wait-us, "
                     "--min-epoll-dispatch-us, --epoll-top, "
                     "--epoll-callback or runtime-adapter options, "
-                    "--duration, --max-events, --format, and --output\n");
+                    "--duration, --max-events, --format, --output, and "
+                    "--report\n");
             error = 2;
             goto cleanup;
         }
@@ -2671,6 +2680,8 @@ trace_target_ready:
                 target_pid, libuv_path);
             if (error)
                 goto cleanup;
+            output.runtime_callbacks =
+                &libuv_runtime.callback_registry;
         }
         if (output.libevent_mode) {
             error = cw_libevent_attach(
@@ -2678,6 +2689,8 @@ trace_target_ready:
                 target_pid, libevent_path);
             if (error)
                 goto cleanup;
+            output.runtime_callbacks =
+                &libevent_runtime.callback_registry;
         }
         attach_optional_raw_tracepoint(
             skeleton->progs.trace_epoll_signal_generate,
@@ -2918,12 +2931,30 @@ trace_target_ready:
             goto cleanup;
         }
         output.report_first = true;
-        if (cw_html_report_begin(report_stream)) {
-            error = -(errno ? errno : EIO);
-            fprintf(stderr, "cannot initialize HTML report %s: %s\n",
-                    report_path, strerror(-error));
-            fclose(report_stream);
-            goto cleanup;
+        if (output.show_async) {
+            if (cw_html_report_begin(report_stream)) {
+                error = -(errno ? errno : EIO);
+                fprintf(stderr,
+                        "cannot initialize HTML report %s: %s\n",
+                        report_path, strerror(-error));
+                fclose(report_stream);
+                goto cleanup;
+            }
+        } else {
+            const char *report_mode = output.io_uring_mode ? "io_uring" :
+                output.libuv_mode ? "libuv" :
+                output.libevent_mode ? "libevent" : "epoll";
+
+            output.runtime_report =
+                cw_runtime_report_create(report_mode);
+            if (!output.runtime_report) {
+                error = -ENOMEM;
+                fprintf(stderr,
+                        "cannot initialize HTML report %s: %s\n",
+                        report_path, strerror(-error));
+                fclose(report_stream);
+                goto cleanup;
+            }
         }
         output.report_stream = report_stream;
     }
@@ -3253,7 +3284,18 @@ trace_target_ready:
         (output.io_uring_callback_name ||
          output.epoll_callback_name) &&
         cw_capture_should_finalize(&control)) {
-        int consume_error = ring_buffer__consume(ring_buffer);
+        int consume_error;
+
+        /*
+         * Stop producers before draining secondary callback ring buffers.
+         * A continuously running target can otherwise keep the callback
+         * buffer non-empty forever after --max-events or --duration fires.
+         */
+        if (output.io_uring_mode)
+            detach_io_uring_links(skeleton);
+        if (output.epoll_mode)
+            detach_epoll_links(skeleton);
+        consume_error = ring_buffer__consume(ring_buffer);
 
         if (consume_error < 0 && !error)
             error = consume_error;
@@ -3303,13 +3345,23 @@ cleanup:
     finalize_outputs = !cw_capture_cancelled(&control);
     if (output.report_stream) {
         if (finalize_outputs) {
-            struct cw_queue_diagnostic diagnostics[MAX_ASYNC_HOPS];
-            struct async_hop_stats raw[MAX_ASYNC_HOPS];
-            size_t diagnostic_count =
-                read_queue_diagnostics(&output, diagnostics, raw);
+            int report_error;
 
-            if ((cw_html_report_end(output.report_stream, diagnostics,
-                                    diagnostic_count) ||
+            if (output.runtime_report) {
+                report_error = cw_runtime_report_write(
+                    output.runtime_report, output.report_stream);
+            } else {
+                struct cw_queue_diagnostic diagnostics[MAX_ASYNC_HOPS];
+                struct async_hop_stats raw[MAX_ASYNC_HOPS];
+                size_t diagnostic_count =
+                    read_queue_diagnostics(
+                        &output, diagnostics, raw);
+
+                report_error = cw_html_report_end(
+                    output.report_stream, diagnostics,
+                    diagnostic_count);
+            }
+            if ((report_error ||
                  fflush(output.report_stream)) && !error) {
                 error = -(errno ? errno : EIO);
                 fprintf(stderr, "failed to finalize HTML report: %s\n",
@@ -3319,6 +3371,7 @@ cleanup:
         if (fclose(output.report_stream) && !error)
             error = -errno;
     }
+    cw_runtime_report_destroy(output.runtime_report);
     if (output.json_stream) {
         finalize_outputs = !cw_capture_cancelled(&control);
         if (output.io_uring_mode && finalize_outputs) {

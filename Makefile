@@ -62,6 +62,7 @@ IO_URING_TEST_BINARY := test/trace_io_uring_test
 EPOLL_TEST_BINARY := test/trace_epoll_test
 LIBUV_TEST_BINARY := test/trace_libuv_test
 LIBEVENT_TEST_BINARY := test/trace_libevent_test
+REPORT_TEST_BINARY := test/trace_report_test
 BPF_OBJECT := src/callweave.bpf.o
 VMLINUX_HEADER := src/vmlinux.h
 SKELETON_HEADER := src/callweave.skel.h
@@ -73,7 +74,7 @@ SKELETON_HEADER := src/callweave.skel.h
 all: $(BINARY) $(TEST_BINARY) $(ASYNC_TEST_BINARY) \
 	$(THREAD_POOL_TEST_BINARY) $(COMPLEX_ASYNC_TEST_BINARY) \
 	$(LOCK_TEST_BINARY) $(IO_URING_TEST_BINARY) $(EPOLL_TEST_BINARY) \
-	$(LIBUV_DEFAULT_TARGET) $(LIBEVENT_DEFAULT_TARGET)
+	$(REPORT_TEST_BINARY) $(LIBUV_DEFAULT_TARGET) $(LIBEVENT_DEFAULT_TARGET)
 
 $(VMLINUX_HEADER):
 	@test -r /sys/kernel/btf/vmlinux || \
@@ -112,6 +113,7 @@ $(BINARY): src/callweave.c src/core/capture_control.c \
 		src/symbols.c src/io_uring/io_uring.c \
 		src/io_uring/io_uring_report.c \
 		src/io_uring/io_uring_resources.c \
+		src/runtime_report.c src/runtime_report.h \
 		src/io_uring/io_uring.h \
 		src/io_uring/io_uring_internal.h \
 		src/io_uring/io_uring_shared.h \
@@ -138,7 +140,8 @@ $(BINARY): src/callweave.c src/core/capture_control.c \
 		src/libevent/libevent.c src/runtime/runtime_adapter.c \
 		src/symbols.c src/io_uring/io_uring.c \
 		src/io_uring/io_uring_report.c \
-		src/io_uring/io_uring_resources.c src/report.c -o $@ \
+		src/io_uring/io_uring_resources.c src/report.c \
+		src/runtime_report.c -o $@ \
 		$(LIBBPF_LIBS) $(LIBELF_LIBS) $(ZLIB_LIBS)
 
 $(TEST_BINARY): test/test.c
@@ -169,6 +172,11 @@ $(EPOLL_TEST_BINARY): test/test_epoll.c
 	$(CC) -std=gnu11 -O0 -g -Wall -Wextra -fno-omit-frame-pointer \
 		-fno-inline -rdynamic $< -o $@ -pthread
 
+$(REPORT_TEST_BINARY): test/test_report.c src/report.c src/report.h \
+		src/runtime_report.c src/runtime_report.h
+	$(CC) $(CFLAGS) -Isrc test/test_report.c src/report.c \
+		src/runtime_report.c -o $@
+
 $(LIBUV_TEST_BINARY): test/test_libuv.c
 	@test -n "$(LIBUV_LIBS)" || \
 		{ echo "error: libuv development files are required for test-libuv" >&2; \
@@ -191,7 +199,8 @@ test-libevent: $(LIBEVENT_TEST_BINARY)
 
 test-program: $(TEST_BINARY) $(ASYNC_TEST_BINARY) \
 	$(THREAD_POOL_TEST_BINARY) $(COMPLEX_ASYNC_TEST_BINARY) \
-	$(LOCK_TEST_BINARY) $(IO_URING_TEST_BINARY) $(EPOLL_TEST_BINARY)
+	$(LOCK_TEST_BINARY) $(IO_URING_TEST_BINARY) $(EPOLL_TEST_BINARY) \
+	$(REPORT_TEST_BINARY)
 
 demo-async: all
 	bash test/run_async_demo.sh
@@ -206,7 +215,7 @@ clean:
 	rm -f $(BINARY) $(TEST_BINARY) $(ASYNC_TEST_BINARY) \
 		$(THREAD_POOL_TEST_BINARY) $(COMPLEX_ASYNC_TEST_BINARY) \
 		$(LOCK_TEST_BINARY) $(IO_URING_TEST_BINARY) \
-		$(EPOLL_TEST_BINARY) $(BPF_OBJECT) \
+		$(EPOLL_TEST_BINARY) $(REPORT_TEST_BINARY) $(BPF_OBJECT) \
 		$(LIBUV_TEST_BINARY) \
 		$(LIBEVENT_TEST_BINARY) \
 		$(VMLINUX_HEADER) \

@@ -13,6 +13,8 @@
 #include "core/fd_resources.h"
 #include "epoll/epoll.h"
 #include "epoll/epoll_internal.h"
+#include "runtime/runtime_adapter.h"
+#include "runtime_report.h"
 
 const char *cw_epoll_output_mode_name(uint32_t mode)
 {
@@ -431,6 +433,15 @@ int cw_epoll_handle_event(void *context, void *data, size_t data_size)
             event->ready[index].fd);
     }
 
+    if (output->runtime_report &&
+        cw_runtime_report_capture_epoll_wait(
+            output->runtime_report, event)) {
+        fprintf(stderr, "failed to collect epoll HTML report data\n");
+        output->export_failed = true;
+        cw_capture_request_stop(output->control, CW_STOP_OUTPUT_ERROR);
+        return 0;
+    }
+
     if (output->epoll_output_mode == CW_EPOLL_OUTPUT_SUMMARY)
         return 0;
     if (output->json_output) {
@@ -448,9 +459,11 @@ int cw_epoll_handle_event(void *context, void *data, size_t data_size)
 
     output->emitted_events++;
     if (output->max_events &&
-        output->emitted_events >= output->max_events)
+        output->emitted_events >= output->max_events) {
         cw_capture_request_stop(
             output->control, CW_STOP_MAX_EVENTS);
+        return 1;
+    }
     return 0;
 }
 
@@ -903,6 +916,15 @@ int cw_epoll_handle_dispatch_event(
     item = &event->item;
     cw_fd_cache_one(
         &output->fd_resources, output->target_pid, item->fd);
+    if (output->runtime_report && !output->epoll_callback_name &&
+        cw_runtime_report_capture_epoll_dispatch(
+            output->runtime_report, event)) {
+        fprintf(stderr,
+                "failed to collect epoll dispatch HTML report data\n");
+        output->export_failed = true;
+        cw_capture_request_stop(output->control, CW_STOP_OUTPUT_ERROR);
+        return 0;
+    }
     if (output->epoll_output_mode == CW_EPOLL_OUTPUT_SUMMARY)
         return 0;
     if (output->json_output) {
@@ -939,7 +961,9 @@ static int write_callback_json(
                 event->blocked_ns - event->runqueue_ns : 0;
     char ready_flags[128];
     char resource[PATH_MAX];
+    char callback_label[256];
     uint64_t callback_key = event->callback_key;
+    const char *callback_name;
 
     if (!stream)
         return 0;
@@ -948,6 +972,12 @@ static int write_callback_json(
     cw_fd_resolve(
         &output->fd_resources, output->target_pid,
         event->fd, resource, sizeof(resource));
+    callback_name = output->epoll_callback_name;
+    if (output->runtime_callbacks && event->callback_address &&
+        !cw_runtime_format_callback(
+            output->runtime_callbacks, event->callback_address,
+            callback_label, sizeof(callback_label)))
+        callback_name = callback_label;
     if (fprintf(
             stream,
             "{\"type\":\"epoll_callback\","
@@ -959,6 +989,7 @@ static int write_callback_json(
             "\"match\":\"%s\","
             "\"evidence\":\"exact\","
             "\"callback_key\":\"0x%016llx\","
+            "\"callback_address\":\"0x%016llx\","
             "\"ready_flags\":",
             (unsigned long long)realtime_ns,
             event->pid, event->tid,
@@ -968,13 +999,13 @@ static int write_callback_json(
             (unsigned long long)event->data,
             event->ready_events,
             cw_epoll_callback_match_name(event->match_kind),
-            (unsigned long long)callback_key) < 0 ||
+            (unsigned long long)callback_key,
+            (unsigned long long)event->callback_address) < 0 ||
         cw_epoll_write_json_string(
             stream, ready_flags, strlen(ready_flags)) ||
         fputs(",\"callback\":", stream) == EOF ||
         cw_epoll_write_json_string(
-            stream, output->epoll_callback_name,
-            strlen(output->epoll_callback_name)) ||
+            stream, callback_name, strlen(callback_name)) ||
         fprintf(
             stream,
             ",\"ready_to_callback_ns\":%llu,"
@@ -1018,6 +1049,14 @@ static void print_callback_event(
     char ready_flags[128];
     char resource[PATH_MAX];
     char callback_key[48];
+    char callback_label[256];
+    const char *callback_name = output->epoll_callback_name;
+
+    if (output->runtime_callbacks && event->callback_address &&
+        !cw_runtime_format_callback(
+            output->runtime_callbacks, event->callback_address,
+            callback_label, sizeof(callback_label)))
+        callback_name = callback_label;
 
     cw_epoll_format_events(
         event->ready_events, ready_flags, sizeof(ready_flags));
@@ -1054,7 +1093,7 @@ static void print_callback_event(
         output->libuv_mode ? "LIBUV CALLBACK" :
             (output->libevent_mode ?
                 "LIBEVENT CALLBACK" : "EPOLL CALLBACK"),
-        output->epoll_callback_name,
+        callback_name,
         event->pid, event->tid,
         (int)sizeof(event->comm), event->comm,
         event->epoll_fd,
@@ -1105,12 +1144,29 @@ int cw_epoll_handle_callback_event(
 {
     struct output_options *output = context;
     const struct cw_epoll_callback_event *event = data;
+    char callback_label[256];
+    const char *callback_name = output->epoll_callback_name;
 
     if (data_size < sizeof(*event) ||
-        !cw_capture_running(output->control))
+        !cw_capture_accepts_drain_events(output->control))
         return 0;
     cw_fd_cache_one(
         &output->fd_resources, output->target_pid, event->fd);
+    if (output->runtime_callbacks && event->callback_address &&
+        !cw_runtime_format_callback(
+            output->runtime_callbacks, event->callback_address,
+            callback_label, sizeof(callback_label)))
+        callback_name = callback_label;
+    if (output->runtime_report &&
+        cw_runtime_report_capture_epoll_callback(
+            output->runtime_report, event,
+            callback_name)) {
+        fprintf(stderr,
+                "failed to collect epoll callback HTML report data\n");
+        output->export_failed = true;
+        cw_capture_request_stop(output->control, CW_STOP_OUTPUT_ERROR);
+        return 0;
+    }
     if (output->epoll_output_mode == CW_EPOLL_OUTPUT_SUMMARY)
         return 0;
     if (output->json_output) {

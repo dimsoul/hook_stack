@@ -54,6 +54,7 @@ static __attribute__((noinline)) void cw_epoll_callback_match(
     struct cw_epoll_resource_stats *resource_stats;
     __u32 match_kind = 0;
     __s32 fd = -1;
+    __u64 callback_address = bpf_get_attach_cookie(ctx);
     __u64 now;
 
     if (!batch) {
@@ -102,11 +103,11 @@ static __attribute__((noinline)) void cw_epoll_callback_match(
         struct cw_libuv_poll_handle *handle =
             bpf_map_lookup_elem(
                 &libuv_poll_handles, &handle_key);
-        __u64 cookie = bpf_get_attach_cookie(ctx);
 
         if (handle && handle->active &&
             handle->fd >= 0 &&
-            (!cookie || handle->callback == cookie)) {
+            (!callback_address ||
+             handle->callback == callback_address)) {
             fd = handle->fd;
             dispatch_key.fd = fd;
             candidate = bpf_map_lookup_elem(
@@ -128,18 +129,18 @@ static __attribute__((noinline)) void cw_epoll_callback_match(
         struct cw_libevent_listener *listener =
             bpf_map_lookup_elem(
                 &libevent_listeners, &object_key);
-        __u64 cookie = bpf_get_attach_cookie(ctx);
 
         if (bufferevent && bufferevent->active &&
             bufferevent->fd >= 0 &&
-            (!cookie ||
-             bufferevent->read_callback == cookie ||
-             bufferevent->write_callback == cookie ||
-             bufferevent->event_callback == cookie)) {
+            (!callback_address ||
+             bufferevent->read_callback == callback_address ||
+             bufferevent->write_callback == callback_address ||
+             bufferevent->event_callback == callback_address)) {
             fd = bufferevent->fd;
         } else if (listener && listener->active &&
                    listener->fd >= 0 &&
-                   (!cookie || listener->callback == cookie)) {
+                   (!callback_address ||
+                    listener->callback == callback_address)) {
             fd = listener->fd;
         } else if (!bufferevent && !listener &&
                    callback_key <= 0x7fffffffULL) {
@@ -167,6 +168,7 @@ static __attribute__((noinline)) void cw_epoll_callback_match(
             now - candidate->item.ready_ns : 0;
     frame->event.data = candidate->item.data;
     frame->event.callback_key = callback_key;
+    frame->event.callback_address = callback_address;
     frame->event.pid = identity->pid;
     frame->event.tid = identity->tid;
     frame->event.global_pid = identity->global_pid;

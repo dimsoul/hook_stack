@@ -42,6 +42,8 @@ void cw_capture_prepare_child(const struct cw_capture_control *control);
 void cw_capture_request_stop(struct cw_capture_control *control,
                              enum cw_stop_reason reason);
 bool cw_capture_running(const struct cw_capture_control *control);
+bool cw_capture_accepts_drain_events(
+    const struct cw_capture_control *control);
 bool cw_capture_should_finalize(const struct cw_capture_control *control);
 bool cw_capture_cancelled(struct cw_capture_control *control);
 bool cw_capture_stopped_by_signal(const struct cw_capture_control *control);

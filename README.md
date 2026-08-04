@@ -181,11 +181,14 @@ Completed asynchronous chains can be exported as JSON Lines and as a self-contai
 sudo ./callweave -p PID \
   --config examples/thread-pool.yaml \
   --format json \
-  --output /tmp/callweave.jsonl \
-  --report /tmp/callweave.html
+  --output ./callweave.jsonl \
+  --report ./callweave.html
 ```
 
-Standalone epoll, libuv, libevent, and io_uring modes also provide structured JSON summaries. See [JSON and HTML output](docs/output/reports.md).
+Standalone epoll, libuv, libevent, and io_uring modes provide both structured
+JSON and the same tabbed HTML report surface. Runtime Sequence views retain
+only observed phases, such as SQE→CQE→callback or ready→callback. See
+[JSON and HTML output](docs/output/reports.md).
 
 ## Documentation
 

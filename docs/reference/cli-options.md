@@ -75,4 +75,5 @@ See [io_uring](../features/io-uring.md), [epoll](../features/epoll.md), [libuv](
 - `--max-events N`: stop after matching detailed events or chains.
 - `--format text|json`: select terminal text or JSON Lines.
 - `--output PATH`: write JSON Lines to a file.
-- `--report PATH`: write the asynchronous-chain HTML report.
+- `--report PATH`: write a self-contained HTML report for async, io_uring,
+  epoll, libuv, or libevent tracing.

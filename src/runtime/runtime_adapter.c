@@ -95,6 +95,9 @@ int cw_runtime_register_callback(
         &attachment->file_offset);
     if (error)
         goto failed;
+    (void)resolve_elf_offset_symbol(
+        attachment->path, attachment->file_offset,
+        attachment->symbol, sizeof(attachment->symbol));
     attachment->runtime_owned =
         registry->runtime_module &&
         !strcmp(attachment->path, registry->runtime_module);
@@ -146,6 +149,38 @@ failed:
         (unsigned long long)callback,
         (unsigned long long)object, fd, strerror(-error));
     return error;
+}
+
+int cw_runtime_format_callback(
+    const struct cw_runtime_callback_registry *registry,
+    uint64_t callback, char *label, size_t label_size)
+{
+    size_t index;
+
+    if (!registry || !callback || !label || !label_size)
+        return -EINVAL;
+    for (index = 0; index < registry->callback_count; index++) {
+        const struct cw_runtime_callback_attachment *attachment =
+            &registry->callbacks[index];
+
+        if (attachment->address != callback)
+            continue;
+        if (attachment->symbol[0]) {
+            if (snprintf(label, label_size, "%s", attachment->symbol) >=
+                (int)label_size)
+                return -ENAMETOOLONG;
+        } else if (snprintf(
+                       label, label_size, "callback@0x%llx",
+                       (unsigned long long)callback) >= (int)label_size) {
+            return -ENAMETOOLONG;
+        }
+        return 0;
+    }
+    if (snprintf(
+            label, label_size, "callback@0x%llx",
+            (unsigned long long)callback) >= (int)label_size)
+        return -ENAMETOOLONG;
+    return 0;
 }
 
 size_t cw_runtime_attached_callback_count(

@@ -19,6 +19,7 @@
 #include "callweave_internal.h"
 #include "io_uring.h"
 #include "io_uring_internal.h"
+#include "runtime_report.h"
 
 const char *cw_io_uring_opcode_name(uint8_t opcode)
 {
@@ -140,6 +141,15 @@ int cw_io_uring_handle_event(void *context, void *data, size_t data_size)
 
     cw_io_uring_cache_fd_resource(output, event->fd);
     operation = cw_io_uring_opcode_name(event->opcode);
+
+    if (output->runtime_report &&
+        cw_runtime_report_capture_io_uring(
+            output->runtime_report, event, operation)) {
+        fprintf(stderr, "failed to collect io_uring HTML report data\n");
+        output->export_failed = true;
+        cw_capture_request_stop(output->control, CW_STOP_OUTPUT_ERROR);
+        return 0;
+    }
 
     if (output->json_output) {
         FILE *stream = output->json_stream;
@@ -279,9 +289,11 @@ int cw_io_uring_handle_event(void *context, void *data, size_t data_size)
 
     output->emitted_events++;
     if (output->max_events &&
-        output->emitted_events >= output->max_events)
+        output->emitted_events >= output->max_events) {
         cw_capture_request_stop(
             output->control, CW_STOP_MAX_EVENTS);
+        return 1;
+    }
     return 0;
 }
 
@@ -293,9 +305,21 @@ int cw_io_uring_handle_callback_event(
     const char *operation;
 
     if (data_size < sizeof(*event) ||
-        !cw_capture_running(output->control))
+        !cw_capture_accepts_drain_events(output->control))
         return 0;
     operation = cw_io_uring_opcode_name(event->opcode);
+    if (output->runtime_report &&
+        cw_runtime_report_capture_io_uring_callback(
+            output->runtime_report, event,
+            operation,
+            output->io_uring_callback_name,
+            cw_capture_running(output->control))) {
+        fprintf(stderr,
+                "failed to collect io_uring callback HTML report data\n");
+        output->export_failed = true;
+        cw_capture_request_stop(output->control, CW_STOP_OUTPUT_ERROR);
+        return 0;
+    }
     if (output->json_output) {
         FILE *stream = output->json_stream;
         uint64_t realtime_ns =
@@ -345,6 +369,10 @@ int cw_io_uring_handle_callback_event(
         }
         return 0;
     }
+
+    /* Final drain is for report correlation, not another verbose pass. */
+    if (!cw_capture_running(output->control))
+        return 0;
 
     print_event_time(event->timestamp_ns);
     printf("IO_URING CQE -> callback user_data=0x%016llx "

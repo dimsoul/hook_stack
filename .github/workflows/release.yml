@@ -98,6 +98,7 @@ jobs:
         run: |
           ./callweave --check-config examples/thread-pool.yaml
           ./callweave --check-config examples/complex-multi-hop.yaml
+          ./test/trace_report_test "$RUNNER_TEMP/callweave-report.html"
           timeout 15s ./test/trace_epoll_test 4
           timeout 15s ./test/trace_libuv_test 1
           timeout 15s ./test/trace_libevent_test \

@@ -338,7 +338,7 @@ JSON Lines output contains `epoll_wait`, `epoll_dispatch`, and, when enabled,
 
 ```sh
 sudo ./callweave -p PID --epoll --verbose --format json \
-  --output /tmp/callweave-epoll.jsonl
+  --output ./callweave-epoll.jsonl
 ```
 
 Without `--verbose`, `--live`, or custom thresholds, JSON mode writes only the

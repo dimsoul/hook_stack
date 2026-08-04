@@ -138,5 +138,14 @@ blocked-time attribution visible. It is also usable through `--exec`:
 
 ```sh
 sudo ./callweave --libuv --duration 12 \
+  --report ./callweave-libuv.html \
   --exec ./test/trace_libuv_test -- 20
 ```
+
+The HTML Sequence view uses lifecycle-role lanes for epoll readiness, the
+libuv event loop, and the automatically discovered callback. It distinguishes
+time blocked in `epoll_wait*`, ready-to-callback dispatch delay, and callback
+execution even though the event loop and callback normally share one TID. The
+callback lane combines the runtime role and resolved ELF symbol, such as
+`libuv_callback (poll_callback)`. Stripped or otherwise unnamed callbacks use
+`libuv_callback (callback@0xADDRESS)` rather than an ambiguous generic label.

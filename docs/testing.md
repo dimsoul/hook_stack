@@ -275,7 +275,7 @@ Trace it with the supplied configuration:
 ```sh
 sudo ./callweave -p PID \
   --config examples/complex-multi-hop.yaml \
-  --report /tmp/callweave-complex.html
+  --report ./callweave-complex.html
 ```
 
 Or use the equivalent command without any target argument positions:
@@ -347,7 +347,7 @@ Generate a short visual report from the same test:
 
 ```sh
 sudo ./callweave -p PID --config examples/thread-pool.yaml \
-  --max-events 20 --report /tmp/callweave-report.html
+  --max-events 20 --report ./callweave-report.html
 ```
 
 Exact frames vary with the compiler, libc, optimization settings, and kernel

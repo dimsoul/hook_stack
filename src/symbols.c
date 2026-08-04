@@ -322,6 +322,91 @@ out:
     return result;
 }
 
+int resolve_elf_offset_symbol(const char *path, uint64_t file_offset,
+                              char *symbol_name, size_t symbol_size)
+{
+    Elf_Scn *section = NULL;
+    Elf *elf = NULL;
+    int file_descriptor = -1;
+    int error = -ENOENT;
+
+    if (!path || !symbol_name || !symbol_size)
+        return -EINVAL;
+    symbol_name[0] = '\0';
+    if (elf_version(EV_CURRENT) == EV_NONE)
+        return -ENOTSUP;
+    file_descriptor = open(path, O_RDONLY | O_CLOEXEC);
+    if (file_descriptor < 0)
+        return -errno;
+    elf = elf_begin(file_descriptor, ELF_C_READ, NULL);
+    if (!elf) {
+        error = -ENOEXEC;
+        goto out;
+    }
+    while ((section = elf_nextscn(elf, section)) != NULL) {
+        GElf_Shdr section_header;
+        Elf_Data *data = NULL;
+
+        if (!gelf_getshdr(section, &section_header) ||
+            (section_header.sh_type != SHT_SYMTAB &&
+             section_header.sh_type != SHT_DYNSYM) ||
+            !section_header.sh_entsize)
+            continue;
+        while ((data = elf_getdata(section, data)) != NULL) {
+            size_t symbol_count =
+                data->d_size / section_header.sh_entsize;
+            size_t index;
+
+            for (index = 0; index < symbol_count; index++) {
+                struct elf_symbol_info info = {0};
+                GElf_Sym elf_symbol;
+                const char *name;
+                unsigned int type;
+                bool contains;
+
+                if (!gelf_getsym(data, (int)index, &elf_symbol) ||
+                    elf_symbol.st_shndx == SHN_UNDEF)
+                    continue;
+                type = GELF_ST_TYPE(elf_symbol.st_info);
+                if (type != STT_FUNC
+#ifdef STT_GNU_IFUNC
+                    && type != STT_GNU_IFUNC
+#endif
+                )
+                    continue;
+                info.value = elf_symbol.st_value;
+                symbol_file_offset(elf, info.value, &info);
+                if (!info.has_file_offset)
+                    continue;
+                contains = file_offset == info.file_offset ||
+                    (elf_symbol.st_size &&
+                     file_offset > info.file_offset &&
+                     file_offset - info.file_offset < elf_symbol.st_size);
+                if (!contains)
+                    continue;
+                name = elf_strptr(
+                    elf, section_header.sh_link, elf_symbol.st_name);
+                if (!name || !name[0])
+                    continue;
+                if (snprintf(symbol_name, symbol_size, "%s", name) >=
+                    (int)symbol_size) {
+                    error = -ENAMETOOLONG;
+                    goto out;
+                }
+                error = 0;
+                goto out;
+            }
+        }
+    }
+
+out:
+    if (elf)
+        elf_end(elf);
+    if (file_descriptor >= 0)
+        close(file_descriptor);
+    return error;
+}
+
 int resolve_process_symbol_module(pid_t pid, const char *symbol_name,
                                   char *path, size_t path_size)
 {

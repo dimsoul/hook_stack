@@ -118,6 +118,7 @@ jobs:
           set -o pipefail
           smoke_log="$RUNNER_TEMP/callweave-smoke-tests.log"
           if ! {
+            ./test/trace_report_test "$RUNNER_TEMP/callweave-report.html"
             timeout 15s ./test/trace_epoll_test 4
             timeout 15s ./test/trace_libuv_test 1
             timeout 15s ./test/trace_libevent_test \

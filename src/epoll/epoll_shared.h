@@ -368,6 +368,7 @@ struct cw_epoll_callback_event {
     __u64 futex_wait_ns;
     __u64 data;
     __u64 callback_key;
+    __u64 callback_address;
     __u32 pid;
     __u32 tid;
     __u32 global_pid;

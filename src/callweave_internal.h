@@ -64,6 +64,9 @@ struct map_list {
     size_t capacity;
 };
 
+struct cw_runtime_report;
+struct cw_runtime_callback_registry;
+
 enum cw_epoll_output_mode {
     CW_EPOLL_OUTPUT_SUMMARY = 0,
     CW_EPOLL_OUTPUT_LIVE,
@@ -112,6 +115,7 @@ struct output_options {
     int libevent_counters_map_fd;
     uint64_t libevent_fallback_tokens;
     const char *epoll_callback_name;
+    const struct cw_runtime_callback_registry *runtime_callbacks;
     uint32_t epoll_callback_key_arg;
     uint32_t epoll_callback_match;
     const char *io_uring_callback_name;
@@ -129,6 +133,7 @@ struct output_options {
     bool json_output;
     FILE *json_stream;
     FILE *report_stream;
+    struct cw_runtime_report *runtime_report;
     bool report_first;
     bool export_failed;
     bool io_uring_mode;

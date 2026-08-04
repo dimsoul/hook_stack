@@ -10,6 +10,12 @@
 
 #define CW_REPORT_MAX_HOPS 8
 
+enum cw_report_work_kind {
+    CW_REPORT_WORK_SCHEDULER = 0,
+    CW_REPORT_WORK_IN_FLIGHT,
+    CW_REPORT_WORK_IO,
+};
+
 struct cw_report_hop {
     uint32_t index;
     uint32_t pid;
@@ -25,6 +31,7 @@ struct cw_report_hop {
     uint64_t offcpu_ns;
     uint64_t blocked_ns;
     uint64_t runqueue_ns;
+    uint32_t work_kind;
     uint32_t wait_kind;
     uint32_t wait_operation;
     uint64_t wait_address;
@@ -36,6 +43,8 @@ struct cw_report_hop {
 };
 
 struct cw_report_chain {
+    const char *kind;
+    const char *name;
     uint64_t timestamp_ms;
     uint32_t pid;
     uint32_t tid;
@@ -79,6 +88,7 @@ int cw_write_queue_diagnostics_json(
     FILE *stream, const struct cw_queue_diagnostic *diagnostics,
     size_t count);
 int cw_html_report_begin(FILE *stream);
+int cw_html_report_begin_mode(FILE *stream, const char *mode);
 int cw_html_report_write(FILE *stream, const struct cw_report_chain *chain,
                          bool *first);
 int cw_html_report_end(FILE *stream,

@@ -15,6 +15,7 @@ struct cw_runtime_callback_attachment {
     uint64_t address;
     uint64_t file_offset;
     char path[PATH_MAX];
+    char symbol[256];
     struct bpf_link *entry;
     struct bpf_link *return_link;
     bool runtime_owned;
@@ -44,6 +45,9 @@ void cw_runtime_callback_registry_init(
 int cw_runtime_register_callback(
     struct cw_runtime_callback_registry *registry,
     uint64_t callback, uint64_t object, int fd);
+int cw_runtime_format_callback(
+    const struct cw_runtime_callback_registry *registry,
+    uint64_t callback, char *label, size_t label_size);
 size_t cw_runtime_attached_callback_count(
     const struct cw_runtime_callback_registry *registry);
 size_t cw_runtime_user_callback_count(
