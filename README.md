@@ -7,6 +7,10 @@
 
 `callweave` is a no-instrumentation asynchronous latency debugger for native Linux applications. It uses eBPF and uprobes to connect selected user-space functions, thread handoffs, scheduler delays, epoll readiness, io_uring completions, and runtime callbacks into evidence-backed causal paths.
 
+![A three-hop asynchronous request traced across four native threads](docs/images/complex-sequence.png)
+
+_A three-hop request across four native threads, with queue delay and execution time preserved on one causal timeline._
+
 It is designed to answer questions such as:
 
 - Who submitted this work?
@@ -189,6 +193,14 @@ Standalone epoll, libuv, libevent, and io_uring modes provide both structured
 JSON and the same tabbed HTML report surface. Runtime Sequence views retain
 only observed phases, such as SQE→CQE→callback or ready→callback. See
 [JSON and HTML output](docs/output/reports.md).
+
+### io_uring request lifecycle
+
+![An io_uring request correlated from SQE submission through CQE completion to its application callback](docs/images/io-uring-sequence.png)
+
+### libevent callback lifecycle
+
+![A libevent ready event correlated with its bufferevent callback and execution time](docs/images/libevent-sequence.png)
 
 ## Documentation
 
