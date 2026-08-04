@@ -85,6 +85,7 @@ jobs:
 
       - name: Build all targets
         run: |
+          set -o pipefail
           make clean
           build_log="$RUNNER_TEMP/callweave-build.log"
           if ! make 2>&1 | tee "$build_log"; then
@@ -98,6 +99,7 @@ jobs:
 
       - name: Validate example configurations
         run: |
+          set -o pipefail
           validation_log="$RUNNER_TEMP/callweave-config-validation.log"
           if ! {
             ./callweave --check-config examples/thread-pool.yaml
@@ -113,6 +115,7 @@ jobs:
 
       - name: Run userspace smoke tests
         run: |
+          set -o pipefail
           smoke_log="$RUNNER_TEMP/callweave-smoke-tests.log"
           if ! {
             timeout 15s ./test/trace_epoll_test 4
