@@ -18,13 +18,30 @@ concurrency:
 
 jobs:
   build-and-smoke-test:
-    name: Build and smoke test (Ubuntu 24.04)
-    runs-on: ubuntu-24.04
+    name: Build and smoke test (${{ matrix.architecture }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            runner: ubuntu-24.04
+            machine: x86_64
+            bpftool_sha256: 68862a7038a269e1d4af5fed53d2b4d763f1cd82a96caa49b76596453bae0c3e
+          - architecture: arm64
+            runner: ubuntu-24.04-arm
+            machine: aarch64
+            bpftool_sha256: 99a6dcc2e0e35d5dbb4b79ebe6c83670317d82e9139f2eb23d3e69fc032139aa
 
     steps:
       - name: Check out source
         uses: actions/checkout@v5
+
+      - name: Verify runner architecture
+        env:
+          EXPECTED_MACHINE: ${{ matrix.machine }}
+        run: test "$(uname -m)" = "$EXPECTED_MACHINE"
 
       - name: Install build dependencies
         run: |
@@ -46,13 +63,14 @@ jobs:
       - name: Install bpftool
         env:
           BPFTOOL_VERSION: v7.4.0
-          BPFTOOL_SHA256: 68862a7038a269e1d4af5fed53d2b4d763f1cd82a96caa49b76596453bae0c3e
+          BPFTOOL_ARCH: ${{ matrix.architecture }}
+          BPFTOOL_SHA256: ${{ matrix.bpftool_sha256 }}
         run: |
           bpftool_archive="$RUNNER_TEMP/bpftool.tar.gz"
           bpftool_dir="$RUNNER_TEMP/bpftool"
           curl --fail --location --silent --show-error \
             --output "$bpftool_archive" \
-            "https://github.com/libbpf/bpftool/releases/download/$BPFTOOL_VERSION/bpftool-$BPFTOOL_VERSION-amd64.tar.gz"
+            "https://github.com/libbpf/bpftool/releases/download/$BPFTOOL_VERSION/bpftool-$BPFTOOL_VERSION-$BPFTOOL_ARCH.tar.gz"
           echo "$BPFTOOL_SHA256  $bpftool_archive" | sha256sum --check
           mkdir --parents "$bpftool_dir"
           tar --extract --gzip --file "$bpftool_archive" --directory "$bpftool_dir"
