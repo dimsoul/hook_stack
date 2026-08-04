@@ -201,6 +201,7 @@ Start with the [documentation index](docs/README.md).
 - [libevent adapter](docs/runtimes/libevent.md)
 - [Evidence levels](docs/reference/evidence-levels.md)
 - [Testing guide](docs/testing.md)
+- [Release guide](docs/releasing.md)
 - [Troubleshooting](docs/troubleshooting/common-issues.md)
 - [Architecture](docs/architecture.md)
 

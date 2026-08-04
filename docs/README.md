@@ -8,6 +8,7 @@
 
 - [Getting started](getting-started.md): dependencies, build, and source layout.
 - [Testing guide](testing.md): commands for the bundled examples and failure scenarios.
+- [Release guide](releasing.md): version tags, automated multi-architecture packaging, and checksums.
 - [CLI reference](reference/cli-options.md): command forms, output modes, and option groups.
 - [Troubleshooting](troubleshooting/common-issues.md): common attachment, symbol, permission, and event-loss problems.
 

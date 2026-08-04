@@ -1,0 +1,180 @@
+# SPDX-License-Identifier: MIT
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build release (${{ matrix.architecture }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            runner: ubuntu-24.04
+            machine: x86_64
+            bpftool_sha256: 68862a7038a269e1d4af5fed53d2b4d763f1cd82a96caa49b76596453bae0c3e
+          - architecture: arm64
+            runner: ubuntu-24.04-arm
+            machine: aarch64
+            bpftool_sha256: 99a6dcc2e0e35d5dbb4b79ebe6c83670317d82e9139f2eb23d3e69fc032139aa
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v5
+
+      - name: Validate release tag and runner
+        env:
+          EXPECTED_MACHINE: ${{ matrix.machine }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+          test "$(uname -m)" = "$EXPECTED_MACHINE"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            binutils \
+            build-essential \
+            ca-certificates \
+            clang \
+            curl \
+            libbpf-dev \
+            libelf-dev \
+            libevent-dev \
+            libuv1-dev \
+            llvm \
+            pkg-config \
+            zlib1g-dev
+
+      - name: Install bpftool
+        env:
+          BPFTOOL_VERSION: v7.4.0
+          BPFTOOL_ARCH: ${{ matrix.architecture }}
+          BPFTOOL_SHA256: ${{ matrix.bpftool_sha256 }}
+        run: |
+          bpftool_archive="$RUNNER_TEMP/bpftool.tar.gz"
+          bpftool_dir="$RUNNER_TEMP/bpftool"
+          curl --fail --location --silent --show-error \
+            --output "$bpftool_archive" \
+            "https://github.com/libbpf/bpftool/releases/download/$BPFTOOL_VERSION/bpftool-$BPFTOOL_VERSION-$BPFTOOL_ARCH.tar.gz"
+          echo "$BPFTOOL_SHA256  $bpftool_archive" | sha256sum --check
+          mkdir --parents "$bpftool_dir"
+          tar --extract --gzip --file "$bpftool_archive" --directory "$bpftool_dir"
+          bpftool_path="$bpftool_dir/bpftool"
+          chmod 0755 "$bpftool_path"
+          test -x "$bpftool_path"
+          echo "BPFTOOL=$bpftool_path" >> "$GITHUB_ENV"
+          "$bpftool_path" version
+
+      - name: Check runner BTF
+        run: test -r /sys/kernel/btf/vmlinux
+
+      - name: Build all targets
+        run: |
+          make clean
+          make
+
+      - name: Validate release build
+        run: |
+          ./callweave --check-config examples/thread-pool.yaml
+          ./callweave --check-config examples/complex-multi-hop.yaml
+          timeout 15s ./test/trace_epoll_test 4
+          timeout 15s ./test/trace_libuv_test 1
+          timeout 15s ./test/trace_libevent_test \
+            --startup-delay 0 \
+            --iterations 8 \
+            --lock-contention
+
+      - name: Package release archive
+        env:
+          RELEASE_ARCH: ${{ matrix.architecture }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          package_name="callweave-$RELEASE_TAG-linux-$RELEASE_ARCH"
+          package_dir="$RUNNER_TEMP/$package_name"
+          archive_dir="$GITHUB_WORKSPACE/dist"
+
+          mkdir --parents "$package_dir" "$archive_dir"
+          install -m 0755 callweave "$package_dir/callweave"
+          strip --strip-unneeded "$package_dir/callweave"
+          install -m 0644 README.md LICENSE "$package_dir/"
+          cp --archive LICENSES docs examples "$package_dir/"
+          printf '%s\n' "$RELEASE_TAG" > "$package_dir/VERSION"
+
+          "$package_dir/callweave" \
+            --check-config "$package_dir/examples/thread-pool.yaml"
+          tar --create --gzip \
+            --file "$archive_dir/$package_name.tar.gz" \
+            --directory "$RUNNER_TEMP" \
+            "$package_name"
+          tar --list --gzip \
+            --file "$archive_dir/$package_name.tar.gz"
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: callweave-release-${{ matrix.architecture }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: callweave-release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd release-assets
+          mapfile -t archives < <(find . -maxdepth 1 -type f -name '*.tar.gz' -printf '%f\n' | sort)
+          test "${#archives[@]}" -eq 2
+          sha256sum "${archives[@]}" > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          mapfile -t assets < <(find release-assets -maxdepth 1 -type f -printf '%p\n' | sort)
+          test "${#assets[@]}" -eq 3
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" \
+              --clobber \
+              --repo "$GITHUB_REPOSITORY"
+          else
+            release_options=(
+              --generate-notes
+              --title "Callweave $RELEASE_TAG"
+              --verify-tag
+              --repo "$GITHUB_REPOSITORY"
+            )
+            if [[ "$RELEASE_TAG" == *-* ]]; then
+              release_options+=(--prerelease)
+            fi
+            gh release create "$RELEASE_TAG" "${assets[@]}" \
+              "${release_options[@]}"
+          fi
