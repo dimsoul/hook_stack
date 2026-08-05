@@ -14,6 +14,7 @@
 
 #include "core/capture_control.h"
 #include "core/fd_resources.h"
+#include "async/async_lifecycle.h"
 #include "epoll/epoll_shared.h"
 #include "io_uring/io_uring_shared.h"
 
@@ -26,6 +27,8 @@
 struct async_hop_config {
     char *source;
     uint32_t source_arg;
+    bool source_exit;
+    uint32_t handoff_kind;
     char *target;
     uint32_t target_arg;
 };

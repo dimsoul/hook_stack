@@ -226,6 +226,8 @@ static const char *wake_action_name(uint32_t action)
         return "timerfd_arm";
     case CW_EPOLL_WAKE_ACTION_SIGNAL_SEND:
         return "signal_send";
+    case CW_EPOLL_WAKE_ACTION_SOCKET_WRITE:
+        return "send";
     default:
         return "wake source";
     }
@@ -542,18 +544,31 @@ int cw_runtime_report_capture_epoll_callback(
     format_callback_label(
         report, callback_name, callback_label, sizeof(callback_label));
     if (event->wake.action &&
-        (event->wake.flags & CW_EPOLL_WAKE_LATENCY_VALID) &&
-        record->chain.hop_count) {
-        struct cw_report_hop *wake = &record->chain.hops[0];
+        (event->wake.flags & CW_EPOLL_WAKE_LATENCY_VALID)) {
+        struct cw_report_hop *wake;
+        char ready_label[CW_RUNTIME_LABEL_SIZE];
+
+        snprintf(ready_label, sizeof(ready_label),
+                 "ready fd=%d", event->fd);
+        if (record->chain.hop_count) {
+            wake = &record->chain.hops[0];
+        } else {
+            wake = add_hop(
+                record, wake_action_name(event->wake.action),
+                ready_label);
+            if (!wake)
+                return -1;
+        }
 
         snprintf(record->source[0], sizeof(record->source[0]), "%s",
                  wake_action_name(event->wake.action));
         snprintf(record->target[0], sizeof(record->target[0]),
-                 "ready fd=%d", event->fd);
+                 "%s", ready_label);
         wake->pid = event->wake.source_pid;
         wake->tid = event->wake.source_tid;
         wake->target_tid = event->tid;
         copy_comm(wake->comm, event->wake.comm);
+        wake->key = event->data;
         wake->queue_ns = event->wake.latency_ns;
         wake->work_ns = 0;
     }

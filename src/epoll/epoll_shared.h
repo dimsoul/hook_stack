@@ -63,6 +63,7 @@ enum cw_epoll_wake_kind {
     CW_EPOLL_WAKE_EVENTFD,
     CW_EPOLL_WAKE_TIMERFD,
     CW_EPOLL_WAKE_SIGNALFD,
+    CW_EPOLL_WAKE_SOCKETPAIR,
 };
 
 enum cw_epoll_wake_action {
@@ -70,6 +71,7 @@ enum cw_epoll_wake_action {
     CW_EPOLL_WAKE_ACTION_EVENTFD_WRITE,
     CW_EPOLL_WAKE_ACTION_TIMERFD_ARM,
     CW_EPOLL_WAKE_ACTION_SIGNAL_SEND,
+    CW_EPOLL_WAKE_ACTION_SOCKET_WRITE,
 };
 
 enum cw_epoll_wake_flags {
@@ -116,9 +118,18 @@ struct cw_epoll_futex_wait {
 
 struct cw_epoll_fd_metadata {
     __u64 signal_mask;
+    __u64 socket_pair_id;
     __u32 kind;
     __s32 clock_id;
+    __u32 socket_endpoint;
+    __u32 reserved;
     struct cw_epoll_wake_source timer_source;
+};
+
+struct cw_epoll_socket_key {
+    __u64 pair_id;
+    __u32 pid;
+    __u32 endpoint;
 };
 
 struct cw_epoll_ready {
@@ -175,6 +186,7 @@ struct cw_epoll_counters {
     __u64 eventfd_ready;
     __u64 timerfd_ready;
     __u64 signalfd_ready;
+    __u64 socketpair_ready;
     __u64 callback_matched;
     __u64 callback_fd_matched;
     __u64 callback_data_matched;

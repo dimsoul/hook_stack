@@ -1,0 +1,23 @@
+# Reproduce and diagnose a delayed uv_queue_work after-work callback.
+
+target:
+  function: after_work_cb
+
+hops:
+  - source: submit_work
+    source_arg: 1
+    target: work_cb
+    target_arg: 1
+
+  - source: work_cb
+    source_arg: 1
+    source_phase: exit
+    handoff: libuv
+    target: after_work_cb
+    target_arg: 1
+
+filters:
+  min_total_ms: 10
+  max_events: 12
+  duration: 15
+  diagnostic_interval_ms: 1000

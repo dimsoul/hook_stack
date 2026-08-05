@@ -79,12 +79,18 @@ the Waterfall work segment show aggregate composition; they do not claim that
 those states occurred in that exact visual order.
 
 epoll, libuv, and libevent reports use an event-loop-specific Sequence view
-instead of the cross-thread layout. Conceptual role lanes separate epoll
-readiness, the event loop, and callback or I/O execution even when they run on
-the same TID. A gray phase is time blocked waiting for readiness, violet is an
-observed wake-to-ready or ready-to-dispatch delay, and blue is callback or I/O
+instead of the generic cross-thread layout. Only observed threads receive
+lanes: epoll waiting, readiness dispatch, and callback or I/O execution remain
+vertical phases on the event-loop thread. A producer lane appears only when a
+real cross-thread wake was observed. A gray phase is time blocked waiting for
+readiness, violet is an observed wake-to-ready or ready-to-function delay, and blue is callback or I/O
 execution. This prevents an ordinary same-thread event-loop cycle from being
 misrepresented as a pair of thread handoffs.
+
+For libevent, the violet phase is explicitly labeled `pre-callback dispatch`
+and the selected-delay card is named `Selected pre-callback`. Event-loop lane
+headers and phase labels retain the resolved callback function name; hovering
+SVG text reveals the complete value when a constrained layout abbreviates it.
 
 
 ## JSON Lines

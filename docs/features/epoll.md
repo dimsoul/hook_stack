@@ -36,7 +36,8 @@ the suspended Callweave child-launcher's own file descriptors and epoll calls.
 
 The tracer observes `epoll_wait`, `epoll_pwait`, and `epoll_pwait2`, successful
 `epoll_ctl` changes, the common read/write/socket I/O syscalls performed after
-a ready return, and the producers of eventfd, timerfd, and signalfd readiness.
+a ready return, and the producers of eventfd, timerfd, signalfd, and
+in-process `socketpair` readiness.
 Each detailed wait record contains the event-loop thread, epoll FD, wait
 duration, return value, ready-event flags, application-defined `event.data`,
 and the corresponding monitored FD when it can be recovered. A dispatch
@@ -63,8 +64,9 @@ waits omitted by the detail threshold. It reports:
 - interest and observed event masks;
 - socket endpoints, Unix sockets, eventfd, timerfd, pipes, and file paths when
   `/proc/PID` exposes them;
-- eventfd writers, timerfd arms, and signalfd signal senders, including their
-  source thread, user stack, source-to-ready latency, and attribution coverage;
+- eventfd writers, timerfd arms, signalfd signal senders, and in-process
+  socketpair writers, including their source thread, user stack,
+  source-to-ready latency, and attribution coverage;
 - when configured, callback matches, ready-to-callback delay, execution time,
   on-CPU/blocked/run-queue attribution, and slowest callback stacks.
 
@@ -189,7 +191,7 @@ work time, and average on-CPU, blocked, and run-queue time. The callback record
 and summary table show the original callback key and its resolved FD, for
 example `6 -> fd=6` in `fd` mode or
 `0x00007fff12345678 -> fd=6` in `data` mode. The callback record also carries
-the eventfd/timerfd/signalfd wake source when one is available.
+the eventfd/timerfd/signalfd/socketpair wake source when one is available.
 
 When a matched callback blocks in a standard futex wait, Callweave also
 records the futex address, operation, total wait time, longest wait, candidate
@@ -248,7 +250,7 @@ option is required. It extends the normal ready-to-handler path in the opposite
 direction:
 
 ```text
-eventfd write / timerfd arm / signal send
+eventfd write / timerfd arm / signal send / socketpair write
     -> monitored FD becomes ready
     -> epoll returns it
     -> event-loop thread performs I/O
@@ -275,6 +277,15 @@ originated in user space. Under a burst of different pending signals, this is a
 conservative latest-source association, not a reconstruction of the kernel's
 entire pending-signal queue.
 
+For a Unix socket created with `socketpair()` after capture starts, Callweave
+records the relationship between its two endpoints. A successful `write`,
+`writev`, `send`, `sendmsg`, or `sendmmsg` on one endpoint is associated with
+the next observed readiness of the peer endpoint. This exposes the real
+producer TID and its user stack in same-process event-loop and runtime reports.
+The association is intentionally limited to in-process socketpairs; it does
+not guess peer threads for TCP sockets, accepted sockets, inherited
+socketpairs, or socketpairs created before attachment.
+
 The `[9] Wake-source attribution` summary reports READY, MATCHED, source
 operation count, average/maximum source-to-ready latency, and the latest source
 stack for each special FD. `MATCHED / READY` is the attribution coverage; a
@@ -284,10 +295,12 @@ user-space producer stack.
 
 Current special-FD metadata is restored from `/proc/PID/fdinfo` during late
 attachment, so Callweave can still identify eventfd, timerfd, and signalfd
-resources that already exist. It cannot reconstruct producer operations or
-stacks that completed before BPF attachment.
+resources that already exist. Socketpair peer relationships are only learned
+when their creation syscall is observed, so use `--exec` for complete startup
+coverage. No mode can reconstruct producer operations or stacks that completed
+before BPF attachment.
 
-The bundled test exercises all three sources:
+The bundled test exercises all four supported source kinds:
 
 ```sh
 sudo ./callweave --epoll --duration 10 \

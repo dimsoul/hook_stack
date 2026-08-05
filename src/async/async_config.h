@@ -14,7 +14,7 @@ struct cw_async_config {
     __u32 source_arg;
     __u32 target_arg;
     __u32 final_hop_id;
-    __u32 reserved;
+    __u32 lifecycle_enabled;
 };
 
 #endif

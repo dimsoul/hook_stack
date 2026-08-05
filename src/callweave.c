@@ -50,6 +50,9 @@
 #include "runtime_report.h"
 #include "symbols.h"
 
+#define ASYNC_SOURCE_CLOSES_TARGET (1ULL << 63)
+#define ASYNC_SOURCE_LIBUV_HANDOFF (1ULL << 62)
+
 _Static_assert(sizeof(struct io_uring_event) == 160,
                "userspace and BPF io_uring event sizes differ");
 _Static_assert(sizeof(struct io_uring_aggregate_key) == 24,
@@ -916,7 +919,7 @@ int main(int argc, char **argv)
     struct callweave_bpf *skeleton = NULL;
     struct ring_buffer *ring_buffer = NULL;
     struct async_hop_config async_hops[MAX_ASYNC_HOPS] = {0};
-    struct bpf_link *async_links[MAX_ASYNC_HOPS * 3] = {0};
+    struct bpf_link *async_links[MAX_ASYNC_HOPS * 4 + 2] = {0};
     struct cw_libuv_runtime libuv_runtime = {0};
     struct cw_libevent_runtime libevent_runtime = {0};
     char target_path[PATH_MAX] = {0};
@@ -924,6 +927,7 @@ int main(int argc, char **argv)
     char io_callback_path[PATH_MAX] = {0};
     char epoll_callback_path[PATH_MAX] = {0};
     char libuv_path[PATH_MAX] = {0};
+    char async_libuv_path[PATH_MAX] = {0};
     char libevent_path[PATH_MAX] = {0};
     const char *binary_argument = NULL;
     const char *module_name = NULL;
@@ -971,6 +975,7 @@ int main(int argc, char **argv)
     bool epoll_top_option_seen = false;
     bool epoll_output_option_seen = false;
     bool epoll_threshold_option_seen = false;
+    bool async_libuv_handoff = false;
     bool check_config = false;
     bool json_output = false;
     bool finalize_outputs = true;
@@ -1996,6 +2001,13 @@ int main(int argc, char **argv)
     output.final_target_name = function_name;
     output.discovery_target_arg = async_target_arg;
 
+    for (size_t index = 0; index < async_hop_count; index++) {
+        if (async_hops[index].handoff_kind == CW_ASYNC_HANDOFF_LIBUV) {
+            async_libuv_handoff = true;
+            break;
+        }
+    }
+
     if (module_name) {
         error = resolve_loaded_module(target_pid, module_name,
                                       target_path, sizeof(target_path));
@@ -2018,6 +2030,19 @@ int main(int argc, char **argv)
         return 2;
     }
     output.target_path = target_path;
+
+    if (async_libuv_handoff) {
+        error = resolve_process_symbol_module(
+            target_pid, "uv_async_send", async_libuv_path,
+            sizeof(async_libuv_path));
+        if (error) {
+            fprintf(stderr,
+                    "cannot find libuv uv_async_send in PID %d: %s; "
+                    "handoff: libuv requires a mapped libuv runtime\n",
+                    (int)target_pid, strerror(-error));
+            goto cleanup;
+        }
+    }
 
     if (async_hop_count) {
         const struct async_hop_config *last =
@@ -2099,6 +2124,8 @@ trace_target_ready:
     skeleton->rodata->cw_trace_cfg.attribution_enabled = output.show_attribution;
     skeleton->rodata->cw_async_cfg.enabled = output.show_async;
     skeleton->rodata->cw_async_cfg.discovery_enabled = output.show_discovery;
+    skeleton->rodata->cw_async_cfg.lifecycle_enabled =
+        async_libuv_handoff;
     skeleton->rodata->cw_io_uring_cfg.enabled = output.io_uring_mode;
     skeleton->rodata->cw_io_uring_cfg.callback_enabled =
         output.io_uring_callback_name != NULL;
@@ -2132,6 +2159,7 @@ trace_target_ready:
     skeleton->rodata->cw_epoll_cfg.timerfd_settime_syscall_nr = -1;
     skeleton->rodata->cw_epoll_cfg.signalfd_syscall_nr = -1;
     skeleton->rodata->cw_epoll_cfg.signalfd4_syscall_nr = -1;
+    skeleton->rodata->cw_epoll_cfg.socketpair_syscall_nr = -1;
 #ifdef SYS_epoll_wait
     skeleton->rodata->cw_epoll_cfg.wait_syscall_nr = SYS_epoll_wait;
 #endif
@@ -2163,6 +2191,9 @@ trace_target_ready:
 #endif
 #ifdef SYS_signalfd4
     skeleton->rodata->cw_epoll_cfg.signalfd4_syscall_nr = SYS_signalfd4;
+#endif
+#ifdef SYS_socketpair
+    skeleton->rodata->cw_epoll_cfg.socketpair_syscall_nr = SYS_socketpair;
 #endif
     configure_epoll_io_syscalls(
         &skeleton->rodata->cw_epoll_cfg);
@@ -2423,7 +2454,8 @@ trace_target_ready:
             goto cleanup;
         }
     }
-    if (!output.show_attribution && !output.epoll_mode) {
+    if (!output.show_attribution && !output.epoll_mode &&
+        !async_libuv_handoff) {
         error = bpf_program__set_autoload(
             skeleton->progs.trace_sched_switch, false);
         if (!error)
@@ -2494,6 +2526,19 @@ trace_target_ready:
         if (error) {
             fprintf(stderr,
                     "failed to disable multi-hop target programs: %s\n",
+                    strerror(-error));
+            goto cleanup;
+        }
+    }
+    if (!async_libuv_handoff) {
+        error = bpf_program__set_autoload(
+            skeleton->progs.trace_async_libuv_notify_entry, false);
+        if (!error)
+            error = bpf_program__set_autoload(
+                skeleton->progs.trace_async_libuv_notify_exit, false);
+        if (error) {
+            fprintf(stderr,
+                    "failed to disable async libuv lifecycle programs: %s\n",
                     strerror(-error));
             goto cleanup;
         }
@@ -2698,7 +2743,7 @@ trace_target_ready:
             "signal_generate");
         if (!output.epoll_started_target)
             cw_epoll_seed_existing(&output);
-    } else if (output.show_attribution) {
+    } else if (output.show_attribution || async_libuv_handoff) {
         error = attach_raw_tracepoint(
             skeleton->progs.trace_sched_switch,
             &skeleton->links.trace_sched_switch, "sched_switch");
@@ -2754,14 +2799,20 @@ trace_target_ready:
             uint64_t target_cookie =
                 ((uint64_t)(i + 1) << 32) |
                 async_hops[i].target_arg;
+            bool closed_by_exit_source =
+                async_hops[i + 1].source_exit &&
+                !strcmp(async_hops[i].target,
+                        async_hops[i + 1].source);
 
-            error = attach_named_uprobe(
-                skeleton->progs.trace_async_target_return,
-                &async_links[async_link_count], target_path,
-                async_hops[i].target, 0, true);
-            if (error)
-                goto cleanup;
-            async_link_count++;
+            if (!closed_by_exit_source) {
+                error = attach_named_uprobe(
+                    skeleton->progs.trace_async_target_return,
+                    &async_links[async_link_count], target_path,
+                    async_hops[i].target, 0, true);
+                if (error)
+                    goto cleanup;
+                async_link_count++;
+            }
             error = attach_named_uprobe(
                 skeleton->progs.trace_async_target,
                 &async_links[async_link_count], target_path,
@@ -2775,10 +2826,49 @@ trace_target_ready:
                 ((uint64_t)(i + 1) << 32) |
                 async_hops[i].source_arg;
 
+            if (async_hops[i].source_exit) {
+                if (i && !strcmp(async_hops[i - 1].target,
+                                 async_hops[i].source))
+                    source_cookie |= ASYNC_SOURCE_CLOSES_TARGET;
+                if (async_hops[i].handoff_kind ==
+                    CW_ASYNC_HANDOFF_LIBUV)
+                    source_cookie |= ASYNC_SOURCE_LIBUV_HANDOFF;
+                error = attach_named_uprobe(
+                    skeleton->progs.trace_async_exit_source_entry,
+                    &async_links[async_link_count], target_path,
+                    async_hops[i].source, source_cookie, false);
+                if (error)
+                    goto cleanup;
+                async_link_count++;
+                error = attach_named_uprobe(
+                    skeleton->progs.trace_async_exit_source_exit,
+                    &async_links[async_link_count], target_path,
+                    async_hops[i].source, source_cookie, true);
+                if (error)
+                    goto cleanup;
+                async_link_count++;
+            } else {
+                error = attach_named_uprobe(
+                    skeleton->progs.trace_async_source,
+                    &async_links[async_link_count], target_path,
+                    async_hops[i].source, source_cookie, false);
+                if (error)
+                    goto cleanup;
+                async_link_count++;
+            }
+        }
+        if (async_libuv_handoff) {
             error = attach_named_uprobe(
-                skeleton->progs.trace_async_source,
-                &async_links[async_link_count], target_path,
-                async_hops[i].source, source_cookie, false);
+                skeleton->progs.trace_async_libuv_notify_entry,
+                &async_links[async_link_count], async_libuv_path,
+                "uv_async_send", 0, false);
+            if (error)
+                goto cleanup;
+            async_link_count++;
+            error = attach_named_uprobe(
+                skeleton->progs.trace_async_libuv_notify_exit,
+                &async_links[async_link_count], async_libuv_path,
+                "uv_async_send", 0, true);
             if (error)
                 goto cleanup;
             async_link_count++;

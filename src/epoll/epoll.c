@@ -126,6 +126,8 @@ const char *cw_epoll_wake_kind_name(uint32_t kind)
         return "timerfd";
     case CW_EPOLL_WAKE_SIGNALFD:
         return "signalfd";
+    case CW_EPOLL_WAKE_SOCKETPAIR:
+        return "socketpair";
     default:
         return "none";
     }
@@ -140,6 +142,8 @@ const char *cw_epoll_wake_action_name(uint32_t action)
         return "arm";
     case CW_EPOLL_WAKE_ACTION_SIGNAL_SEND:
         return "signal";
+    case CW_EPOLL_WAKE_ACTION_SOCKET_WRITE:
+        return "send";
     default:
         return "none";
     }
@@ -738,6 +742,9 @@ static void print_wake_source(
     } else if (wake->action == CW_EPOLL_WAKE_ACTION_SIGNAL_SEND)
         printf(" signo=%u count=%llu",
                wake->signal_number,
+               (unsigned long long)wake->operations);
+    else if (wake->action == CW_EPOLL_WAKE_ACTION_SOCKET_WRITE)
+        printf(" sends=%llu",
                (unsigned long long)wake->operations);
     if (wake->flags & CW_EPOLL_WAKE_LATENCY_VALID)
         print_interval(

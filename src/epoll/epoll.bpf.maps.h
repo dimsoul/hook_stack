@@ -96,6 +96,8 @@ enum cw_epoll_wake_sys_action {
     CW_EPOLL_WAKE_SYS_CREATE_SIGNALFD,
     CW_EPOLL_WAKE_SYS_TIMERFD_SETTIME,
     CW_EPOLL_WAKE_SYS_EVENTFD_WRITE,
+    CW_EPOLL_WAKE_SYS_CREATE_SOCKETPAIR,
+    CW_EPOLL_WAKE_SYS_SOCKET_WRITE,
     CW_EPOLL_WAKE_SYS_CLOSE,
     CW_EPOLL_WAKE_SYS_DUP,
 };
@@ -103,12 +105,14 @@ enum cw_epoll_wake_sys_action {
 struct cw_epoll_wake_sys_state {
     struct cw_epoll_wake_source source;
     __u64 signal_mask;
+    __u64 user_address;
+    __u64 socket_pair_id;
     __u32 pid;
     __u32 action;
     __s32 fd;
     __s32 target_fd;
     __s32 clock_id;
-    __u32 reserved;
+    __u32 socket_endpoint;
 };
 
 struct {
@@ -232,6 +236,13 @@ struct {
     __type(key, struct cw_epoll_fd_key);
     __type(value, struct cw_epoll_wake_source);
 } epoll_wake_pending SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 32768);
+    __type(key, struct cw_epoll_socket_key);
+    __type(value, struct cw_epoll_wake_source);
+} epoll_socketpair_pending SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);

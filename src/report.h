@@ -25,8 +25,16 @@ struct cw_report_hop {
     char comm[17];
     const char *source;
     const char *target;
+    bool source_exit;
+    uint32_t handoff_kind;
+    uint32_t handoff_flags;
     uint64_t key;
     uint64_t queue_ns;
+    uint64_t publish_ns;
+    uint64_t notify_ns;
+    uint64_t loop_ns;
+    uint64_t poll_ns;
+    uint64_t dispatch_ns;
     uint64_t work_ns;
     uint64_t offcpu_ns;
     uint64_t blocked_ns;
@@ -61,6 +69,7 @@ struct cw_report_chain {
 struct cw_queue_diagnostic {
     uint32_t index;
     const char *source;
+    bool source_exit;
     const char *target;
     uint64_t submitted;
     uint64_t started;

@@ -37,6 +37,7 @@ static void copy_queue_diagnostic(
     destination->index = index;
     if (index < output->async_hop_count) {
         destination->source = output->async_hops[index].source;
+        destination->source_exit = output->async_hops[index].source_exit;
         destination->target = output->async_hops[index].target;
     } else {
         destination->source = output->async_source_name ?
@@ -185,11 +186,13 @@ bool print_queue_diagnostics(struct output_options *output,
             diagnostic->completed ?
                 diagnostic->work_total_ns / diagnostic->completed : 0);
         fprintf(stream,
-                "  hop %zu %s -> %s: "
+                "  hop %zu %s%s -> %s: "
                 "rate %.1f/%.1f/%.1f per s, "
                 "pending %llu (peak %llu), active %llu (peak %llu), "
                 "average queue %s, average work %s, workers %u, %s\n",
-                index, diagnostic->source, diagnostic->target,
+                index, diagnostic->source,
+                diagnostic->source_exit ? " completed" : " started",
+                diagnostic->target,
                 seconds ? submitted_delta / seconds : 0.0,
                 seconds ? started_delta / seconds : 0.0,
                 seconds ? completed_delta / seconds : 0.0,
@@ -383,6 +386,54 @@ static uint64_t event_realtime_milliseconds(uint64_t timestamp_ns)
     return event_realtime_nanoseconds(timestamp_ns) / 1000000ULL;
 }
 
+static bool calculate_libuv_handoff(
+    const struct async_hop_event *hop,
+    uint64_t *publish_ns, uint64_t *notify_ns,
+    uint64_t *loop_ns, uint64_t *poll_ns,
+    uint64_t *dispatch_ns)
+{
+    uint64_t notify_boundary_ns;
+    uint64_t target_entry_ns;
+
+    *publish_ns = 0;
+    *notify_ns = 0;
+    *loop_ns = 0;
+    *poll_ns = 0;
+    *dispatch_ns = 0;
+    if (hop->lifecycle_kind != CW_ASYNC_HANDOFF_LIBUV ||
+        !(hop->lifecycle_flags & CW_ASYNC_LIFECYCLE_NOTIFY_ENTRY) ||
+        hop->notify_entry_ns < hop->source_ns ||
+        UINT64_MAX - hop->source_ns < hop->queue_ns)
+        return false;
+    target_entry_ns = hop->source_ns + hop->queue_ns;
+    if (hop->notify_entry_ns > target_entry_ns)
+        return false;
+
+    *publish_ns = hop->notify_entry_ns - hop->source_ns;
+    notify_boundary_ns = hop->notify_entry_ns;
+    if ((hop->lifecycle_flags & CW_ASYNC_LIFECYCLE_NOTIFY_EXIT) &&
+        hop->notify_exit_ns >= hop->notify_entry_ns &&
+        hop->notify_exit_ns <= target_entry_ns) {
+        *notify_ns = hop->notify_exit_ns - hop->notify_entry_ns;
+        notify_boundary_ns = hop->notify_exit_ns;
+    }
+    if ((hop->lifecycle_flags & CW_ASYNC_LIFECYCLE_EPOLL_EXIT) &&
+        hop->epoll_exit_ns >= notify_boundary_ns &&
+        hop->epoll_exit_ns <= target_entry_ns) {
+        if (hop->epoll_enter_ns > notify_boundary_ns &&
+            hop->epoll_enter_ns <= hop->epoll_exit_ns) {
+            *loop_ns = hop->epoll_enter_ns - notify_boundary_ns;
+            *poll_ns = hop->epoll_exit_ns - hop->epoll_enter_ns;
+        } else {
+            *poll_ns = hop->epoll_exit_ns - notify_boundary_ns;
+        }
+        *dispatch_ns = target_entry_ns - hop->epoll_exit_ns;
+    } else {
+        *loop_ns = target_entry_ns - notify_boundary_ns;
+    }
+    return true;
+}
+
 static void copy_report_comm(char destination[17],
                              const char source[16])
 {
@@ -435,6 +486,8 @@ static void build_report_chain(const struct stack_trace_event *event,
                 output->async_hops[configured_hop].source;
             destination->target =
                 output->async_hops[configured_hop].target;
+            destination->source_exit =
+                output->async_hops[configured_hop].source_exit;
         } else {
             destination->source =
                 output->async_source_name ?
@@ -445,6 +498,13 @@ static void build_report_chain(const struct stack_trace_event *event,
         }
         destination->key = source->key;
         destination->queue_ns = source->queue_ns;
+        destination->handoff_kind = source->lifecycle_kind;
+        destination->handoff_flags = source->lifecycle_flags;
+        (void)calculate_libuv_handoff(
+            source, &destination->publish_ns,
+            &destination->notify_ns, &destination->loop_ns,
+            &destination->poll_ns,
+            &destination->dispatch_ns);
         destination->work_ns = source->target_ns;
         destination->offcpu_ns = source->offcpu_ns;
         destination->blocked_ns = source->blocked_ns;
@@ -625,10 +685,13 @@ int handle_event(void *context, void *data, size_t data_size)
                 source_name = output->async_hops[configured_hop].source;
                 target_name = output->async_hops[configured_hop].target;
             }
-            printf("  async hop %u %s -> %s PID %u/TID %u (%.*s) "
+            printf("  async hop %u %s%s -> %s PID %u/TID %u (%.*s) "
                    "key=0x%016llx target-arg=%u\n",
                    configured_hop,
                    source_name ? source_name : "source",
+                   configured_hop < output->async_hop_count &&
+                           output->async_hops[configured_hop].source_exit ?
+                       " completed" : " started",
                    target_name ? target_name : "target",
                    hop->pid, hop->tid,
                    (int)sizeof(hop->comm), hop->comm,
@@ -644,6 +707,38 @@ int handle_event(void *context, void *data, size_t data_size)
                 printf(" work=unavailable");
             }
             putchar('\n');
+            if (hop->lifecycle_kind == CW_ASYNC_HANDOFF_LIBUV) {
+                uint64_t publish_ns;
+                uint64_t notify_ns;
+                uint64_t loop_ns;
+                uint64_t poll_ns;
+                uint64_t dispatch_ns;
+
+                printf("    libuv handoff:");
+                if (calculate_libuv_handoff(
+                        hop, &publish_ns, &notify_ns,
+                        &loop_ns, &poll_ns, &dispatch_ns)) {
+                    print_interval("completion-publish", publish_ns);
+                    if (hop->lifecycle_flags &
+                        CW_ASYNC_LIFECYCLE_NOTIFY_EXIT)
+                        print_interval("uv_async_send", notify_ns);
+                    else
+                        printf(" uv_async_send=exit-unobserved");
+                    if (hop->lifecycle_flags &
+                        CW_ASYNC_LIFECYCLE_EPOLL_EXIT) {
+                        if (loop_ns)
+                            print_interval("loop-active/backlog", loop_ns);
+                        print_interval("epoll-wait/wakeup", poll_ns);
+                        print_interval("ready-to-callback", dispatch_ns);
+                    } else {
+                        print_interval("loop-active/backlog", loop_ns);
+                        printf(" (no epoll return observed)");
+                    }
+                } else {
+                    printf(" notification boundary unavailable");
+                }
+                putchar('\n');
+            }
             print_wait_resource(&hop->wait, output, "    ");
             if (hop->pid != hop->global_pid ||
                 hop->tid != hop->global_tid)

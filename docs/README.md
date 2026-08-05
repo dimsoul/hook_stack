@@ -27,6 +27,11 @@
 
 Runtime-specific behavior belongs under `docs/runtimes/`. A future adapter such as Boost.Asio should add one document here instead of extending the project README.
 
+## Case studies
+
+- [libuv: delayed `after_work_cb`](cases/libuv-work-callback-delay.md):
+  distinguish worker-pool queueing, worker execution, and event-loop delay.
+
 ## Output and interpretation
 
 - [JSON and HTML output](output/reports.md)

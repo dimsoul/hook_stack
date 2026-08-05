@@ -3,6 +3,7 @@
 #include "vmlinux.h"
 #include "core/core_config.h"
 #include "async/async_config.h"
+#include "async/async_lifecycle.h"
 #include "epoll/epoll_config.h"
 #include "epoll/epoll_shared.h"
 #include "libuv/libuv_shared.h"
@@ -19,6 +20,8 @@
 #define MAX_NESTED_CALLS 16
 #define ASYNC_HOP_ID_MASK 0xffffU
 #define ASYNC_TARGET_ARG_SHIFT 16
+#define ASYNC_SOURCE_CLOSES_TARGET (1ULL << 63)
+#define ASYNC_SOURCE_LIBUV_HANDOFF (1ULL << 62)
 #define FUTEX_CMD_MASK 0x7fU
 #define FUTEX_WAIT 0U
 #define FUTEX_WAKE 1U
@@ -62,11 +65,18 @@ struct async_hop_event {
     s32 stack_id;
     u32 reserved;
     u64 key;
+    u64 source_ns;
+    u64 notify_entry_ns;
+    u64 notify_exit_ns;
+    u64 epoll_enter_ns;
+    u64 epoll_exit_ns;
     u64 queue_ns;
     u64 target_ns;
     u64 offcpu_ns;
     u64 blocked_ns;
     u64 runqueue_ns;
+    u32 lifecycle_kind;
+    u32 lifecycle_flags;
     struct wait_resource wait;
 };
 
@@ -147,11 +157,17 @@ struct async_hop_context {
     u32 reserved;
     u64 key;
     u64 source_ns;
+    u64 notify_entry_ns;
+    u64 notify_exit_ns;
+    u64 epoll_enter_ns;
+    u64 epoll_exit_ns;
     u64 queue_ns;
     u64 target_ns;
     u64 offcpu_ns;
     u64 blocked_ns;
     u64 runqueue_ns;
+    u32 lifecycle_kind;
+    u32 lifecycle_flags;
     struct wait_resource wait;
 };
 
@@ -166,6 +182,29 @@ struct async_target_thread {
     u32 reserved;
     u64 offcpu_start_ns;
     u64 wakeup_ns;
+};
+
+struct async_exit_source_key {
+    u64 pid_tgid;
+    u32 hop_id;
+    u32 reserved;
+};
+
+struct async_exit_source_state {
+    u32 depth;
+    u32 reserved;
+    u64 values[MAX_NESTED_CALLS];
+};
+
+struct async_libuv_notify_state {
+    struct async_context_key context;
+    u32 hop_id;
+    u32 reserved;
+};
+
+struct async_epoll_observation {
+    u64 enter_ns;
+    u64 exit_ns;
 };
 
 struct async_hop_stats {
@@ -228,9 +267,9 @@ struct futex_waker {
     char comm[16];
 };
 
-_Static_assert(__builtin_offsetof(struct stack_trace_event, stack) == 1520,
+_Static_assert(__builtin_offsetof(struct stack_trace_event, stack) == 1904,
                "unexpected BPF event layout");
-_Static_assert(sizeof(struct stack_trace_event) == 2544,
+_Static_assert(sizeof(struct stack_trace_event) == 2928,
                "unexpected BPF event size");
 
 const volatile struct cw_target_config cw_target_cfg = {0};
@@ -306,6 +345,34 @@ struct {
     __type(key, struct invocation_key);
     __type(value, struct async_chain);
 } final_lineages SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 16384);
+    __type(key, struct async_exit_source_key);
+    __type(value, struct async_exit_source_state);
+} async_exit_sources SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 16384);
+    __type(key, u64);
+    __type(value, struct async_libuv_notify_state);
+} async_libuv_notifications SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 16384);
+    __type(key, u64);
+    __type(value, u64);
+} async_epoll_waits SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 16384);
+    __type(key, u64);
+    __type(value, struct async_epoll_observation);
+} async_epoll_exits SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -520,11 +587,17 @@ static __always_inline void move_async_hop(
     destination->reserved = source->reserved;
     destination->key = source->key;
     destination->source_ns = source->source_ns;
+    destination->notify_entry_ns = source->notify_entry_ns;
+    destination->notify_exit_ns = source->notify_exit_ns;
+    destination->epoll_enter_ns = source->epoll_enter_ns;
+    destination->epoll_exit_ns = source->epoll_exit_ns;
     destination->queue_ns = source->queue_ns;
     destination->target_ns = source->target_ns;
     destination->offcpu_ns = source->offcpu_ns;
     destination->blocked_ns = source->blocked_ns;
     destination->runqueue_ns = source->runqueue_ns;
+    destination->lifecycle_kind = source->lifecycle_kind;
+    destination->lifecycle_flags = source->lifecycle_flags;
     __builtin_memcpy(&destination->wait, &source->wait,
                      sizeof(destination->wait));
 }
@@ -671,42 +744,26 @@ static __always_inline void async_stats_completed(
         __sync_fetch_and_add(&worker->futex_waits, 1);
 }
 
-SEC("uprobe")
-int trace_async_source(struct pt_regs *ctx)
+static __always_inline int record_async_source(
+    struct pt_regs *ctx, u64 cookie, u64 key_value, u64 pid_tgid,
+    u32 global_pid, u32 global_tid, u32 pid, u32 tid)
 {
-    struct async_context_key key = {0};
+    struct async_context_key key = {
+        .global_pid = global_pid,
+        .value = key_value,
+    };
     struct async_target_thread *target_thread;
     struct async_chain *scratch;
     struct async_chain *active = NULL;
     struct async_hop_context *hop;
     struct invocation_key lineage_key = {0};
-    u64 cookie;
-    u64 pid_tgid;
-    u32 global_pid;
-    u32 global_tid;
-    u32 pid;
-    u32 tid;
     u32 zero = 0;
-    u32 argument;
     u32 hop_index;
     u32 stats_hop;
     u32 depth = 0;
     u64 now;
     int duplicate;
     int i;
-    s32 pidns_error;
-
-    if (!cw_async_cfg.enabled ||
-        !get_process_info(&pid_tgid, &global_pid, &global_tid, &pid, &tid,
-                          &pidns_error))
-        return 0;
-
-    cookie = bpf_get_attach_cookie(ctx);
-    argument = cookie ? (u32)cookie : cw_async_cfg.source_arg;
-    key.global_pid = global_pid;
-    key.value = read_uprobe_argument(ctx, argument);
-    if (!key.value)
-        return 0;
     duplicate = bpf_map_lookup_elem(&async_contexts, &key) != NULL;
 
     scratch = bpf_map_lookup_elem(&async_scratch, &zero);
@@ -788,11 +845,17 @@ int trace_async_source(struct pt_regs *ctx)
     hop->reserved = (u32)(cookie >> 32);
     hop->key = key.value;
     hop->source_ns = now;
+    hop->notify_entry_ns = 0;
+    hop->notify_exit_ns = 0;
+    hop->epoll_enter_ns = 0;
+    hop->epoll_exit_ns = 0;
     hop->queue_ns = 0;
     hop->target_ns = 0;
     hop->offcpu_ns = 0;
     hop->blocked_ns = 0;
     hop->runqueue_ns = 0;
+    hop->lifecycle_kind = CW_ASYNC_HANDOFF_NONE;
+    hop->lifecycle_flags = 0;
     __builtin_memset(&hop->wait, 0, sizeof(hop->wait));
     bpf_get_current_comm(hop->comm, sizeof(hop->comm));
     hop->stack_id = bpf_get_stackid(ctx, &async_stacks, BPF_F_USER_STACK);
@@ -801,6 +864,79 @@ int trace_async_source(struct pt_regs *ctx)
 
     bpf_map_update_elem(&async_contexts, &key, scratch, BPF_ANY);
     async_stats_submitted(stats_hop, duplicate);
+    return 0;
+}
+
+SEC("uprobe")
+int trace_async_source(struct pt_regs *ctx)
+{
+    u64 cookie;
+    u64 key_value;
+    u64 pid_tgid;
+    u32 global_pid;
+    u32 global_tid;
+    u32 pid;
+    u32 tid;
+    u32 argument;
+    s32 pidns_error;
+
+    if (!cw_async_cfg.enabled ||
+        !get_process_info(&pid_tgid, &global_pid, &global_tid, &pid, &tid,
+                          &pidns_error))
+        return 0;
+
+    cookie = bpf_get_attach_cookie(ctx);
+    argument = cookie ? (u32)cookie : cw_async_cfg.source_arg;
+    key_value = read_uprobe_argument(ctx, argument);
+    if (!key_value)
+        return 0;
+    return record_async_source(ctx, cookie, key_value, pid_tgid,
+                               global_pid, global_tid, pid, tid);
+}
+
+SEC("uprobe")
+int trace_async_exit_source_entry(struct pt_regs *ctx)
+{
+    struct async_exit_source_key map_key = {0};
+    struct async_exit_source_state initial = {0};
+    struct async_exit_source_state *state;
+    u64 cookie;
+    u64 pid_tgid;
+    u64 value;
+    u32 global_pid;
+    u32 global_tid;
+    u32 pid;
+    u32 tid;
+    u32 argument;
+    u32 depth;
+    s32 pidns_error;
+
+    if (!cw_async_cfg.enabled ||
+        !get_process_info(&pid_tgid, &global_pid, &global_tid, &pid, &tid,
+                          &pidns_error))
+        return 0;
+
+    cookie = bpf_get_attach_cookie(ctx);
+    argument = (u32)cookie;
+    value = read_uprobe_argument(ctx, argument);
+    if (!value)
+        return 0;
+
+    map_key.pid_tgid = pid_tgid;
+    map_key.hop_id = (u32)(cookie >> 32) & ASYNC_HOP_ID_MASK;
+    bpf_map_update_elem(&async_exit_sources, &map_key,
+                        &initial, BPF_NOEXIST);
+    state = bpf_map_lookup_elem(&async_exit_sources, &map_key);
+    if (!state)
+        return 0;
+    depth = state->depth;
+    if (depth >= MAX_NESTED_CALLS) {
+        if (state->reserved != (__u32)-1)
+            state->reserved++;
+        return 0;
+    }
+    state->values[depth] = value;
+    state->depth = depth + 1;
     return 0;
 }
 
@@ -880,6 +1016,24 @@ int trace_async_target(struct pt_regs *ctx)
         bpf_map_delete_elem(&async_contexts, &context_key);
         return 0;
     }
+    if (chain->hops[last].lifecycle_kind ==
+        CW_ASYNC_HANDOFF_LIBUV) {
+        struct async_epoll_observation *last_epoll =
+            bpf_map_lookup_elem(&async_epoll_exits, &pid_tgid);
+        u64 notify_boundary =
+            chain->hops[last].notify_exit_ns ?
+                chain->hops[last].notify_exit_ns :
+                chain->hops[last].notify_entry_ns;
+
+        if (last_epoll && notify_boundary &&
+            last_epoll->exit_ns >= notify_boundary &&
+            last_epoll->exit_ns <= now) {
+            chain->hops[last].epoll_enter_ns = last_epoll->enter_ns;
+            chain->hops[last].epoll_exit_ns = last_epoll->exit_ns;
+            chain->hops[last].lifecycle_flags |=
+                CW_ASYNC_LIFECYCLE_EPOLL_EXIT;
+        }
+    }
     chain->hops[last].queue_ns = now - chain->hops[last].source_ns;
     stats_hop = async_hop_index(chain->hops[last].reserved);
     queue_ns = chain->hops[last].queue_ns;
@@ -895,24 +1049,17 @@ int trace_async_target(struct pt_regs *ctx)
     return 0;
 }
 
-SEC("uretprobe")
-int trace_async_target_return(struct pt_regs *ctx)
+static __always_inline void close_async_target(u64 pid_tgid, u64 now)
 {
     struct async_target_thread *target_thread;
     struct invocation_key lineage_key = {0};
     struct invocation_state *invocation;
     struct async_chain *lineage;
-    u64 pid_tgid = bpf_get_current_pid_tgid();
-    u64 now = bpf_ktime_get_ns();
     u32 depth;
-
-    (void)ctx;
-    if (!cw_async_cfg.enabled)
-        return 0;
 
     target_thread = bpf_map_lookup_elem(&async_target_threads, &pid_tgid);
     if (!target_thread || !target_thread->depth)
-        return 0;
+        return;
 
     depth = target_thread->depth - 1;
     target_thread->depth = depth;
@@ -940,6 +1087,172 @@ int trace_async_target_return(struct pt_regs *ctx)
     }
     if (!depth)
         bpf_map_delete_elem(&async_target_threads, &pid_tgid);
+}
+
+static __always_inline void arm_async_libuv_notification(
+    u64 pid_tgid, u32 global_pid, u64 key_value, u32 hop_id)
+{
+    struct async_libuv_notify_state notification = {
+        .context = {
+            .global_pid = global_pid,
+            .value = key_value,
+        },
+        .hop_id = hop_id,
+    };
+    struct async_chain *chain;
+    u32 last;
+
+    chain = bpf_map_lookup_elem(
+        &async_contexts, &notification.context);
+    if (!chain || !chain->hop_count)
+        return;
+    last = chain->hop_count - 1;
+    if (last >= MAX_ASYNC_HOPS ||
+        (chain->hops[last].reserved & ASYNC_HOP_ID_MASK) != hop_id)
+        return;
+    chain->hops[last].lifecycle_kind = CW_ASYNC_HANDOFF_LIBUV;
+    chain->hops[last].lifecycle_flags = 0;
+    chain->hops[last].notify_entry_ns = 0;
+    chain->hops[last].notify_exit_ns = 0;
+    chain->hops[last].epoll_enter_ns = 0;
+    chain->hops[last].epoll_exit_ns = 0;
+    bpf_map_update_elem(&async_libuv_notifications, &pid_tgid,
+                        &notification, BPF_ANY);
+}
+
+SEC("uretprobe")
+int trace_async_exit_source_exit(struct pt_regs *ctx)
+{
+    struct async_exit_source_key map_key = {0};
+    struct async_exit_source_state *state;
+    u64 cookie;
+    u64 key_value;
+    u64 pid_tgid;
+    u64 now;
+    u32 global_pid;
+    u32 global_tid;
+    u32 pid;
+    u32 tid;
+    u32 depth;
+    s32 pidns_error;
+
+    if (!cw_async_cfg.enabled ||
+        !get_process_info(&pid_tgid, &global_pid, &global_tid, &pid, &tid,
+                          &pidns_error))
+        return 0;
+
+    cookie = bpf_get_attach_cookie(ctx);
+    map_key.pid_tgid = pid_tgid;
+    map_key.hop_id = (u32)(cookie >> 32) & ASYNC_HOP_ID_MASK;
+    state = bpf_map_lookup_elem(&async_exit_sources, &map_key);
+    if (!state) {
+        if (cookie & ASYNC_SOURCE_CLOSES_TARGET)
+            close_async_target(pid_tgid, bpf_ktime_get_ns());
+        return 0;
+    }
+    if (state->reserved) {
+        state->reserved--;
+        if (cookie & ASYNC_SOURCE_CLOSES_TARGET)
+            close_async_target(pid_tgid, bpf_ktime_get_ns());
+        return 0;
+    }
+    if (!state->depth) {
+        bpf_map_delete_elem(&async_exit_sources, &map_key);
+        if (cookie & ASYNC_SOURCE_CLOSES_TARGET)
+            close_async_target(pid_tgid, bpf_ktime_get_ns());
+        return 0;
+    }
+    if (state->depth > MAX_NESTED_CALLS) {
+        bpf_map_delete_elem(&async_exit_sources, &map_key);
+        if (cookie & ASYNC_SOURCE_CLOSES_TARGET)
+            close_async_target(pid_tgid, bpf_ktime_get_ns());
+        return 0;
+    }
+
+    depth = state->depth - 1;
+    state->depth = depth;
+    key_value = state->values[depth];
+    now = bpf_ktime_get_ns();
+    if (key_value) {
+        record_async_source(ctx, cookie, key_value, pid_tgid,
+                            global_pid, global_tid, pid, tid);
+        if (cookie & ASYNC_SOURCE_LIBUV_HANDOFF)
+            arm_async_libuv_notification(
+                pid_tgid, global_pid, key_value, map_key.hop_id);
+    }
+    if (!depth)
+        bpf_map_delete_elem(&async_exit_sources, &map_key);
+    if (cookie & ASYNC_SOURCE_CLOSES_TARGET)
+        close_async_target(pid_tgid, now);
+    return 0;
+}
+
+static __always_inline void record_async_libuv_notification(
+    u64 pid_tgid, bool exiting)
+{
+    struct async_libuv_notify_state *notification;
+    struct async_chain *chain;
+    struct async_hop_context *hop;
+    u32 last;
+
+    if (!cw_async_cfg.lifecycle_enabled)
+        return;
+    notification = bpf_map_lookup_elem(
+        &async_libuv_notifications, &pid_tgid);
+    if (!notification)
+        return;
+    chain = bpf_map_lookup_elem(
+        &async_contexts, &notification->context);
+    if (!chain || !chain->hop_count)
+        goto cleanup;
+    last = chain->hop_count - 1;
+    if (last >= MAX_ASYNC_HOPS)
+        goto cleanup;
+    hop = &chain->hops[last];
+    if ((hop->reserved & ASYNC_HOP_ID_MASK) != notification->hop_id ||
+        hop->lifecycle_kind != CW_ASYNC_HANDOFF_LIBUV)
+        goto cleanup;
+    if (!exiting) {
+        hop->notify_entry_ns = bpf_ktime_get_ns();
+        hop->lifecycle_flags |= CW_ASYNC_LIFECYCLE_NOTIFY_ENTRY;
+        return;
+    }
+    if (hop->lifecycle_flags & CW_ASYNC_LIFECYCLE_NOTIFY_ENTRY) {
+        hop->notify_exit_ns = bpf_ktime_get_ns();
+        hop->lifecycle_flags |= CW_ASYNC_LIFECYCLE_NOTIFY_EXIT;
+    }
+
+cleanup:
+    bpf_map_delete_elem(&async_libuv_notifications, &pid_tgid);
+}
+
+SEC("uprobe")
+int trace_async_libuv_notify_entry(struct pt_regs *ctx)
+{
+    (void)ctx;
+    record_async_libuv_notification(
+        bpf_get_current_pid_tgid(), false);
+    return 0;
+}
+
+SEC("uretprobe")
+int trace_async_libuv_notify_exit(struct pt_regs *ctx)
+{
+    (void)ctx;
+    record_async_libuv_notification(
+        bpf_get_current_pid_tgid(), true);
+    return 0;
+}
+
+SEC("uretprobe")
+int trace_async_target_return(struct pt_regs *ctx)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+
+    (void)ctx;
+    if (!cw_async_cfg.enabled)
+        return 0;
+    close_async_target(pid_tgid, bpf_ktime_get_ns());
     return 0;
 }
 
@@ -986,11 +1299,18 @@ static __always_inline void copy_async_hop_to_event(
     destination->stack_id = source->stack_id;
     destination->reserved = source->reserved;
     destination->key = source->key;
+    destination->source_ns = source->source_ns;
+    destination->notify_entry_ns = source->notify_entry_ns;
+    destination->notify_exit_ns = source->notify_exit_ns;
+    destination->epoll_enter_ns = source->epoll_enter_ns;
+    destination->epoll_exit_ns = source->epoll_exit_ns;
     destination->queue_ns = source->queue_ns;
     destination->target_ns = source->target_ns;
     destination->offcpu_ns = source->offcpu_ns;
     destination->blocked_ns = source->blocked_ns;
     destination->runqueue_ns = source->runqueue_ns;
+    destination->lifecycle_kind = source->lifecycle_kind;
+    destination->lifecycle_flags = source->lifecycle_flags;
     __builtin_memcpy(&destination->wait, &source->wait,
                      sizeof(destination->wait));
 }
@@ -1030,6 +1350,7 @@ static __always_inline void consume_async_context(
         .global_pid = global_pid,
     };
     struct async_chain *chain;
+    u64 pid_tgid = bpf_get_current_pid_tgid();
     u64 now;
     u64 queue_ns;
     u32 last;
@@ -1064,6 +1385,24 @@ static __always_inline void consume_async_context(
         async_stats_expired(async_hop_index(chain->hops[last].reserved));
         bpf_map_delete_elem(&async_contexts, &key);
         return;
+    }
+    if (chain->hops[last].lifecycle_kind ==
+        CW_ASYNC_HANDOFF_LIBUV) {
+        struct async_epoll_observation *last_epoll =
+            bpf_map_lookup_elem(&async_epoll_exits, &pid_tgid);
+        u64 notify_boundary =
+            chain->hops[last].notify_exit_ns ?
+                chain->hops[last].notify_exit_ns :
+                chain->hops[last].notify_entry_ns;
+
+        if (last_epoll && notify_boundary &&
+            last_epoll->exit_ns >= notify_boundary &&
+            last_epoll->exit_ns <= now) {
+            chain->hops[last].epoll_enter_ns = last_epoll->enter_ns;
+            chain->hops[last].epoll_exit_ns = last_epoll->exit_ns;
+            chain->hops[last].lifecycle_flags |=
+                CW_ASYNC_LIFECYCLE_EPOLL_EXIT;
+        }
     }
     chain->hops[last].queue_ns = now - chain->hops[last].source_ns;
     stats_hop = async_hop_index(chain->hops[last].reserved);
@@ -1416,6 +1755,13 @@ static __attribute__((noinline)) void update_epoll_callback_futex_wait(
     }
 }
 
+static __always_inline bool is_async_epoll_wait_syscall(s32 syscall_nr)
+{
+    return syscall_nr == cw_epoll_cfg.wait_syscall_nr ||
+           syscall_nr == cw_epoll_cfg.pwait_syscall_nr ||
+           syscall_nr == cw_epoll_cfg.pwait2_syscall_nr;
+}
+
 SEC("raw_tp/sys_enter")
 int trace_sys_enter(struct bpf_raw_tracepoint_args *ctx)
 {
@@ -1430,12 +1776,25 @@ int trace_sys_enter(struct bpf_raw_tracepoint_args *ctx)
     u32 pid;
     u32 tid;
     u32 operation;
+    s32 syscall_nr = (s32)ctx->args[1];
     s32 pidns_error;
 
+    if (cw_async_cfg.lifecycle_enabled &&
+        is_async_epoll_wait_syscall(syscall_nr)) {
+        u64 enter_ns = bpf_ktime_get_ns();
+
+        if (!get_process_info(
+                &pid_tgid, &global_pid, &global_tid, &pid, &tid,
+                &pidns_error))
+            return 0;
+        bpf_map_update_elem(
+            &async_epoll_waits, &pid_tgid, &enter_ns, BPF_ANY);
+        return 0;
+    }
     if ((!cw_trace_cfg.attribution_enabled &&
          !(cw_epoll_cfg.callback_enabled &&
            cw_epoll_capture_active())) ||
-        (s32)ctx->args[1] != cw_trace_cfg.futex_syscall_nr)
+        syscall_nr != cw_trace_cfg.futex_syscall_nr)
         return 0;
     if (!get_process_info(&pid_tgid, &global_pid, &global_tid, &pid, &tid,
                           &pidns_error))
@@ -1485,9 +1844,29 @@ int trace_sys_exit(struct bpf_raw_tracepoint_args *ctx)
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u64 now;
 
-    (void)ctx;
+    if (cw_async_cfg.lifecycle_enabled) {
+        u64 *epoll_active =
+            bpf_map_lookup_elem(&async_epoll_waits, &pid_tgid);
+
+        if (epoll_active) {
+            struct async_epoll_observation observation = {
+                .enter_ns = *epoll_active,
+            };
+
+            bpf_map_delete_elem(&async_epoll_waits, &pid_tgid);
+            if ((s64)ctx->args[1] >= 0) {
+                observation.exit_ns = bpf_ktime_get_ns();
+
+                bpf_map_update_elem(
+                    &async_epoll_exits, &pid_tgid,
+                    &observation, BPF_ANY);
+            }
+            return 0;
+        }
+    }
     if (!cw_trace_cfg.attribution_enabled &&
-        !cw_epoll_capture_active())
+        !cw_epoll_capture_active() &&
+        !cw_async_cfg.lifecycle_enabled)
         return 0;
     active = bpf_map_lookup_elem(&futex_waits, &pid_tgid);
     if (!active)

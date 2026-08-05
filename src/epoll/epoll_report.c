@@ -1103,7 +1103,8 @@ bool cw_epoll_print_summary(struct output_options *output)
             "  Reused registrations: %llu\n"
             "  Wake-source ready   : %llu\n"
             "  Wake attributed     : %llu\n"
-            "    eventfd/timerfd/signalfd: %llu / %llu / %llu\n"
+            "    eventfd/timerfd/signalfd/socketpair: "
+            "%llu / %llu / %llu / %llu\n"
             "  Callback match/done : %llu / %llu\n"
             "    matched fd/data/libuv/libevent: "
             "%llu / %llu / %llu / %llu\n"
@@ -1154,6 +1155,7 @@ bool cw_epoll_print_summary(struct output_options *output)
             (unsigned long long)counters.eventfd_ready,
             (unsigned long long)counters.timerfd_ready,
             (unsigned long long)counters.signalfd_ready,
+            (unsigned long long)counters.socketpair_ready,
             (unsigned long long)counters.callback_matched,
             (unsigned long long)counters.callback_completed,
             (unsigned long long)counters.callback_fd_matched,
@@ -1380,6 +1382,7 @@ int cw_epoll_write_summary_json(struct output_options *output)
             "\"wake_ready\":%llu,\"wake_attributed\":%llu,"
             "\"eventfd_ready\":%llu,\"timerfd_ready\":%llu,"
             "\"signalfd_ready\":%llu,"
+            "\"socketpair_ready\":%llu,"
             "\"callback_matched\":%llu,"
             "\"callback_fd_matched\":%llu,"
             "\"callback_data_matched\":%llu,"
@@ -1430,6 +1433,7 @@ int cw_epoll_write_summary_json(struct output_options *output)
             (unsigned long long)counters.eventfd_ready,
             (unsigned long long)counters.timerfd_ready,
             (unsigned long long)counters.signalfd_ready,
+            (unsigned long long)counters.socketpair_ready,
             (unsigned long long)counters.callback_matched,
             (unsigned long long)counters.callback_fd_matched,
             (unsigned long long)counters.callback_data_matched,

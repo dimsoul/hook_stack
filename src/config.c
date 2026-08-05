@@ -147,6 +147,8 @@ int parse_trace_config(const char *path,
         CONFIG_FILTERS,
     } section = CONFIG_NONE;
     bool source_arg_seen[MAX_ASYNC_HOPS] = {0};
+    bool source_phase_seen[MAX_ASYNC_HOPS] = {0};
+    bool handoff_seen[MAX_ASYNC_HOPS] = {0};
     bool target_arg_seen[MAX_ASYNC_HOPS] = {0};
     FILE *file;
     char *line = NULL;
@@ -253,6 +255,46 @@ int parse_trace_config(const char *path,
                     goto cleanup;
                 }
                 source_arg_seen[index] = true;
+            } else if (!strcmp(key, "source_phase")) {
+                if (source_phase_seen[index]) {
+                    fprintf(stderr, "%s:%zu: duplicate source_phase\n",
+                            path, line_number);
+                    goto cleanup;
+                }
+                if (!strcmp(value, "entry")) {
+                    hop->source_exit = false;
+                } else if (!strcmp(value, "exit")) {
+                    hop->source_exit = true;
+                } else if (!strcmp(value, "return")) {
+                    hop->source_exit = true;
+                    fprintf(stderr,
+                            "%s:%zu: warning: source_phase 'return' is "
+                            "deprecated; use 'exit'\n",
+                            path, line_number);
+                } else {
+                    fprintf(stderr,
+                            "%s:%zu: invalid source_phase '%s'; "
+                            "expected entry or exit\n",
+                            path, line_number, value);
+                    goto cleanup;
+                }
+                source_phase_seen[index] = true;
+            } else if (!strcmp(key, "handoff")) {
+                if (handoff_seen[index]) {
+                    fprintf(stderr, "%s:%zu: duplicate handoff\n",
+                            path, line_number);
+                    goto cleanup;
+                }
+                if (!strcmp(value, "libuv")) {
+                    hop->handoff_kind = CW_ASYNC_HANDOFF_LIBUV;
+                } else {
+                    fprintf(stderr,
+                            "%s:%zu: invalid handoff '%s'; "
+                            "expected libuv\n",
+                            path, line_number, value);
+                    goto cleanup;
+                }
+                handoff_seen[index] = true;
             } else if (!strcmp(key, "target")) {
                 if (hop->target) {
                     fprintf(stderr, "%s:%zu: duplicate hop target\n",
@@ -348,6 +390,13 @@ int parse_trace_config(const char *path,
             fprintf(stderr,
                     "%s: hop %zu requires source, source_arg, and target; "
                     "target_arg is optional\n",
+                    path, index);
+            goto cleanup;
+        }
+        if (hops[index].handoff_kind != CW_ASYNC_HANDOFF_NONE &&
+            !hops[index].source_exit) {
+            fprintf(stderr,
+                    "%s: hop %zu handoff requires source_phase: exit\n",
                     path, index);
             goto cleanup;
         }

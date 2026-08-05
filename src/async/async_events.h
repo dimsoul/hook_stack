@@ -42,11 +42,18 @@ struct async_hop_event {
     int32_t stack_id;
     uint32_t reserved;
     uint64_t key;
+    uint64_t source_ns;
+    uint64_t notify_entry_ns;
+    uint64_t notify_exit_ns;
+    uint64_t epoll_enter_ns;
+    uint64_t epoll_exit_ns;
     uint64_t queue_ns;
     uint64_t target_ns;
     uint64_t offcpu_ns;
     uint64_t blocked_ns;
     uint64_t runqueue_ns;
+    uint32_t lifecycle_kind;
+    uint32_t lifecycle_flags;
     struct wait_resource wait;
 };
 
@@ -106,9 +113,9 @@ struct async_worker_stats {
     char comm[16];
 };
 
-_Static_assert(offsetof(struct stack_trace_event, stack) == 1520,
+_Static_assert(offsetof(struct stack_trace_event, stack) == 1904,
                "userspace and BPF event layouts differ");
-_Static_assert(sizeof(struct stack_trace_event) == 2544,
+_Static_assert(sizeof(struct stack_trace_event) == 2928,
                "userspace and BPF event sizes differ");
 
 #endif

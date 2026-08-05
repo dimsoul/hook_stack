@@ -183,6 +183,43 @@ as `target_arg: auto`. Explicit argument positions are 1-8, and at most eight
 hops are accepted. Command-line filter options override values loaded from the
 file regardless of option order.
 
+By default, the handoff begins when the source function is entered. The paired
+values are `entry` and `exit`; use `source_phase: exit` to begin when the source
+function has completed:
+
+```yaml
+  - source: work_cb
+    source_arg: 1
+    source_phase: exit
+    handoff: libuv
+    target: after_work_cb
+    target_arg: 1
+```
+
+Callweave saves the selected argument at source entry and emits the handoff at
+the matching function exit, so the argument remains available even though a uretprobe
+cannot read the original call registers. Nested calls are tracked separately.
+This is useful when the question is specifically how long a completion waits
+*after* worker execution. When that exit source is also the preceding hop's
+target, Callweave closes the preceding work interval and starts the next queue
+interval at the same exit boundary. The deprecated value `return` remains an
+alias for `exit` so existing configurations continue to work.
+
+Reports render these paired boundaries as `source started` and
+`source completed`, respectively, so `return` cannot be mistaken for a return
+value.
+
+For a libuv worker completion, add `handoff: libuv` to an exit-source hop.
+Callweave then observes the public `uv_async_send()` boundary and the target
+event loop's `epoll_wait*` entries and returns. The queue interval is divided
+into completion publishing, the notification call, loop-active/backlog time,
+epoll wait or wakeup, and ready-to-callback dispatch. Recording both syscall
+boundaries prevents time spent in an earlier callback from being mislabeled as
+epoll wakeup latency. If no poll return occurs, the remaining time stays under
+`loop-active/backlog` rather than receiving an invented wakeup timestamp. This
+option requires `source_phase: exit`; it does not depend on stripped libuv
+internal symbols.
+
 The same slow-chain controls can be used with explicit `--async-hop` options:
 
 ```sh

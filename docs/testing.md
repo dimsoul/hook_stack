@@ -223,6 +223,30 @@ waker stack containing `writer_main`.
 See the [libevent adapter guide](runtimes/libevent.md) for lifecycle and
 evidence semantics.
 
+To reproduce a `uv_queue_work()` result whose after-work callback is delayed
+after the worker has already returned, build the optional libuv tests and run:
+
+```sh
+# Terminal 1
+./test/trace_libuv_work_test \
+  --iterations 80 --block-loop-ms 50
+
+# Terminal 2, using the printed PID
+sudo ./callweave -p PID \
+  --config examples/libuv-work-delay.yaml \
+  --report ./callweave-libuv-work-delay.html
+```
+
+Hop 0 measures submission to `work_cb` and its approximately 2 ms execution.
+Hop 1 starts specifically at the exit of `work_cb`; its queue interval should
+show a small completion-publish and `uv_async_send` phase followed by roughly
+48 ms of `loop-active/backlog` before a short epoll and callback-dispatch
+phase. Repeat Terminal 1 with
+`--block-loop-ms 0` as the control and add `--min-total-ms 0` to the tracer
+command so the fast chains are not filtered out. The second-hop delay should
+collapse. See the [case study](cases/libuv-work-callback-delay.md) for the
+diagnosis.
+
 The example also passes a task pointer from the main thread through a small
 queue to a worker thread. Use it to test asynchronous stitching:
 

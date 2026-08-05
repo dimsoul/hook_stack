@@ -37,7 +37,7 @@ endif
 LIBUV_CFLAGS := $(shell $(PKG_CONFIG) --cflags libuv 2>/dev/null)
 LIBUV_LIBS := $(shell $(PKG_CONFIG) --libs libuv 2>/dev/null)
 ifneq ($(strip $(LIBUV_LIBS)),)
-LIBUV_DEFAULT_TARGET = $(LIBUV_TEST_BINARY)
+LIBUV_DEFAULT_TARGETS = $(LIBUV_TEST_BINARY) $(LIBUV_WORK_TEST_BINARY)
 endif
 
 LIBEVENT_CFLAGS := $(shell $(PKG_CONFIG) --cflags libevent 2>/dev/null)
@@ -61,6 +61,7 @@ LOCK_TEST_BINARY := test/trace_lock_test
 IO_URING_TEST_BINARY := test/trace_io_uring_test
 EPOLL_TEST_BINARY := test/trace_epoll_test
 LIBUV_TEST_BINARY := test/trace_libuv_test
+LIBUV_WORK_TEST_BINARY := test/trace_libuv_work_test
 LIBEVENT_TEST_BINARY := test/trace_libevent_test
 REPORT_TEST_BINARY := test/trace_report_test
 BPF_OBJECT := src/callweave.bpf.o
@@ -74,7 +75,7 @@ SKELETON_HEADER := src/callweave.skel.h
 all: $(BINARY) $(TEST_BINARY) $(ASYNC_TEST_BINARY) \
 	$(THREAD_POOL_TEST_BINARY) $(COMPLEX_ASYNC_TEST_BINARY) \
 	$(LOCK_TEST_BINARY) $(IO_URING_TEST_BINARY) $(EPOLL_TEST_BINARY) \
-	$(REPORT_TEST_BINARY) $(LIBUV_DEFAULT_TARGET) $(LIBEVENT_DEFAULT_TARGET)
+	$(REPORT_TEST_BINARY) $(LIBUV_DEFAULT_TARGETS) $(LIBEVENT_DEFAULT_TARGET)
 
 $(VMLINUX_HEADER):
 	@test -r /sys/kernel/btf/vmlinux || \
@@ -83,6 +84,7 @@ $(VMLINUX_HEADER):
 
 $(BPF_OBJECT): src/callweave.bpf.c \
 		src/core/core_config.h src/async/async_config.h \
+		src/async/async_lifecycle.h \
 		src/epoll/epoll_config.h src/epoll/epoll_shared.h \
 		src/epoll/epoll.bpf.maps.h src/epoll/epoll.bpf.progs.h \
 		src/epoll/epoll_wake.bpf.progs.h \
@@ -187,6 +189,16 @@ $(LIBUV_TEST_BINARY): test/test_libuv.c
 
 test-libuv: $(LIBUV_TEST_BINARY)
 
+$(LIBUV_WORK_TEST_BINARY): test/test_libuv_work.c
+	@test -n "$(LIBUV_LIBS)" || \
+		{ echo "error: libuv development files are required for test-libuv" >&2; \
+		  echo "install libuv1-dev, then run make test-libuv" >&2; exit 1; }
+	$(CC) -std=gnu11 -O0 -g -Wall -Wextra -fno-omit-frame-pointer \
+		-fno-inline -rdynamic $(LIBUV_CFLAGS) $< -o $@ \
+		$(LIBUV_LIBS) -pthread
+
+test-libuv: $(LIBUV_WORK_TEST_BINARY)
+
 $(LIBEVENT_TEST_BINARY): test/test_libevent.c
 	@test -n "$(LIBEVENT_LIBS)" || \
 		{ echo "error: libevent development files are required for test-libevent" >&2; \
@@ -216,7 +228,7 @@ clean:
 		$(THREAD_POOL_TEST_BINARY) $(COMPLEX_ASYNC_TEST_BINARY) \
 		$(LOCK_TEST_BINARY) $(IO_URING_TEST_BINARY) \
 		$(EPOLL_TEST_BINARY) $(REPORT_TEST_BINARY) $(BPF_OBJECT) \
-		$(LIBUV_TEST_BINARY) \
+		$(LIBUV_TEST_BINARY) $(LIBUV_WORK_TEST_BINARY) \
 		$(LIBEVENT_TEST_BINARY) \
 		$(VMLINUX_HEADER) \
 		$(SKELETON_HEADER)

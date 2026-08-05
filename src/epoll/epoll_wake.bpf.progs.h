@@ -77,6 +77,33 @@ static __always_inline void cw_epoll_merge_wake_source(
         &epoll_wake_pending, key, &combined, BPF_ANY);
 }
 
+static __always_inline bool cw_epoll_is_wake_write_operation(
+    __u32 operation)
+{
+    return operation == CW_EPOLL_IO_WRITE ||
+           operation == CW_EPOLL_IO_WRITEV ||
+           operation == CW_EPOLL_IO_SENDTO ||
+           operation == CW_EPOLL_IO_SENDMSG ||
+           operation == CW_EPOLL_IO_SENDMMSG;
+}
+
+static __always_inline void cw_epoll_merge_socketpair_source(
+    const struct cw_epoll_socket_key *key,
+    const struct cw_epoll_wake_source *source)
+{
+    struct cw_epoll_wake_source combined = *source;
+    struct cw_epoll_wake_source *existing =
+        bpf_map_lookup_elem(&epoll_socketpair_pending, key);
+
+    if (existing && existing->kind == source->kind &&
+        existing->action == source->action) {
+        combined.first_timestamp_ns = existing->first_timestamp_ns;
+        combined.operations += existing->operations;
+    }
+    bpf_map_update_elem(
+        &epoll_socketpair_pending, key, &combined, BPF_ANY);
+}
+
 static __attribute__((noinline)) void cw_epoll_record_wake_syscall(
     void *stack_context, struct pt_regs *registers,
     __s32 syscall_nr,
@@ -111,6 +138,10 @@ static __attribute__((noinline)) void cw_epoll_record_wake_syscall(
         if (mask && mask_size >= sizeof(state.signal_mask))
             bpf_probe_read_user(
                 &state.signal_mask, sizeof(state.signal_mask), mask);
+    } else if (syscall_nr == cw_epoll_cfg.socketpair_syscall_nr) {
+        state.action = CW_EPOLL_WAKE_SYS_CREATE_SOCKETPAIR;
+        state.user_address =
+            PT_REGS_PARM4_CORE_SYSCALL(registers);
     } else if (syscall_nr ==
                cw_epoll_cfg.timerfd_settime_syscall_nr) {
         struct cw_userspace_itimerspec timer = {0};
@@ -145,7 +176,7 @@ static __attribute__((noinline)) void cw_epoll_record_wake_syscall(
             if (!state.source.timer_initial_ns)
                 state.source.flags |= CW_EPOLL_WAKE_TIMER_DISARMED;
         }
-    } else if (io_operation == CW_EPOLL_IO_WRITE) {
+    } else if (cw_epoll_is_wake_write_operation(io_operation)) {
         const __u64 *value_address =
             (const void *)PT_REGS_PARM2_CORE_SYSCALL(registers);
         __u64 length =
@@ -158,19 +189,35 @@ static __attribute__((noinline)) void cw_epoll_record_wake_syscall(
         key.pid = identity->pid;
         key.fd = state.fd;
         metadata = bpf_map_lookup_elem(&epoll_fd_metadata, &key);
-        if (!metadata || metadata->kind != CW_EPOLL_WAKE_EVENTFD ||
-            length < sizeof(state.source.value) || !value_address)
+        if (!metadata)
             return;
-        state.action = CW_EPOLL_WAKE_SYS_EVENTFD_WRITE;
-        cw_epoll_fill_wake_source(
-            stack_context, &state.source,
-            CW_EPOLL_WAKE_EVENTFD,
-            CW_EPOLL_WAKE_ACTION_EVENTFD_WRITE,
-            identity->pid, identity->tid,
-            identity->global_pid, identity->global_tid);
-        bpf_probe_read_user(
-            &state.source.value, sizeof(state.source.value),
-            value_address);
+        if (metadata->kind == CW_EPOLL_WAKE_EVENTFD &&
+            io_operation == CW_EPOLL_IO_WRITE &&
+            length >= sizeof(state.source.value) && value_address) {
+            state.action = CW_EPOLL_WAKE_SYS_EVENTFD_WRITE;
+            cw_epoll_fill_wake_source(
+                stack_context, &state.source,
+                CW_EPOLL_WAKE_EVENTFD,
+                CW_EPOLL_WAKE_ACTION_EVENTFD_WRITE,
+                identity->pid, identity->tid,
+                identity->global_pid, identity->global_tid);
+            bpf_probe_read_user(
+                &state.source.value, sizeof(state.source.value),
+                value_address);
+        } else if (metadata->kind == CW_EPOLL_WAKE_SOCKETPAIR &&
+                   metadata->socket_pair_id) {
+            state.action = CW_EPOLL_WAKE_SYS_SOCKET_WRITE;
+            state.socket_pair_id = metadata->socket_pair_id;
+            state.socket_endpoint = metadata->socket_endpoint ^ 1U;
+            cw_epoll_fill_wake_source(
+                stack_context, &state.source,
+                CW_EPOLL_WAKE_SOCKETPAIR,
+                CW_EPOLL_WAKE_ACTION_SOCKET_WRITE,
+                identity->pid, identity->tid,
+                identity->global_pid, identity->global_tid);
+        } else {
+            return;
+        }
     } else if (io_operation == CW_EPOLL_IO_CLOSE) {
         state.action = CW_EPOLL_WAKE_SYS_CLOSE;
         state.fd =
@@ -238,7 +285,42 @@ static __attribute__((noinline)) void cw_epoll_finish_wake_syscall(
         .fd = state->fd,
     };
 
-    if (state->action == CW_EPOLL_WAKE_SYS_CREATE_EVENTFD &&
+    if (state->action == CW_EPOLL_WAKE_SYS_CREATE_SOCKETPAIR &&
+        !result && state->user_address) {
+        __s32 fds[2] = {-1, -1};
+
+        if (!bpf_probe_read_user(
+                fds, sizeof(fds),
+                (const void *)state->user_address) &&
+            fds[0] >= 0 && fds[1] >= 0) {
+            __u64 pair_id = bpf_ktime_get_ns();
+            struct cw_epoll_fd_key first_key = {
+                .pid = state->pid,
+                .fd = fds[0],
+            };
+            struct cw_epoll_fd_key second_key = {
+                .pid = state->pid,
+                .fd = fds[1],
+            };
+            struct cw_epoll_fd_metadata first = {
+                .socket_pair_id = pair_id,
+                .kind = CW_EPOLL_WAKE_SOCKETPAIR,
+                .clock_id = -1,
+                .socket_endpoint = 0,
+            };
+            struct cw_epoll_fd_metadata second = {
+                .socket_pair_id = pair_id,
+                .kind = CW_EPOLL_WAKE_SOCKETPAIR,
+                .clock_id = -1,
+                .socket_endpoint = 1,
+            };
+
+            bpf_map_update_elem(
+                &epoll_fd_metadata, &first_key, &first, BPF_ANY);
+            bpf_map_update_elem(
+                &epoll_fd_metadata, &second_key, &second, BPF_ANY);
+        }
+    } else if (state->action == CW_EPOLL_WAKE_SYS_CREATE_EVENTFD &&
         result >= 0) {
         struct cw_epoll_fd_metadata metadata = {
             .kind = CW_EPOLL_WAKE_EVENTFD,
@@ -283,6 +365,16 @@ static __attribute__((noinline)) void cw_epoll_finish_wake_syscall(
                    CW_EPOLL_WAKE_SYS_EVENTFD_WRITE &&
                result == sizeof(__u64)) {
         cw_epoll_merge_wake_source(&key, &state->source);
+    } else if (state->action == CW_EPOLL_WAKE_SYS_SOCKET_WRITE &&
+               result > 0) {
+        struct cw_epoll_socket_key socket_key = {
+            .pair_id = state->socket_pair_id,
+            .pid = state->pid,
+            .endpoint = state->socket_endpoint,
+        };
+
+        cw_epoll_merge_socketpair_source(
+            &socket_key, &state->source);
     } else if (state->action == CW_EPOLL_WAKE_SYS_CLOSE &&
                !result) {
         bpf_map_delete_elem(&epoll_fd_metadata, &key);
@@ -347,7 +439,8 @@ int trace_epoll_wake_sys_enter(struct bpf_raw_tracepoint_args *ctx)
         syscall_nr != cw_epoll_cfg.timerfd_settime_syscall_nr &&
         syscall_nr != cw_epoll_cfg.signalfd_syscall_nr &&
         syscall_nr != cw_epoll_cfg.signalfd4_syscall_nr &&
-        io_operation != CW_EPOLL_IO_WRITE &&
+        syscall_nr != cw_epoll_cfg.socketpair_syscall_nr &&
+        !cw_epoll_is_wake_write_operation(io_operation) &&
         io_operation != CW_EPOLL_IO_CLOSE &&
         io_operation != CW_EPOLL_IO_DUP &&
         io_operation != CW_EPOLL_IO_DUP2 &&
@@ -539,6 +632,20 @@ static __attribute__((noinline)) void cw_epoll_correlate_wake_source(
             bpf_map_delete_elem(
                 &epoll_signal_pending, &state->global_pid);
         }
+    } else if (metadata->kind == CW_EPOLL_WAKE_SOCKETPAIR &&
+               metadata->socket_pair_id) {
+        struct cw_epoll_socket_key socket_key = {
+            .pair_id = metadata->socket_pair_id,
+            .pid = state->pid,
+            .endpoint = metadata->socket_endpoint,
+        };
+
+        pending = bpf_map_lookup_elem(
+            &epoll_socketpair_pending, &socket_key);
+        if (pending)
+            source = *pending;
+        bpf_map_delete_elem(
+            &epoll_socketpair_pending, &socket_key);
     }
     cw_epoll_wake_latency(&source, ready_ns);
     *result = source;
@@ -557,6 +664,9 @@ static __attribute__((noinline)) void cw_epoll_correlate_wake_source(
         else if (source.kind == CW_EPOLL_WAKE_SIGNALFD)
             __sync_fetch_and_add(
                 &counters->signalfd_ready, 1);
+        else if (source.kind == CW_EPOLL_WAKE_SOCKETPAIR)
+            __sync_fetch_and_add(
+                &counters->socketpair_ready, 1);
     }
     if (!resource_stats)
         return;

@@ -178,9 +178,11 @@ sudo ./callweave --libevent --live --duration 12 \
   --startup-delay 0 --iterations 80
 ```
 
-The HTML Sequence view uses lifecycle-role lanes for epoll readiness, the
-libevent loop, and the automatically discovered callback. It distinguishes
-time blocked in `epoll_wait*`, ready-to-callback dispatch delay, and callback
+The HTML Sequence view uses real thread lanes. `epoll_wait*`, readiness
+dispatch, and the automatically discovered callback remain vertical phases on
+the libevent-loop thread; a producer lane appears only for an observed
+cross-thread wake. It distinguishes time blocked in `epoll_wait*`,
+ready-to-callback dispatch delay, and callback
 execution even though the event loop and callback normally share one TID;
 futex attribution remains available in Waterfall and Details. Callback lanes
 combine the runtime role and resolved ELF symbol, such as
@@ -188,6 +190,19 @@ combine the runtime role and resolved ELF symbol, such as
 `libevent_callback (bufferevent_read_callback)`. When no symbol is available
 the parenthesized value is `callback@0xADDRESS`, which remains distinct for
 each callback address.
+
+The Sequence card calls the combined producer-to-ready and ready-to-callback
+portion `Selected pre-callback`. Its violet dispatch label is written as
+`ready → CALLBACK` followed by `pre-callback dispatch · DURATION`; the blue
+phase repeats the full resolved callback name and its execution duration.
+Long names remain available in full in the lane header and SVG hover text.
+
+When Callweave observes the example's `socketpair()` creation from startup, it
+also correlates the writer thread's `send()` with readiness of the peer FD.
+The Sequence view then contains separate writer and libevent-loop TID lanes,
+with `send → epoll_wait*` as the cross-thread handoff. This correlation is why
+the complete-from-start `--exec` test is preferred; attaching after the
+socketpair already exists cannot recover its peer relationship.
 
 The example exercises a persistent Unix-socket raw event, a socket
 bufferevent, an existing-FD listener, and a persistent timer. Every tenth I/O

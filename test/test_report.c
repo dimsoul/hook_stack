@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "callweave_internal.h"
+#include "async/async_lifecycle.h"
 #include "report.h"
 #include "runtime_report.h"
 
@@ -163,9 +164,11 @@ out:
     return result;
 }
 
-static int write_libuv_report(const char *path)
+static int write_event_loop_report(
+    const char *path, const char *mode, uint32_t match_kind,
+    const char *callback_name)
 {
-    static const char *const expected[] = {
+    static const char *const libuv_expected[] = {
         "const reportMode=\"libuv\"",
         "renderEventLoopSequence",
         "\"source\":\"eventfd_write\"",
@@ -173,8 +176,26 @@ static int write_libuv_report(const char *path)
         "\"target\":\"libuv_callback (poll_callback)\"",
         "\"target\":\"ready fd=5\"",
     };
+    static const char *const libevent_expected[] = {
+        "const reportMode=\"libevent\"",
+        "renderEventLoopSequence",
+        "Only observed threads receive lanes",
+        "Selected pre-callback",
+        "pre-callback dispatch",
+        "lane(loopX,callbackName",
+        "\"source\":\"send\"",
+        "\"tid\":43011,\"target_tid\":43001",
+        "\"target\":\"ready fd=6\"",
+        "\"tid\":43012,\"target_tid\":43001",
+        "\"target\":\"libevent_callback (bufferevent_read_callback)\"",
+    };
+    const char *const *expected = !strcmp(mode, "libevent") ?
+        libevent_expected : libuv_expected;
+    size_t expected_count = !strcmp(mode, "libevent") ?
+        sizeof(libevent_expected) / sizeof(libevent_expected[0]) :
+        sizeof(libuv_expected) / sizeof(libuv_expected[0]);
     struct cw_runtime_report *report =
-        cw_runtime_report_create("libuv");
+        cw_runtime_report_create(mode);
     struct cw_epoll_event wait = {
         .timestamp_ns = 1785811426790000000ULL,
         .start_ns = 1785811426788000000ULL,
@@ -204,7 +225,7 @@ static int write_libuv_report(const char *path)
         .epoll_fd = 3,
         .fd = 4,
         .ready_events = 1,
-        .match_kind = CW_EPOLL_CALLBACK_MATCH_LIBUV,
+        .match_kind = match_kind,
         .comm = "uv-loop",
         .wake = {
             .latency_ns = 90000,
@@ -241,21 +262,52 @@ static int write_libuv_report(const char *path)
         .epoll_fd = 3,
         .fd = 5,
         .ready_events = 1,
-        .match_kind = CW_EPOLL_CALLBACK_MATCH_LIBUV,
+        .match_kind = match_kind,
         .comm = "uv-loop",
+    };
+    struct cw_epoll_callback_event callback_without_wait_record = {
+        .timestamp_ns = 1785811426850100000ULL,
+        .ready_ns = 1785811426850000000ULL,
+        .start_ns = 1785811426850030000ULL,
+        .delay_ns = 30000,
+        .duration_ns = 70000,
+        .data = 0x6789,
+        .callback_key = 0xfeed,
+        .pid = 43000,
+        .tid = 43001,
+        .epoll_fd = 3,
+        .fd = 6,
+        .ready_events = 1,
+        .match_kind = match_kind,
+        .comm = "uv-loop",
+        .wake = {
+            .latency_ns = 80000,
+            .action = CW_EPOLL_WAKE_ACTION_SOCKET_WRITE,
+            .flags = CW_EPOLL_WAKE_LATENCY_VALID,
+            .source_pid = 43000,
+            .source_tid = 43012,
+            .comm = "producer",
+        },
     };
     FILE *stream;
     int result = -1;
+
+    if (!strcmp(mode, "libevent"))
+        callback.wake.action = CW_EPOLL_WAKE_ACTION_SOCKET_WRITE;
 
     if (!report)
         return -1;
     if (cw_runtime_report_capture_epoll_wait(report, &wait) ||
         cw_runtime_report_capture_epoll_callback(
-            report, &callback, "poll_callback") ||
+            report, &callback, callback_name) ||
         cw_runtime_report_capture_epoll_wait(
             report, &wait_without_waker) ||
         cw_runtime_report_capture_epoll_callback(
-            report, &callback_without_waker, "poll_callback"))
+            report, &callback_without_waker, callback_name))
+        goto out;
+    if (!strcmp(mode, "libevent") &&
+        cw_runtime_report_capture_epoll_callback(
+            report, &callback_without_wait_record, callback_name))
         goto out;
     stream = fopen(path, "wb");
     if (!stream)
@@ -266,11 +318,88 @@ static int write_libuv_report(const char *path)
         if (fclose(stream) || write_error)
             goto out;
     }
-    result = verify_report_markers(
-        path, expected, sizeof(expected) / sizeof(expected[0]));
+    result = verify_report_markers(path, expected, expected_count);
 out:
     cw_runtime_report_destroy(report);
     return result;
+}
+
+static int write_libuv_work_report(const char *path)
+{
+    static const char *const expected[] = {
+        "function renderLibuvWorkSequence",
+        "libuv work lifecycle",
+        "libuv event loop",
+        "libuv worker",
+        "Two real thread lanes",
+        "event loop active / backlog",
+        "uv_async_send → epoll_wait*",
+        "epoll_wait* → ",
+        "\"handoff_kind\":1",
+        "\"source\":\"work_cb\"",
+        "\"target\":\"after_work_cb\"",
+    };
+    struct cw_report_chain chain = {
+        .timestamp_ms = 1785898535422ULL,
+        .pid = 44000,
+        .tid = 44001,
+        .comm = "uv-loop",
+        .duration_ns = 50309000,
+        .hop_count = 2,
+        .hops = {
+            {
+                .index = 0,
+                .pid = 44000,
+                .tid = 44001,
+                .target_tid = 44011,
+                .target_arg = 1,
+                .comm = "uv-loop",
+                .source = "submit_work",
+                .target = "work_cb",
+                .key = 0x557afddec7680ULL,
+                .queue_ns = 42075,
+                .work_ns = 2117000,
+                .offcpu_ns = 2080000,
+                .blocked_ns = 2070000,
+                .runqueue_ns = 4000,
+            },
+            {
+                .index = 1,
+                .pid = 44000,
+                .tid = 44011,
+                .target_tid = 44001,
+                .target_arg = 1,
+                .comm = "libuv-worker",
+                .source = "work_cb",
+                .target = "after_work_cb",
+                .source_exit = true,
+                .handoff_kind = CW_ASYNC_HANDOFF_LIBUV,
+                .handoff_flags = CW_ASYNC_LIFECYCLE_NOTIFY_ENTRY |
+                    CW_ASYNC_LIFECYCLE_NOTIFY_EXIT |
+                    CW_ASYNC_LIFECYCLE_EPOLL_EXIT,
+                .key = 0x557afddec7680ULL,
+                .queue_ns = 48008000,
+                .publish_ns = 12594,
+                .notify_ns = 6003,
+                .loop_ns = 47970000,
+                .poll_ns = 3040,
+                .dispatch_ns = 16363,
+                .work_ns = 141925,
+            },
+        },
+    };
+    FILE *stream;
+    bool first = true;
+
+    stream = fopen(path, "wb");
+    if (!stream)
+        return -1;
+    if (cw_html_report_begin(stream) ||
+        cw_html_report_write(stream, &chain, &first) ||
+        cw_html_report_end(stream, NULL, 0) || fclose(stream))
+        return -1;
+    return verify_report_markers(
+        path, expected, sizeof(expected) / sizeof(expected[0]));
 }
 
 int main(int argc, char **argv)
@@ -278,6 +407,8 @@ int main(int argc, char **argv)
     const char *path = argc > 1 ? argv[1] : "/tmp/callweave-report-test.html";
     char runtime_path[PATH_MAX];
     char libuv_path[PATH_MAX];
+    char libevent_path[PATH_MAX];
+    char libuv_work_path[PATH_MAX];
     struct cw_report_chain chain = {
         .timestamp_ms = 1785811426789ULL,
         .pid = 42000,
@@ -381,12 +512,32 @@ int main(int argc, char **argv)
     }
     if (snprintf(libuv_path, sizeof(libuv_path), "%s.libuv.html", path) >=
             (int)sizeof(libuv_path) ||
-        write_libuv_report(libuv_path)) {
+        write_event_loop_report(
+            libuv_path, "libuv", CW_EPOLL_CALLBACK_MATCH_LIBUV,
+            "poll_callback")) {
         fprintf(stderr, "generated libuv report failed validation\n");
+        return 1;
+    }
+    if (snprintf(libevent_path, sizeof(libevent_path),
+                 "%s.libevent.html", path) >=
+            (int)sizeof(libevent_path) ||
+        write_event_loop_report(
+            libevent_path, "libevent", CW_EPOLL_CALLBACK_MATCH_LIBEVENT,
+            "bufferevent_read_callback")) {
+        fprintf(stderr, "generated libevent report failed validation\n");
+        return 1;
+    }
+    if (snprintf(libuv_work_path, sizeof(libuv_work_path),
+                 "%s.libuv-work.html", path) >=
+            (int)sizeof(libuv_work_path) ||
+        write_libuv_work_report(libuv_work_path)) {
+        fprintf(stderr, "generated libuv work report failed validation\n");
         return 1;
     }
     printf("generated report: %s\n", path);
     printf("generated runtime report: %s\n", runtime_path);
     printf("generated libuv report: %s\n", libuv_path);
+    printf("generated libevent report: %s\n", libevent_path);
+    printf("generated libuv work report: %s\n", libuv_work_path);
     return 0;
 }

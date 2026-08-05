@@ -20,6 +20,16 @@ It is designed to answer questions such as:
 - Did a libuv or libevent callback actually run, or is only a weaker fallback correlation available?
 - Which futex blocked a slow event-loop callback, and which thread woke it?
 
+## Real problem case
+
+The bundled [libuv delayed-callback case study](docs/cases/libuv-work-callback-delay.md)
+reproduces a reported `uv_queue_work()` symptom where `work_cb` has already
+returned but `after_work_cb` arrives about 50 ms later. Callweave uses the same
+`uv_work_t *` to separate worker-pool queueing, worker execution, and the
+post-worker event-loop delay. The reproduction makes the cause visible: a
+long-running callback is blocking the event-loop thread, rather than libuv
+adding a fixed 50 ms delay.
+
 Callweave complements sampling profilers and distributed tracing. A profiler shows where CPU samples accumulate, while Callweave focuses on selected asynchronous operations and explains where their elapsed time went.
 
 ## What it can trace
@@ -198,9 +208,15 @@ only observed phases, such as SQE→CQE→callback or ready→callback. See
 
 ![An io_uring request correlated from SQE submission through CQE completion to its application callback](docs/images/io-uring-sequence.png)
 
+_A WRITE request split into defer/io-wq queueing, kernel in-flight time, and
+CQE-to-callback delay._
+
 ### libevent callback lifecycle
 
 ![A libevent ready event correlated with its bufferevent callback and execution time](docs/images/libevent-sequence.png)
+
+_A socketpair wake connected across the producer and event-loop threads, with
+pre-callback dispatch separated from `bufferevent_read_callback` execution._
 
 ## Documentation
 
