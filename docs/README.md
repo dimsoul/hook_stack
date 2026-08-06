@@ -31,6 +31,8 @@ Runtime-specific behavior belongs under `docs/runtimes/`. A future adapter such 
 
 - [libuv: delayed `after_work_cb`](cases/libuv-work-callback-delay.md):
   distinguish worker-pool queueing, worker execution, and event-loop delay.
+- [libevent: a client connection stops timer callbacks](cases/libevent-blocking-accept.md):
+  identify the listener callback blocked in `accept()` while timers remain pending.
 
 ## Output and interpretation
 

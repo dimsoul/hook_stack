@@ -20,7 +20,7 @@ It is designed to answer questions such as:
 - Did a libuv or libevent callback actually run, or is only a weaker fallback correlation available?
 - Which futex blocked a slow event-loop callback, and which thread woke it?
 
-## Real problem case
+## Real problem cases
 
 The bundled [libuv delayed-callback case study](docs/cases/libuv-work-callback-delay.md)
 reproduces a reported `uv_queue_work()` symptom where `work_cb` has already
@@ -29,6 +29,12 @@ returned but `after_work_cb` arrives about 50 ms later. Callweave uses the same
 post-worker event-loop delay. The reproduction makes the cause visible: a
 long-running callback is blocking the event-loop thread, rather than libuv
 adding a fixed 50 ms delay.
+
+The [libevent blocking-listener case study](docs/cases/libevent-blocking-accept.md)
+reconstructs a report where periodic timers stop after the first client
+connects. Automatic callback discovery shows that epoll readiness and libevent
+dispatch are prompt, while the listener callback spends about 1.5 seconds
+blocked in `accept()`, preventing the event loop from servicing its timers.
 
 Callweave complements sampling profilers and distributed tracing. A profiler shows where CPU samples accumulate, while Callweave focuses on selected asynchronous operations and explains where their elapsed time went.
 
