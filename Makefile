@@ -43,7 +43,8 @@ endif
 LIBEVENT_CFLAGS := $(shell $(PKG_CONFIG) --cflags libevent 2>/dev/null)
 LIBEVENT_LIBS := $(shell $(PKG_CONFIG) --libs libevent 2>/dev/null)
 ifneq ($(strip $(LIBEVENT_LIBS)),)
-LIBEVENT_DEFAULT_TARGET = $(LIBEVENT_TEST_BINARY)
+LIBEVENT_DEFAULT_TARGETS = $(LIBEVENT_TEST_BINARY) \
+	$(LIBEVENT_BLOCKING_ACCEPT_TEST_BINARY)
 endif
 
 CFLAGS ?= -O2 -g
@@ -63,6 +64,7 @@ EPOLL_TEST_BINARY := test/trace_epoll_test
 LIBUV_TEST_BINARY := test/trace_libuv_test
 LIBUV_WORK_TEST_BINARY := test/trace_libuv_work_test
 LIBEVENT_TEST_BINARY := test/trace_libevent_test
+LIBEVENT_BLOCKING_ACCEPT_TEST_BINARY := test/trace_libevent_blocking_accept
 REPORT_TEST_BINARY := test/trace_report_test
 BPF_OBJECT := src/callweave.bpf.o
 VMLINUX_HEADER := src/vmlinux.h
@@ -75,7 +77,7 @@ SKELETON_HEADER := src/callweave.skel.h
 all: $(BINARY) $(TEST_BINARY) $(ASYNC_TEST_BINARY) \
 	$(THREAD_POOL_TEST_BINARY) $(COMPLEX_ASYNC_TEST_BINARY) \
 	$(LOCK_TEST_BINARY) $(IO_URING_TEST_BINARY) $(EPOLL_TEST_BINARY) \
-	$(REPORT_TEST_BINARY) $(LIBUV_DEFAULT_TARGETS) $(LIBEVENT_DEFAULT_TARGET)
+	$(REPORT_TEST_BINARY) $(LIBUV_DEFAULT_TARGETS) $(LIBEVENT_DEFAULT_TARGETS)
 
 $(VMLINUX_HEADER):
 	@test -r /sys/kernel/btf/vmlinux || \
@@ -207,7 +209,16 @@ $(LIBEVENT_TEST_BINARY): test/test_libevent.c
 		-fno-inline -rdynamic $(LIBEVENT_CFLAGS) $< -o $@ \
 		$(LIBEVENT_LIBS) -pthread
 
-test-libevent: $(LIBEVENT_TEST_BINARY)
+$(LIBEVENT_BLOCKING_ACCEPT_TEST_BINARY): test/test_libevent_blocking_accept.c
+	@test -n "$(LIBEVENT_LIBS)" || \
+		{ echo "error: libevent development files are required for test-libevent" >&2; \
+		  echo "install libevent-dev, then run make test-libevent" >&2; exit 1; }
+	$(CC) -std=gnu11 -O0 -g -Wall -Wextra -fno-omit-frame-pointer \
+		-fno-inline -rdynamic $(LIBEVENT_CFLAGS) $< -o $@ \
+		$(LIBEVENT_LIBS) -pthread
+
+test-libevent: $(LIBEVENT_TEST_BINARY) \
+	$(LIBEVENT_BLOCKING_ACCEPT_TEST_BINARY)
 
 test-program: $(TEST_BINARY) $(ASYNC_TEST_BINARY) \
 	$(THREAD_POOL_TEST_BINARY) $(COMPLEX_ASYNC_TEST_BINARY) \
@@ -230,5 +241,6 @@ clean:
 		$(EPOLL_TEST_BINARY) $(REPORT_TEST_BINARY) $(BPF_OBJECT) \
 		$(LIBUV_TEST_BINARY) $(LIBUV_WORK_TEST_BINARY) \
 		$(LIBEVENT_TEST_BINARY) \
+		$(LIBEVENT_BLOCKING_ACCEPT_TEST_BINARY) \
 		$(VMLINUX_HEADER) \
 		$(SKELETON_HEADER)

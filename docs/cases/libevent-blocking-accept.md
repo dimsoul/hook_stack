@@ -19,7 +19,7 @@ The reporter later identified a blocking listening socket as the cause.
 ## Diagnostic reconstruction
 
 The public report links a much larger application rather than a standalone
-reproducer, so the diagnosis was checked with a minimal reconstruction of the
+reproducer, so `test/test_libevent_blocking_accept.c` reconstructs the
 same mechanism:
 
 - one persistent libevent timer fires every 200 ms;
@@ -30,13 +30,19 @@ same mechanism:
 - a second client connects 1.5 seconds later so that the blocked callback can
   return and produce a complete timing record.
 
+Build the bundled reproducer and other libevent test target with:
+
+```sh
+make test-libevent
+```
+
 Callweave launched the target from startup so that libevent event definitions,
 epoll registrations, and dynamically discovered application callbacks were all
 observed:
 
 ```sh
-sudo ./callweave --libevent --duration 4 \
-  --exec /tmp/libevent_blocking_listener
+sudo ./callweave --libevent --duration 5 \
+  --exec ./test/trace_libevent_blocking_accept -- --blocking
 ```
 
 ## Evidence
@@ -46,11 +52,11 @@ almost immediately:
 
 ```text
 listener FD ready
-  -> accept_cb entry       18.299 us
+  -> accept_cb entry       18.111 us
   -> accept_cb execution    1.501 s
-       on-CPU                 139.332 us
-       blocked                  1.501 s
-       run queue                   3.456 us
+       on-CPU                 110.556 us
+       blocked                  1.500 s
+       run queue                   3.937 us
 ```
 
 The path had `exact` evidence: the same ready listening FD was joined to a
@@ -66,9 +72,16 @@ was not waiting in `epoll_wait`, and it was not consuming CPU; it was blocked
 inside the listener callback.
 
 A nonblocking control run kept the same event, clients, and timer. Its two
-listener callbacks had a maximum execution time of 173.142 us, zero observed
+listener callbacks had a maximum execution time of 64.451 us, zero observed
 blocked time, and the timer continued without a gap. This control distinguishes
 the blocking callback from network arrival or libevent dispatch latency.
+
+Run that control with:
+
+```sh
+sudo ./callweave --libevent --duration 5 \
+  --exec ./test/trace_libevent_blocking_accept -- --nonblocking
+```
 
 ## Diagnosis
 
