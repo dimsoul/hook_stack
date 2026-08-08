@@ -1,0 +1,16 @@
+# Diagnose unrelated libuv work delayed by a saturated shared thread pool.
+
+target:
+  function: serial_write_work
+
+hops:
+  - source: submit_serial
+    source_arg: 1
+    target: serial_write_work
+    target_arg: 1
+
+filters:
+  min_queue_ms: 1000
+  max_events: 10
+  duration: 12
+  diagnostic_interval_ms: 1000

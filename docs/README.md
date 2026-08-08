@@ -33,6 +33,8 @@ Runtime-specific behavior belongs under `docs/runtimes/`. A future adapter such 
   distinguish worker-pool queueing, worker execution, and event-loop delay.
 - [libevent: a client connection stops timer callbacks](cases/libevent-blocking-accept.md):
   identify the listener callback blocked in `accept()` while timers remain pending.
+- [libuv: slow DNS stalls unrelated serial work](cases/libuv-dns-threadpool-contention.md):
+  localize a multi-second serial delay to queueing behind DNS in libuv's shared worker pool.
 
 ## Output and interpretation
 

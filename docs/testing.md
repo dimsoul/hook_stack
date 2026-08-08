@@ -247,6 +247,25 @@ command so the fast chains are not filtered out. The second-hop delay should
 collapse. See the [case study](cases/libuv-work-callback-delay.md) for the
 diagnosis.
 
+To reproduce unrelated native work waiting behind slow DNS in libuv's shared
+worker pool, run:
+
+```sh
+# Terminal 1
+UV_THREADPOOL_SIZE=4 ./test/trace_libuv_threadpool_contention
+
+# Terminal 2, using the printed PID
+sudo ./callweave -p PID \
+  --config examples/libuv-threadpool-contention.yaml \
+  --report ./callweave-libuv-threadpool-contention.html
+```
+
+The six `serial_write_work` calls should spend about five seconds queued and
+only microseconds executing while four `dns_lookup_work` calls occupy all four
+workers. See the
+[case study](cases/libuv-dns-threadpool-contention.md) for the evidence and a
+larger-pool causal control.
+
 The example also passes a task pointer from the main thread through a small
 queue to a worker thread. Use it to test asynchronous stitching:
 

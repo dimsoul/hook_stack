@@ -37,7 +37,8 @@ endif
 LIBUV_CFLAGS := $(shell $(PKG_CONFIG) --cflags libuv 2>/dev/null)
 LIBUV_LIBS := $(shell $(PKG_CONFIG) --libs libuv 2>/dev/null)
 ifneq ($(strip $(LIBUV_LIBS)),)
-LIBUV_DEFAULT_TARGETS = $(LIBUV_TEST_BINARY) $(LIBUV_WORK_TEST_BINARY)
+LIBUV_DEFAULT_TARGETS = $(LIBUV_TEST_BINARY) $(LIBUV_WORK_TEST_BINARY) \
+	$(LIBUV_THREADPOOL_TEST_BINARY)
 endif
 
 LIBEVENT_CFLAGS := $(shell $(PKG_CONFIG) --cflags libevent 2>/dev/null)
@@ -63,6 +64,7 @@ IO_URING_TEST_BINARY := test/trace_io_uring_test
 EPOLL_TEST_BINARY := test/trace_epoll_test
 LIBUV_TEST_BINARY := test/trace_libuv_test
 LIBUV_WORK_TEST_BINARY := test/trace_libuv_work_test
+LIBUV_THREADPOOL_TEST_BINARY := test/trace_libuv_threadpool_contention
 LIBEVENT_TEST_BINARY := test/trace_libevent_test
 LIBEVENT_BLOCKING_ACCEPT_TEST_BINARY := test/trace_libevent_blocking_accept
 REPORT_TEST_BINARY := test/trace_report_test
@@ -201,6 +203,16 @@ $(LIBUV_WORK_TEST_BINARY): test/test_libuv_work.c
 
 test-libuv: $(LIBUV_WORK_TEST_BINARY)
 
+$(LIBUV_THREADPOOL_TEST_BINARY): test/test_libuv_threadpool_contention.c
+	@test -n "$(LIBUV_LIBS)" || \
+		{ echo "error: libuv development files are required for test-libuv" >&2; \
+		  echo "install libuv1-dev, then run make test-libuv" >&2; exit 1; }
+	$(CC) -std=gnu11 -O0 -g -Wall -Wextra -fno-omit-frame-pointer \
+		-fno-inline -rdynamic $(LIBUV_CFLAGS) $< -o $@ \
+		$(LIBUV_LIBS) -pthread
+
+test-libuv: $(LIBUV_THREADPOOL_TEST_BINARY)
+
 $(LIBEVENT_TEST_BINARY): test/test_libevent.c
 	@test -n "$(LIBEVENT_LIBS)" || \
 		{ echo "error: libevent development files are required for test-libevent" >&2; \
@@ -240,6 +252,7 @@ clean:
 		$(LOCK_TEST_BINARY) $(IO_URING_TEST_BINARY) \
 		$(EPOLL_TEST_BINARY) $(REPORT_TEST_BINARY) $(BPF_OBJECT) \
 		$(LIBUV_TEST_BINARY) $(LIBUV_WORK_TEST_BINARY) \
+		$(LIBUV_THREADPOOL_TEST_BINARY) \
 		$(LIBEVENT_TEST_BINARY) \
 		$(LIBEVENT_BLOCKING_ACCEPT_TEST_BINARY) \
 		$(VMLINUX_HEADER) \

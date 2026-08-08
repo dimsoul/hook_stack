@@ -36,6 +36,12 @@ connects. Automatic callback discovery shows that epoll readiness and libevent
 dispatch are prompt, while the listener callback spends about 1.5 seconds
 blocked in `accept()`, preventing the event loop from servicing its timers.
 
+The [libuv shared-thread-pool case study](docs/cases/libuv-dns-threadpool-contention.md)
+reconstructs a node-serialport report where slow network requests delay
+unrelated serial operations by seconds. Callweave shows that the serial work
+spends about five seconds queued but only microseconds executing, while four
+blocking DNS jobs occupy every worker in libuv's default shared pool.
+
 Callweave complements sampling profilers and distributed tracing. A profiler shows where CPU samples accumulate, while Callweave focuses on selected asynchronous operations and explains where their elapsed time went.
 
 ## What it can trace
