@@ -17,6 +17,7 @@ The executable is the authoritative source for the complete option list:
 ./callweave -p PID [--module MODULE] FUNCTION
 ./callweave --binary BINARY --offset OFFSET
 ./callweave -p PID --config PATH
+./callweave --config PATH --exec PROGRAM -- [ARGS...]
 ./callweave -p PID --io-uring
 ./callweave -p PID --epoll
 ./callweave -p PID --libuv
@@ -56,6 +57,8 @@ See [function tracing](../features/function-tracing.md).
 - `--discover-async FUNCTION`: inspect the most recent scheduler waker for a target.
 - `--min-total-ms`, `--min-queue-ms`, `--min-work-ms`: retain slow chains.
 - `--diagnostic-interval-ms`: control live queue snapshots.
+- `--exec PROGRAM -- [ARGS...]`: with `--config`, install all asynchronous
+  probes before launching the target; arguments after `--` belong to it.
 
 See [asynchronous call chains](../features/async-call-chain.md) and [queue diagnostics](../features/queue-diagnostics.md).
 

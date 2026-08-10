@@ -311,6 +311,7 @@ static void usage(FILE *stream, const char *program)
             "  %s --binary BINARY --offset OFFSET\n"
             "  %s -p PID --discover-async FUNCTION\n"
             "  %s -p PID --config PATH\n"
+            "  %s --config PATH --exec PROGRAM -- [ARGS...]\n"
             "  %s -p PID --io-uring\n"
             "  %s -p PID --epoll\n"
             "  %s --epoll --exec PROGRAM -- [ARGS...]\n"
@@ -405,8 +406,8 @@ static void usage(FILE *stream, const char *program)
             "      --min-epoll-callback-us US (advanced)\n"
             "                             only emit callbacks lasting at "
             "least US\n"
-            "      --exec PROGRAM         launch PROGRAM after epoll tracing "
-            "is ready;\n"
+            "      --exec PROGRAM         launch PROGRAM after async or epoll "
+            "probes are ready;\n"
             "                             put its arguments after `--`\n"
             "      --min-epoll-wait-us US (advanced)\n"
             "                             only emit waits at least US\n"
@@ -418,10 +419,11 @@ static void usage(FILE *stream, const char *program)
             "  -h, --help                show this help\n"
             "\n"
             "When -p is used without --binary or --module, /proc/PID/exe is used.\n"
-            "Without -p, an explicit BINARY is required except for "
-            "--epoll/--libuv/--libevent --exec.\n",
+            "Without -p, an explicit BINARY is required except when --exec "
+            "is used with --config, --epoll, --libuv, or --libevent.\n",
             program, program, program, program, program, program, program,
-            program, program, program, program, program, program, program);
+            program, program, program, program, program, program, program,
+            program);
 }
 
 static int parse_pid(const char *text, pid_t *pid)
@@ -592,6 +594,31 @@ static int launch_target_suspended(
     target->pid = pid;
     target->exec_status_fd = status_pipe[0];
     target->resumed = false;
+    return 0;
+}
+
+static int prepare_launched_target(
+    const char *path, char *const target_arguments[],
+    size_t target_argument_count, struct launched_target *target,
+    char ***exec_argv)
+{
+    char **child_argv;
+    size_t index;
+    int error;
+
+    child_argv = calloc(target_argument_count + 2,
+                        sizeof(*child_argv));
+    if (!child_argv)
+        return -ENOMEM;
+    child_argv[0] = (char *)path;
+    for (index = 0; index < target_argument_count; index++)
+        child_argv[index + 1] = target_arguments[index];
+    error = launch_target_suspended(path, child_argv, target);
+    if (error) {
+        free(child_argv);
+        return error;
+    }
+    *exec_argv = child_argv;
     return 0;
 }
 
@@ -979,6 +1006,7 @@ int main(int argc, char **argv)
     bool check_config = false;
     bool json_output = false;
     bool finalize_outputs = true;
+    size_t exec_argument_count = 0;
     int remaining_arguments;
     int option;
     int error = 0;
@@ -1553,10 +1581,11 @@ int main(int argc, char **argv)
             error = 2;
             goto cleanup;
         }
-        if (!output.epoll_mode) {
+        if (!output.epoll_mode &&
+            !(config_path && output.show_async)) {
             fprintf(stderr,
-                    "--exec is currently supported with standalone "
-                    "--epoll, --libuv, or --libevent mode\n");
+                    "--exec requires --config for asynchronous tracing, "
+                    "or standalone --epoll, --libuv, or --libevent mode\n");
             error = 2;
             goto cleanup;
         }
@@ -1723,21 +1752,10 @@ int main(int argc, char **argv)
             goto cleanup;
         }
         if (exec_path) {
-            size_t index;
-
-            exec_argv = calloc(
-                (size_t)remaining_arguments + 2,
-                sizeof(*exec_argv));
-            if (!exec_argv) {
-                error = -ENOMEM;
-                goto cleanup;
-            }
-            exec_argv[0] = (char *)exec_path;
-            for (index = 0;
-                 index < (size_t)remaining_arguments; index++)
-                exec_argv[index + 1] = argv[optind + index];
-            error = launch_target_suspended(
-                exec_path, exec_argv, &launched);
+            error = prepare_launched_target(
+                exec_path, &argv[optind],
+                (size_t)remaining_arguments, &launched,
+                &exec_argv);
             if (error) {
                 fprintf(stderr, "cannot prepare target %s: %s\n",
                         exec_path, strerror(-error));
@@ -1897,6 +1915,11 @@ int main(int argc, char **argv)
         goto trace_target_ready;
     }
 
+    if (exec_path) {
+        exec_argument_count = (size_t)remaining_arguments;
+        remaining_arguments = 0;
+    }
+
     if (find_symbol_name) {
         int result;
 
@@ -2019,6 +2042,13 @@ int main(int argc, char **argv)
                     binary_argument, strerror(errno));
             return 1;
         }
+    } else if (exec_path) {
+        if (!realpath(exec_path, target_path)) {
+            fprintf(stderr, "cannot resolve exec target %s: %s\n",
+                    exec_path, strerror(errno));
+            error = 1;
+            goto cleanup;
+        }
     } else if (target_pid > 0) {
         error = resolve_process_executable(target_pid, target_path,
                                            sizeof(target_path));
@@ -2032,14 +2062,31 @@ int main(int argc, char **argv)
     output.target_path = target_path;
 
     if (async_libuv_handoff) {
-        error = resolve_process_symbol_module(
-            target_pid, "uv_async_send", async_libuv_path,
-            sizeof(async_libuv_path));
+        if (exec_path) {
+            char executable[PATH_MAX];
+
+            if (!realpath(exec_path, executable)) {
+                fprintf(stderr,
+                        "cannot resolve async target %s: %s\n",
+                        exec_path, strerror(errno));
+                error = 1;
+                goto cleanup;
+            }
+            error = resolve_linked_symbol_module(
+                executable, "uv_async_send", async_libuv_path,
+                sizeof(async_libuv_path));
+        } else {
+            error = resolve_process_symbol_module(
+                target_pid, "uv_async_send", async_libuv_path,
+                sizeof(async_libuv_path));
+        }
         if (error) {
             fprintf(stderr,
-                    "cannot find libuv uv_async_send in PID %d: %s; "
-                    "handoff: libuv requires a mapped libuv runtime\n",
-                    (int)target_pid, strerror(-error));
+                    "cannot find the libuv module defining uv_async_send "
+                    "for %s: %s; handoff: libuv requires a linked or "
+                    "mapped libuv runtime\n",
+                    exec_path ? exec_path : "the target process",
+                    strerror(-error));
             goto cleanup;
         }
     }
@@ -2076,6 +2123,21 @@ int main(int argc, char **argv)
             snprintf(async_source_path, sizeof(async_source_path), "%s",
                      target_path);
         }
+    }
+
+    if (exec_path) {
+        error = prepare_launched_target(
+            exec_path, &argv[optind], exec_argument_count,
+            &launched, &exec_argv);
+        if (error) {
+            fprintf(stderr, "cannot prepare target %s: %s\n",
+                    exec_path, strerror(-error));
+            goto cleanup;
+        }
+        target_pid = launched.pid;
+        error = validate_target_pid(target_pid);
+        if (error)
+            goto cleanup;
     }
 
 trace_target_ready:
@@ -3113,7 +3175,7 @@ trace_target_ready:
         if (output.epoll_mode)
             fprintf(stderr, ", top %u event loops",
                     output.epoll_top);
-        if (output.epoll_started_target)
+        if (launched.pid > 0)
             fprintf(stderr, ", target launched after tracer readiness");
         else if (output.epoll_mode)
             fprintf(stderr,
@@ -3200,7 +3262,7 @@ trace_target_ready:
         }
         if (output.epoll_mode)
             printf(", top %u event loops", output.epoll_top);
-        if (output.epoll_started_target)
+        if (launched.pid > 0)
             printf(", target launched after tracer readiness");
         else if (output.epoll_mode)
             printf(", bootstrapped %u registration%s from %u epoll FD%s",

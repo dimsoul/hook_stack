@@ -1,4 +1,5 @@
 /callweave
+/callweave-libuv-threadpool-contention.html
 /src/callweave.bpf.o
 /src/callweave.skel.h
 /src/vmlinux.h
@@ -12,5 +13,6 @@
 /test/trace_report_test
 /test/trace_libuv_test
 /test/trace_libuv_work_test
+/test/trace_libuv_threadpool_contention
 /test/trace_libevent_test
 /test/trace_libevent_blocking_accept

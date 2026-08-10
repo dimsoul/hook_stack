@@ -74,7 +74,7 @@ SKELETON_HEADER := src/callweave.skel.h
 
 .DELETE_ON_ERROR:
 .PHONY: all clean test-program test-libuv test-libevent \
-	demo-async demo-io-uring demo-epoll
+	demo-async demo-io-uring demo-epoll demo-libuv-threadpool
 
 all: $(BINARY) $(TEST_BINARY) $(ASYNC_TEST_BINARY) \
 	$(THREAD_POOL_TEST_BINARY) $(COMPLEX_ASYNC_TEST_BINARY) \
@@ -245,6 +245,13 @@ demo-io-uring: all
 
 demo-epoll: all
 	bash test/run_epoll_demo.sh
+
+demo-libuv-threadpool: $(BINARY) $(LIBUV_THREADPOOL_TEST_BINARY)
+	sudo env UV_THREADPOOL_SIZE=4 ./$(BINARY) \
+		--config examples/libuv-threadpool-contention.yaml \
+		--report ./callweave-libuv-threadpool-contention.html \
+		--exec ./$(LIBUV_THREADPOOL_TEST_BINARY) -- \
+		--startup-delay-ms 0
 
 clean:
 	rm -f $(BINARY) $(TEST_BINARY) $(ASYNC_TEST_BINARY) \

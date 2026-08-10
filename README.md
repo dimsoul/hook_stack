@@ -146,6 +146,15 @@ Load the same trace from a configuration file:
 sudo ./callweave -p PID --config examples/thread-pool.yaml
 ```
 
+Launch an asynchronous target only after every configured probe is ready:
+
+```sh
+sudo ./callweave \
+  --config examples/libuv-threadpool-contention.yaml \
+  --exec ./test/trace_libuv_threadpool_contention -- \
+  --startup-delay-ms 0
+```
+
 Diagnose io_uring requests:
 
 ```sh
@@ -170,7 +179,9 @@ Automatically adapt libevent I/O callbacks:
 sudo ./callweave -p PID --libevent
 ```
 
-To avoid missing initialization, let Callweave launch an epoll or runtime target after all probes are ready:
+To avoid missing initialization or the first asynchronous submission, let
+Callweave launch a configured async, epoll, or runtime target after all probes
+are ready:
 
 ```sh
 sudo ./callweave --libuv --duration 20 \

@@ -104,6 +104,7 @@ jobs:
           if ! {
             ./callweave --check-config examples/thread-pool.yaml
             ./callweave --check-config examples/complex-multi-hop.yaml
+            ./callweave --check-config examples/libuv-threadpool-contention.yaml
           } 2>&1 | tee "$validation_log"; then
             message="$(tail --lines 40 "$validation_log")"
             message="${message//'%'/'%25'}"

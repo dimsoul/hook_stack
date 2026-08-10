@@ -41,24 +41,23 @@ a live resolver. A separate validation used real `getaddrinfo()` calls against
 an unreachable resolver and produced the same ordering and timing shape; the
 bundled version avoids changing resolver settings and remains deterministic.
 
-Build the optional libuv tests:
+Build and run the complete demonstration with one command:
 
 ```sh
-make test-libuv
+make demo-libuv-threadpool
 ```
 
-Run the reconstruction with libuv's default pool size:
+This builds the optional libuv workload, installs the configured asynchronous
+probes, launches the workload with libuv's default four-worker pool, and writes
+`callweave-libuv-threadpool-contention.html`. Its equivalent explicit command
+is:
 
 ```sh
-UV_THREADPOOL_SIZE=4 ./test/trace_libuv_threadpool_contention
-```
-
-In a second terminal, using the printed PID, trace the serial handoff:
-
-```sh
-sudo ./callweave -p PID \
+sudo env UV_THREADPOOL_SIZE=4 ./callweave \
   --config examples/libuv-threadpool-contention.yaml \
-  --report ./callweave-libuv-threadpool-contention.html
+  --report ./callweave-libuv-threadpool-contention.html \
+  --exec ./test/trace_libuv_threadpool_contention -- \
+  --startup-delay-ms 0
 ```
 
 ## Evidence

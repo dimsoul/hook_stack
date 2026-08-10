@@ -37,6 +37,26 @@ The first target hit after attachment initializes the kernel-global process
 identity used by discovery, so candidate output normally begins with a
 subsequent wakeup rather than that first event.
 
+## Launch after probe readiness
+
+Attaching to an already running process cannot reconstruct submissions that
+completed before its source probes were installed. When startup itself is the
+interesting interval, put the chain in a configuration file and let Callweave
+launch the target only after every probe and ring buffer is ready:
+
+```sh
+sudo ./callweave \
+  --config examples/libuv-threadpool-contention.yaml \
+  --report ./callweave-libuv-threadpool-contention.html \
+  --exec ./test/trace_libuv_threadpool_contention -- \
+  --startup-delay-ms 0
+```
+
+The configuration supplies `target.function` and every asynchronous hop.
+Arguments after `--` belong to the launched program. The child retains the
+same PID across `exec`, is returned to the invoking user's identity when the
+tracer was started through `sudo`, and is stopped if the capture ends first.
+
 
 ## Trace one handoff
 

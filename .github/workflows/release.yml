@@ -98,6 +98,7 @@ jobs:
         run: |
           ./callweave --check-config examples/thread-pool.yaml
           ./callweave --check-config examples/complex-multi-hop.yaml
+          ./callweave --check-config examples/libuv-threadpool-contention.yaml
           ./test/trace_report_test "$RUNNER_TEMP/callweave-report.html"
           timeout 15s ./test/trace_epoll_test 4
           timeout 15s ./test/trace_libuv_test 1
@@ -124,6 +125,9 @@ jobs:
 
           "$package_dir/callweave" \
             --check-config "$package_dir/examples/thread-pool.yaml"
+          "$package_dir/callweave" \
+            --check-config \
+            "$package_dir/examples/libuv-threadpool-contention.yaml"
           tar --create --gzip \
             --file "$archive_dir/$package_name.tar.gz" \
             --directory "$RUNNER_TEMP" \
