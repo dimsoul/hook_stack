@@ -39,6 +39,37 @@ Read the
 [complete case study](docs/cases/libuv-dns-threadpool-contention.md), including
 the four-worker trace and the eight-worker causal control.
 
+## Install v1.1.2
+
+Prebuilt release archives are available for Ubuntu 24.04 on amd64 and arm64.
+Install the runtime libraries, download the archive for the current machine,
+and verify it before extracting:
+
+```sh
+sudo apt install libbpf1 libelf1t64 zlib1g libzstd1 binutils
+
+version=v1.1.2
+case "$(uname -m)" in
+  x86_64) arch=amd64 ;;
+  aarch64|arm64) arch=arm64 ;;
+  *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+
+base_url="https://github.com/dimsoul/callweave-ebpf/releases/download/$version"
+archive="callweave-$version-linux-$arch.tar.gz"
+curl --fail --location --remote-name "$base_url/$archive"
+curl --fail --location --remote-name "$base_url/SHA256SUMS"
+grep " $archive$" SHA256SUMS | sha256sum --check
+tar --extract --gzip --file "$archive"
+cd "callweave-$version-linux-$arch"
+sudo ./callweave --help
+```
+
+Callweave needs Linux 5.8 or newer, kernel BTF at
+`/sys/kernel/btf/vmlinux`, and root or equivalent BPF/perf capabilities. The
+archive includes the executable, examples, documentation, and licenses. For
+other Linux distributions, use the [source build](#requirements).
+
 ## What it answers
 
 Callweave is designed to answer questions such as:
