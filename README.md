@@ -5,13 +5,43 @@
 [![CI](https://github.com/dimsoul/callweave-ebpf/actions/workflows/ci.yml/badge.svg)](https://github.com/dimsoul/callweave-ebpf/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-`callweave` is a no-instrumentation asynchronous latency debugger for native Linux applications. It uses eBPF and uprobes to connect selected user-space functions, thread handoffs, scheduler delays, epoll readiness, io_uring completions, and runtime callbacks into evidence-backed causal paths.
+**Find where asynchronous latency went across native Linux threads without
+adding application instrumentation.**
 
-![A three-hop asynchronous request traced across four native threads](docs/images/complex-sequence.png)
+`callweave` uses eBPF and uprobes to connect selected user-space functions,
+thread handoffs, scheduler delays, epoll readiness, io_uring completions, and
+runtime callbacks into evidence-backed causal paths.
 
-_A three-hop request across four native threads, with queue delay and execution time preserved on one causal timeline._
+## A five-second delay, localized
 
-It is designed to answer questions such as:
+A deterministic reconstruction of a
+[reported node-serialport problem](https://github.com/serialport/node-serialport/issues/797)
+appears only when network requests are slow. Callweave separates the missing
+time from the serial work itself:
+
+| Observed symptom | Callweave evidence | Localized cause |
+| --- | --- | --- |
+| Serial operations stall for about five seconds during slow network requests | Selected operation: `4.900025 s` queued, `310.822 us` executing | Four blocking DNS jobs occupy libuv's four shared workers |
+
+![Callweave showing a serial operation queued for 4.9 seconds before executing in microseconds](docs/images/libuv-threadpool-contention.png)
+
+_Purple is time spent waiting before `serial_write_work` starts. The short
+blue activation is the serial work itself._
+
+After installing the [build requirements](#requirements), reproduce the
+diagnosis and generate a self-contained HTML report:
+
+```sh
+make demo-libuv-threadpool
+```
+
+Read the
+[complete case study](docs/cases/libuv-dns-threadpool-contention.md), including
+the four-worker trace and the eight-worker causal control.
+
+## What it answers
+
+Callweave is designed to answer questions such as:
 
 - Who submitted this work?
 - How long did it wait before another thread started it?
@@ -226,6 +256,13 @@ Standalone epoll, libuv, libevent, and io_uring modes provide both structured
 JSON and the same tabbed HTML report surface. Runtime Sequence views retain
 only observed phases, such as SQE→CQE→callback or ready→callback. See
 [JSON and HTML output](docs/output/reports.md).
+
+### Multi-hop asynchronous chain
+
+![A three-hop asynchronous request traced across four native threads](docs/images/complex-sequence.png)
+
+_A three-hop request across four native threads, with queue delay and execution
+time preserved on one causal timeline._
 
 ### io_uring request lifecycle
 
